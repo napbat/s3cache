@@ -1,0 +1,29 @@
+[package]
+name = "s3cache"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent S3 caching proxy — serves LIST from an in-memory key index and GET from an LRU cache, write-through to an upstream S3 (Cloudflare R2). Cuts S3 request costs for chatty clients."
+license = "MIT"
+
+[dependencies]
+s3s = "0.14.0"
+s3s-aws = "0.14.0"
+async-trait = "0.1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+tokio = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
+moka = { version = "0.12", features = ["future"] }
+bytes = "1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+
+[profile.release]
+opt-level = 2
