@@ -15,14 +15,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput};
+use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, Timestamp};
 use s3s::{S3Request, S3Response, S3Result};
 use tracing::info;
 
 struct ObjEntry {
     size: i64,
+    last_modified: SystemTime,
 }
 
 #[derive(Default)]
@@ -77,7 +79,11 @@ impl CachingProxy {
             let resp = req.send().await?;
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
-                    let entry = ObjEntry { size: obj.size().unwrap_or(0) };
+                    let last_modified = obj
+                        .last_modified()
+                        .and_then(|d| u64::try_from(d.secs()).ok())
+                        .map_or_else(SystemTime::now, |s| UNIX_EPOCH + Duration::from_secs(s));
+                    let entry = ObjEntry { size: obj.size().unwrap_or(0), last_modified };
                     let mut g = self.state.write().unwrap();
                     g.entry(bucket.to_owned()).or_default().keys.insert(key.to_owned(), entry);
                     found += 1;
@@ -102,7 +108,7 @@ impl CachingProxy {
         g.entry(bucket.to_owned())
             .or_default()
             .keys
-            .insert(key.to_owned(), ObjEntry { size });
+            .insert(key.to_owned(), ObjEntry { size, last_modified: SystemTime::now() });
         self.metrics.writes_indexed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -171,6 +177,7 @@ impl CachingProxy {
                 contents.push(Object {
                     key: Some(key.clone()),
                     size: Some(entry.size),
+                    last_modified: Some(Timestamp::from(entry.last_modified)),
                     ..Default::default()
                 });
             }
