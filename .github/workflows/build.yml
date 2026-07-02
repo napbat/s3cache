@@ -1,0 +1,39 @@
+name: build
+
+# Builds + pushes the s3cache image to GHCR, then bumps the Fleet chart tag to the
+# built SHA so Fleet rolls it. The bump lands only after the push, so Fleet never
+# chases a missing image.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - "deploy/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  server:
+    uses: napbat/cicd/.github/workflows/build-push.yml@main
+    with:
+      image-name: s3cache
+      dockerfile: Dockerfile
+      context: .
+      cache-backend: registry
+    # s3cache's package is owned by this repo, so the default GITHUB_TOKEN can push.
+    secrets: inherit
+
+  bump:
+    needs: [server]
+    uses: napbat/cicd/.github/workflows/bump-fleet-tag.yml@main
+    with:
+      file: deploy/helm/s3cache/fleet.yaml
+      paths: ".helm.values.image.tag"
+      sha: ${{ needs.server.outputs.tag }}

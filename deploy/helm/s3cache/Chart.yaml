@@ -1,0 +1,6 @@
+apiVersion: v2
+name: s3cache
+description: Transparent S3 caching proxy in front of an upstream S3 (R2).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

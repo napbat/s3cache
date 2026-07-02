@@ -1,0 +1,25 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/napbat/s3cache
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Private image → reference the shared ghcr-pull Secret from the cicd secrets bundle.
+imagePullSecret:
+  existingSecret: ghcr-pull
+
+# Upstream S3 (R2) the proxy forwards to.
+upstream:
+  endpoint: ""            # e.g. https://<acct>.r2.cloudflarestorage.com  (required)
+  buckets: ""             # comma-separated buckets to index eagerly, e.g. "docres"
+
+# AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
+# this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).
+auth:
+  existingSecret: s3cache-s3
+
+service:
+  port: 8014
+
+resources: {}

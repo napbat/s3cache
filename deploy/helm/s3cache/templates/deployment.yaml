@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3cache
+  labels:
+    app.kubernetes.io/name: s3cache
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Single writer's view of the bucket → the index is authoritative. Recreate avoids
+  # two proxies briefly diverging (each has its own in-memory index) during a roll.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3cache
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3cache
+    spec:
+      {{- with .Values.imagePullSecret.existingSecret }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      containers:
+        - name: s3cache
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: s3
+              containerPort: 8014
+          env:
+            - name: S3CACHE_LISTEN
+              value: "0.0.0.0:8014"
+            - name: S3CACHE_UPSTREAM_ENDPOINT
+              value: {{ required "upstream.endpoint is required" .Values.upstream.endpoint | quote }}
+            - name: S3CACHE_BUCKETS
+              value: {{ .Values.upstream.buckets | quote }}
+            - name: RUST_LOG
+              value: "info"
+          # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION for the upstream.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.auth.existingSecret }}
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources: {{- toYaml .Values.resources | nindent 12 }}
