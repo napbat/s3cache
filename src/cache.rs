@@ -18,13 +18,100 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, Timestamp};
+use bytes::Bytes;
+use futures::StreamExt;
+use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, StreamingBlob, Metadata, ETag, Timestamp};
 use s3s::{S3Request, S3Response, S3Result};
 use tracing::info;
 
 struct ObjEntry {
     size: i64,
     last_modified: SystemTime,
+}
+
+/// A cached object body + the response metadata needed to reconstruct a GET/HEAD.
+struct CachedObject {
+    body: Bytes,
+    content_length: Option<i64>,
+    content_type: Option<String>,
+    e_tag: Option<ETag>,
+    last_modified: Option<Timestamp>,
+    cache_control: Option<String>,
+    content_encoding: Option<String>,
+    content_language: Option<String>,
+    content_disposition: Option<String>,
+    accept_ranges: Option<String>,
+    metadata: Option<Metadata>,
+}
+
+impl CachedObject {
+    fn from_get(out: &GetObjectOutput, body: Bytes) -> Self {
+        Self {
+            body,
+            content_length: out.content_length,
+            content_type: out.content_type.clone(),
+            e_tag: out.e_tag.clone(),
+            last_modified: out.last_modified.clone(),
+            cache_control: out.cache_control.clone(),
+            content_encoding: out.content_encoding.clone(),
+            content_language: out.content_language.clone(),
+            content_disposition: out.content_disposition.clone(),
+            accept_ranges: out.accept_ranges.clone(),
+            metadata: out.metadata.clone(),
+        }
+    }
+
+    fn body_blob(&self) -> StreamingBlob {
+        let b = self.body.clone();
+        StreamingBlob::wrap(futures::stream::once(async move { Ok::<Bytes, std::io::Error>(b) }))
+    }
+
+    fn to_get(&self) -> GetObjectOutput {
+        GetObjectOutput {
+            body: Some(self.body_blob()),
+            content_length: self.content_length,
+            content_type: self.content_type.clone(),
+            e_tag: self.e_tag.clone(),
+            last_modified: self.last_modified.clone(),
+            cache_control: self.cache_control.clone(),
+            content_encoding: self.content_encoding.clone(),
+            content_language: self.content_language.clone(),
+            content_disposition: self.content_disposition.clone(),
+            accept_ranges: self.accept_ranges.clone(),
+            metadata: self.metadata.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn to_head(&self) -> HeadObjectOutput {
+        HeadObjectOutput {
+            content_length: self.content_length,
+            content_type: self.content_type.clone(),
+            e_tag: self.e_tag.clone(),
+            last_modified: self.last_modified.clone(),
+            cache_control: self.cache_control.clone(),
+            content_encoding: self.content_encoding.clone(),
+            content_language: self.content_language.clone(),
+            content_disposition: self.content_disposition.clone(),
+            accept_ranges: self.accept_ranges.clone(),
+            metadata: self.metadata.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Drain a streamed body into memory, bailing (None) past `cap` bytes or on error.
+async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
+    let mut blob = std::pin::pin!(blob);
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = blob.next().await {
+        let b = chunk.ok()?;
+        if buf.len() + b.len() > cap {
+            return None;
+        }
+        buf.extend_from_slice(&b);
+    }
+    Some(Bytes::from(buf))
 }
 
 #[derive(Default)]
@@ -38,6 +125,9 @@ pub struct Metrics {
     list_from_index: AtomicU64,
     list_passthrough: AtomicU64,
     writes_indexed: AtomicU64,
+    get_hit: AtomicU64,
+    get_miss: AtomicU64,
+    get_bypass: AtomicU64,
 }
 
 pub struct CachingProxy {
@@ -45,15 +135,30 @@ pub struct CachingProxy {
     /// Direct client used only for the startup/periodic full LIST sync.
     client: aws_sdk_s3::Client,
     state: RwLock<HashMap<String, BucketState>>,
+    /// Object-body LRU (weighted by bytes). Key = (bucket, key).
+    obj_cache: moka::future::Cache<(String, String), Arc<CachedObject>>,
+    /// Objects larger than this are never cached (segments stream straight through).
+    max_obj_bytes: usize,
     metrics: Arc<Metrics>,
 }
 
 impl CachingProxy {
-    pub fn new(inner: s3s_aws::Proxy, client: aws_sdk_s3::Client) -> Self {
+    pub fn new(
+        inner: s3s_aws::Proxy,
+        client: aws_sdk_s3::Client,
+        cache_bytes: u64,
+        max_obj_bytes: usize,
+    ) -> Self {
+        let obj_cache = moka::future::Cache::builder()
+            .max_capacity(cache_bytes)
+            .weigher(|_k, v: &Arc<CachedObject>| u32::try_from(v.body.len()).unwrap_or(u32::MAX))
+            .build();
         Self {
             inner,
             client,
             state: RwLock::new(HashMap::new()),
+            obj_cache,
+            max_obj_bytes,
             metrics: Arc::new(Metrics::default()),
         }
     }
@@ -205,16 +310,20 @@ impl CachingProxy {
 
 /// Periodically log the cache-effectiveness counters (LISTs served from the index
 /// vs forwarded, writes indexed).
-pub fn spawn_stats(metrics: Arc<Metrics>) {
+pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_mins(1));
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
             tick.tick().await;
             info!(
-                "s3cache stats: list_from_index={} list_passthrough={} writes_indexed={}",
+                "s3cache stats: list_from_index={} list_passthrough={} writes_indexed={} \
+                 get_hit={} get_miss={} get_bypass={}",
                 metrics.list_from_index.load(Ordering::Relaxed),
                 metrics.list_passthrough.load(Ordering::Relaxed),
                 metrics.writes_indexed.load(Ordering::Relaxed),
+                metrics.get_hit.load(Ordering::Relaxed),
+                metrics.get_miss.load(Ordering::Relaxed),
+                metrics.get_bypass.load(Ordering::Relaxed),
             );
         }
     });
@@ -246,6 +355,7 @@ impl s3s::S3 for CachingProxy {
         let size = req.input.content_length.unwrap_or(0);
         let resp = self.inner.put_object(req).await?;
         self.index_insert(&bucket, &key, size);
+        self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
 
@@ -257,6 +367,7 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let resp = self.inner.delete_object(req).await?;
         self.index_remove(&bucket, &key);
+        self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
 
@@ -269,6 +380,7 @@ impl s3s::S3 for CachingProxy {
         let resp = self.inner.delete_objects(req).await?;
         for k in keys {
             self.index_remove(&bucket, &k);
+            self.obj_cache.invalidate(&(bucket.clone(), k)).await;
         }
         Ok(resp)
     }
@@ -281,6 +393,7 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let resp = self.inner.complete_multipart_upload(req).await?;
         self.index_insert(&bucket, &key, 0);
+        self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
 
@@ -292,7 +405,66 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let resp = self.inner.copy_object(req).await?;
         self.index_insert(&bucket, &key, 0);
+        self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
+    }
+
+    // GET: cacheable (no range/part/conditional) small objects served from the LRU;
+    // miss buffers the body + caches it; oversized/range/conditional stream through.
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let cacheable = req.input.range.is_none()
+            && req.input.part_number.is_none()
+            && req.input.if_match.is_none()
+            && req.input.if_none_match.is_none()
+            && req.input.if_modified_since.is_none()
+            && req.input.if_unmodified_since.is_none();
+        let ckey = (req.input.bucket.clone(), req.input.key.clone());
+        if cacheable {
+            if let Some(obj) = self.obj_cache.get(&ckey).await {
+                self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
+                return Ok(S3Response::new(obj.to_get()));
+            }
+        }
+        let mut resp = self.inner.get_object(req).await?;
+        let len = resp.output.content_length.unwrap_or(-1);
+        let small = len >= 0 && usize::try_from(len).unwrap_or(usize::MAX) <= self.max_obj_bytes;
+        if cacheable && small {
+            if let Some(body) = resp.output.body.take() {
+                match buffer_body(body, self.max_obj_bytes).await {
+                    Some(bytes) => {
+                        self.obj_cache
+                            .insert(ckey, Arc::new(CachedObject::from_get(&resp.output, bytes.clone())))
+                            .await;
+                        self.metrics.get_miss.fetch_add(1, Ordering::Relaxed);
+                        resp.output.body = Some(StreamingBlob::wrap(futures::stream::once(
+                            async move { Ok::<Bytes, std::io::Error>(bytes) },
+                        )));
+                    }
+                    None => return Err(s3s::s3_error!(InternalError, "s3cache: failed to buffer body")),
+                }
+            }
+        } else {
+            self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(resp)
+    }
+
+    // HEAD served from the object cache when the body is already cached.
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        if req.input.range.is_none() && req.input.part_number.is_none() {
+            let ckey = (req.input.bucket.clone(), req.input.key.clone());
+            if let Some(obj) = self.obj_cache.get(&ckey).await {
+                self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
+                return Ok(S3Response::new(obj.to_head()));
+            }
+        }
+        self.inner.head_object(req).await
     }
 
     // Full S3 passthrough: every other op forwards to the upstream so any S3
@@ -423,9 +595,6 @@ impl s3s::S3 for CachingProxy {
     async fn get_bucket_website(&self, req: S3Request<s3s::dto::GetBucketWebsiteInput>) -> S3Result<S3Response<s3s::dto::GetBucketWebsiteOutput>> {
         self.inner.get_bucket_website(req).await
     }
-    async fn get_object(&self, req: S3Request<s3s::dto::GetObjectInput>) -> S3Result<S3Response<s3s::dto::GetObjectOutput>> {
-        self.inner.get_object(req).await
-    }
     async fn get_object_acl(&self, req: S3Request<s3s::dto::GetObjectAclInput>) -> S3Result<S3Response<s3s::dto::GetObjectAclOutput>> {
         self.inner.get_object_acl(req).await
     }
@@ -452,9 +621,6 @@ impl s3s::S3 for CachingProxy {
     }
     async fn head_bucket(&self, req: S3Request<s3s::dto::HeadBucketInput>) -> S3Result<S3Response<s3s::dto::HeadBucketOutput>> {
         self.inner.head_bucket(req).await
-    }
-    async fn head_object(&self, req: S3Request<s3s::dto::HeadObjectInput>) -> S3Result<S3Response<s3s::dto::HeadObjectOutput>> {
-        self.inner.head_object(req).await
     }
     async fn list_bucket_analytics_configurations(&self, req: S3Request<s3s::dto::ListBucketAnalyticsConfigurationsInput>) -> S3Result<S3Response<s3s::dto::ListBucketAnalyticsConfigurationsOutput>> {
         self.inner.list_bucket_analytics_configurations(req).await

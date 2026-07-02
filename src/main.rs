@@ -37,7 +37,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             .build(),
     );
     let proxy = s3s_aws::Proxy::from(client.clone());
-    let cp = cache::CachingProxy::new(proxy, client);
+    // Object-cache sizing: total LRU capacity + per-object cap (bigger objects, e.g.
+    // segment blobs, stream straight through and aren't cached).
+    let cache_bytes: u64 = env_or("S3CACHE_CACHE_BYTES", "268435456").parse().unwrap_or(268_435_456);
+    let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608").parse().unwrap_or(8_388_608);
+    let cp = cache::CachingProxy::new(proxy, client, cache_bytes, max_obj_bytes);
 
     // Eagerly index the configured buckets before serving, so LIST is answered from the
     // index from the first request. A bucket that fails to sync stays in passthrough (safe).
@@ -51,7 +55,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             Err(e) => tracing::warn!("initial sync of `{bucket}` failed (passthrough): {e}"),
         }
     }
-    cache::spawn_stats(cp.metrics());
+    let stats_secs: u64 = env_or("S3CACHE_STATS_SECS", "60").parse().unwrap_or(60);
+    cache::spawn_stats(cp.metrics(), stats_secs);
 
     let service = {
         let mut b = S3ServiceBuilder::new(cp);
