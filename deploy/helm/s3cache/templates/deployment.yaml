@@ -42,6 +42,18 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.auth.existingSecret }}
+          # The initial full R2 sync (a paginated LIST of every configured bucket) runs
+          # BEFORE the listener binds — the port only opens once the index is complete,
+          # which is exactly what stops a fresh/restarted pod from serving an incomplete
+          # LIST (the single-index correctness invariant on restart). A large bucket makes
+          # that sync slow, so gate liveness behind a startupProbe with generous headroom;
+          # without it the 10s + 3×30s liveness would kill the pod mid-sync and crashloop
+          # it. Once the port opens (sync done) liveness/readiness take over normally.
+          startupProbe:
+            tcpSocket:
+              port: s3
+            periodSeconds: 5
+            failureThreshold: {{ .Values.startupProbe.failureThreshold | default 120 }}
           readinessProbe:
             tcpSocket:
               port: s3

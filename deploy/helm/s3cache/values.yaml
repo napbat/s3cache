@@ -1,4 +1,16 @@
+# Single replica is intentional and load-bearing: the in-memory LIST index is
+# authoritative and correct ONLY as the sole path to the bucket, so this must stay 1
+# (see the chart's Recreate strategy + the startupProbe note in the Deployment). HA is
+# by fast restart — a fresh pod re-syncs from R2 before it opens its port — not by
+# horizontal replication (which would let replicas' indexes diverge).
 replicaCount: 1
+
+# Headroom for the initial full-bucket R2 sync before the port opens (periodSeconds 5 ×
+# failureThreshold). Raise it if a bucket grows large enough that the first sync needs
+# more than ~10 min; the pod stays un-Ready (no traffic) until it finishes, then normal
+# liveness/readiness apply.
+startupProbe:
+  failureThreshold: 120
 
 image:
   repository: ghcr.io/napbat/s3cache
