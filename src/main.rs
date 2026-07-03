@@ -43,18 +43,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608").parse().unwrap_or(8_388_608);
     let cp = cache::CachingProxy::new(proxy, client, cache_bytes, max_obj_bytes);
 
-    // Eagerly index the configured buckets before serving, so LIST is answered from the
-    // index from the first request. A bucket that fails to sync stays in passthrough (safe).
-    for bucket in env_or("S3CACHE_BUCKETS", "")
+    // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
+    // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the
+    // upstream (always correct) until a bucket's index is complete, then flip to
+    // index-served. Keeps startup instant + independent of bucket size. A bucket that
+    // fails to sync just stays in passthrough (safe).
+    let buckets: Vec<String> = env_or("S3CACHE_BUCKETS", "")
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        match cp.sync_bucket(bucket).await {
-            Ok(n) => info!("indexed {n} keys for bucket `{bucket}`"),
-            Err(e) => tracing::warn!("initial sync of `{bucket}` failed (passthrough): {e}"),
-        }
-    }
+        .map(str::to_owned)
+        .collect();
+    cp.spawn_background_sync(buckets);
     let stats_secs: u64 = env_or("S3CACHE_STATS_SECS", "60").parse().unwrap_or(60);
     cache::spawn_stats(cp.metrics(), stats_secs);
 

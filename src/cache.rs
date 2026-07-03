@@ -8,8 +8,12 @@
 //! (OCC) writes, so correctness is unchanged.
 //!
 //! Correctness rests on a single property: this proxy is the *only* path to the
-//! bucket. Buckets are eagerly synced once at startup (before serving), then kept
-//! current by observed writes, with a periodic re-sync as a drift safety-net.
+//! bucket. The LIST index warms up lazily — the proxy serves immediately and a
+//! background task does the one full LIST per bucket; until a bucket's index is
+//! complete, LISTs for it pass straight through to the upstream (always correct), then
+//! flip to index-served ([`CachingProxy::is_synced`] gates this). Once warm it's kept
+//! current by observed writes. The GET/HEAD body cache is separately lazy (populate on
+//! miss, invalidate on write).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -132,9 +136,11 @@ pub struct Metrics {
 
 pub struct CachingProxy {
     inner: s3s_aws::Proxy,
-    /// Direct client used only for the startup/periodic full LIST sync.
+    /// Direct client used only for the background full LIST warm-up sync.
     client: aws_sdk_s3::Client,
-    state: RwLock<HashMap<String, BucketState>>,
+    /// The LIST index, `Arc` so the background warm-up task shares it with the serving
+    /// proxy (the service takes the proxy by value, so the sync can't borrow `self`).
+    state: Arc<RwLock<HashMap<String, BucketState>>>,
     /// Object-body LRU (weighted by bytes). Key = (bucket, key).
     obj_cache: moka::future::Cache<(String, String), Arc<CachedObject>>,
     /// Objects larger than this are never cached (segments stream straight through).
@@ -156,7 +162,7 @@ impl CachingProxy {
         Self {
             inner,
             client,
-            state: RwLock::new(HashMap::new()),
+            state: Arc::new(RwLock::new(HashMap::new())),
             obj_cache,
             max_obj_bytes,
             metrics: Arc::new(Metrics::default()),
@@ -167,45 +173,27 @@ impl CachingProxy {
         self.metrics.clone()
     }
 
-    /// Full paginated LIST of a bucket into the index, then mark it synced. Merges
-    /// (never clears) so a write that raced the sync isn't lost.
-    pub async fn sync_bucket(&self, bucket: &str) -> anyhow::Result<usize> {
-        let mut token: Option<String> = None;
-        let mut found = 0usize;
-        loop {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(bucket)
-                .max_keys(1000);
-            if let Some(t) = &token {
-                req = req.continuation_token(t);
-            }
-            let resp = req.send().await?;
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    let last_modified = obj
-                        .last_modified()
-                        .and_then(|d| u64::try_from(d.secs()).ok())
-                        .map_or_else(SystemTime::now, |s| UNIX_EPOCH + Duration::from_secs(s));
-                    let entry = ObjEntry { size: obj.size().unwrap_or(0), last_modified };
-                    let mut g = self.state.write().unwrap();
-                    g.entry(bucket.to_owned()).or_default().keys.insert(key.to_owned(), entry);
-                    found += 1;
+    /// Warm the LIST index in the background instead of pre-loading it before serving.
+    /// The proxy binds + serves immediately; a `LIST` for a bucket whose index isn't
+    /// complete yet passes straight through to the upstream ([`is_synced`] gates it), so
+    /// results are always correct during warm-up. Once a bucket's full sync finishes it
+    /// flips to index-served. This keeps startup instant and independent of bucket size,
+    /// rather than blocking the port on a full pre-sync (which grows with the object count).
+    ///
+    /// [`is_synced`]: Self::is_synced
+    pub fn spawn_background_sync(&self, buckets: Vec<String>) {
+        let client = self.client.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            for bucket in buckets {
+                match sync_bucket_into(&client, &state, &bucket).await {
+                    Ok(n) => info!("warmed LIST index for `{bucket}`: {n} keys"),
+                    Err(e) => {
+                        tracing::warn!("background sync of `{bucket}` failed (staying passthrough): {e}");
+                    }
                 }
             }
-            if resp.is_truncated().unwrap_or(false) {
-                token = resp.next_continuation_token().map(str::to_owned);
-                if token.is_none() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        self.state.write().unwrap().entry(bucket.to_owned()).or_default().synced = true;
-        info!("synced bucket `{bucket}` into index: {found} keys");
-        Ok(found)
+        });
     }
 
     fn index_insert(&self, bucket: &str, key: &str, size: i64) {
@@ -306,6 +294,49 @@ impl CachingProxy {
         }
     }
 
+}
+
+/// Full paginated LIST of a bucket into `state`, then mark it synced. Merges (never
+/// clears) so a write that raced the sync isn't lost. Free-standing (takes the client +
+/// shared index) so the background warm-up task can run it without borrowing the proxy,
+/// which the S3 service owns by value.
+async fn sync_bucket_into(
+    client: &aws_sdk_s3::Client,
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+) -> anyhow::Result<usize> {
+    let mut token: Option<String> = None;
+    let mut found = 0usize;
+    loop {
+        let mut req = client.list_objects_v2().bucket(bucket).max_keys(1000);
+        if let Some(t) = &token {
+            req = req.continuation_token(t);
+        }
+        let resp = req.send().await?;
+        for obj in resp.contents() {
+            if let Some(key) = obj.key() {
+                let last_modified = obj
+                    .last_modified()
+                    .and_then(|d| u64::try_from(d.secs()).ok())
+                    .map_or_else(SystemTime::now, |s| UNIX_EPOCH + Duration::from_secs(s));
+                let entry = ObjEntry { size: obj.size().unwrap_or(0), last_modified };
+                let mut g = state.write().unwrap();
+                g.entry(bucket.to_owned()).or_default().keys.insert(key.to_owned(), entry);
+                found += 1;
+            }
+        }
+        if resp.is_truncated().unwrap_or(false) {
+            token = resp.next_continuation_token().map(str::to_owned);
+            if token.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    state.write().unwrap().entry(bucket.to_owned()).or_default().synced = true;
+    info!("synced bucket `{bucket}` into index: {found} keys");
+    Ok(found)
 }
 
 /// Periodically log the cache-effectiveness counters (LISTs served from the index
