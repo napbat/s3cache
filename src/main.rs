@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    raise_fd_limit();
 
     let listen = env_or("S3CACHE_LISTEN", "0.0.0.0:8014");
     let endpoint = std::env::var("S3CACHE_UPSTREAM_ENDPOINT")
@@ -99,4 +100,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => info!("shutdown timed out"),
     }
     Ok(())
+}
+
+/// Raise `RLIMIT_NOFILE`'s soft limit to the hard cap. The proxy holds one accepted
+/// socket per in-cluster client connection plus its upstream pool; docres alone keeps
+/// ~1000 keepalive connections open (an HTTP pool per `LanceDB` dataset), so a
+/// distro-default soft limit of 1024 exhausts and `accept()` starts failing — seen as
+/// probe timeouts on this pod and EMFILE request failures in its clients.
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    match rlimit::Resource::NOFILE.get() {
+        Ok((soft, hard)) if soft < hard => match rlimit::Resource::NOFILE.set(hard, hard) {
+            Ok(()) => info!("raised open-file soft limit {soft} -> {hard}"),
+            Err(err) => tracing::warn!("could not raise open-file soft limit: {err}"),
+        },
+        Ok(_) => {}
+        Err(err) => tracing::warn!("could not read the open-file limit: {err}"),
+    }
 }
