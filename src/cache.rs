@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, StreamingBlob, Metadata, ETag, Timestamp};
-use s3s::{S3Request, S3Response, S3Result};
+use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
 struct ObjEntry {
@@ -161,6 +161,7 @@ pub struct Metrics {
     get_bypass: AtomicU64,
     range_hit: AtomicU64,
     range_promote: AtomicU64,
+    range_promote_reject: AtomicU64,
 }
 
 pub struct CachingProxy {
@@ -244,6 +245,83 @@ impl CachingProxy {
     /// LIST warm-up). Drives the range-promotion decision without a HEAD.
     fn index_size(&self, bucket: &str, key: &str) -> Option<i64> {
         self.state.read().unwrap().get(bucket).and_then(|b| b.keys.get(key)).map(|e| e.size)
+    }
+
+    /// The upstream's actual size of a key (one HEAD via the direct client).
+    /// Used where the write path doesn't carry the size (multipart complete,
+    /// copy) — indexing those at a placeholder poisons range promotion.
+    async fn upstream_size(&self, bucket: &str, key: &str) -> Option<i64> {
+        self.client.head_object().bucket(bucket).key(key).send().await.ok()?.content_length()
+    }
+
+    /// Try to serve an int-range GET by promoting the whole object into the LRU
+    /// (one upstream fetch, singleflighted by `try_get_with`). `Some(_)` when
+    /// served — a slice, or `InvalidRange` past EOF; `None` when the promote was
+    /// refused/failed and the caller should stream the range through. The
+    /// loader gets its own request (input is Clone, all fields pub) so the
+    /// caller's — range intact — survives for that fallback. The index size can
+    /// lie (a stale entry, or a write path that didn't carry one), so the
+    /// loader trusts the upstream's Content-Length, refuses oversize bodies
+    /// before buffering, and the reject path writes the real size back so the
+    /// next range takes the bypass immediately instead of re-attempting.
+    async fn promote_range(
+        &self,
+        ckey: &(String, String),
+        req: &S3Request<GetObjectInput>,
+        first: u64,
+        last: Option<u64>,
+    ) -> Option<S3Result<S3Response<GetObjectOutput>>> {
+        let whole = S3Request {
+            input: { let mut i = req.input.clone(); i.range = None; i },
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            headers: req.headers.clone(),
+            extensions: req.extensions.clone(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+            trailing_headers: None,
+        };
+        let cap = self.max_obj_bytes;
+        let inner = &self.inner;
+        let fetched = self
+            .obj_cache
+            .try_get_with(ckey.clone(), async move {
+                let mut resp = inner.get_object(whole).await.map_err(|e| e.to_string())?;
+                let declared = resp.output.content_length.unwrap_or(-1);
+                if declared < 0 || usize::try_from(declared).unwrap_or(usize::MAX) > cap {
+                    return Err(format!("oversize {declared}"));
+                }
+                let body = match resp.output.body.take() {
+                    Some(b) => buffer_body(b, cap)
+                        .await
+                        .ok_or_else(|| format!("oversize {declared} (body past declared length)"))?,
+                    None => Bytes::new(),
+                };
+                Ok::<_, String>(Arc::new(CachedObject::from_get(&resp.output, body)))
+            })
+            .await;
+        match fetched {
+            Ok(obj) => {
+                self.metrics.range_promote.fetch_add(1, Ordering::Relaxed);
+                Some(obj.to_get_range(first, last).map_or_else(
+                    || Err(s3s::s3_error!(InvalidRange, "range start past end of object")),
+                    |out| Ok(S3Response::new(out)),
+                ))
+            }
+            Err(e) => {
+                // Self-heal a lying index entry so this object stops
+                // re-attempting promotion, then let the caller serve upstream.
+                if let Some(sz) = e.strip_prefix("oversize ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<i64>().ok()) {
+                    if sz >= 0 {
+                        self.index_insert(&ckey.0, &ckey.1, sz);
+                    }
+                }
+                self.metrics.range_promote_reject.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("range promote of {}/{} failed ({e}); falling back to passthrough", ckey.0, ckey.1);
+                None
+            }
+        }
     }
 
     fn is_synced(&self, bucket: &str) -> bool {
@@ -383,7 +461,7 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
             tick.tick().await;
             info!(
                 "s3cache stats: list_from_index={} list_passthrough={} writes_indexed={} \
-                 get_hit={} get_miss={} get_bypass={} range_hit={} range_promote={}",
+                 get_hit={} get_miss={} get_bypass={} range_hit={} range_promote={} range_promote_reject={}",
                 metrics.list_from_index.load(Ordering::Relaxed),
                 metrics.list_passthrough.load(Ordering::Relaxed),
                 metrics.writes_indexed.load(Ordering::Relaxed),
@@ -392,6 +470,7 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
                 metrics.get_bypass.load(Ordering::Relaxed),
                 metrics.range_hit.load(Ordering::Relaxed),
                 metrics.range_promote.load(Ordering::Relaxed),
+                metrics.range_promote_reject.load(Ordering::Relaxed),
             );
         }
     });
@@ -460,7 +539,11 @@ impl s3s::S3 for CachingProxy {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let resp = self.inner.complete_multipart_upload(req).await?;
-        self.index_insert(&bucket, &key, 0);
+        // Multipart is how the big objects arrive, and indexing them at a
+        // placeholder size poisoned the range-promotion decision (a "0-byte"
+        // entry promoted a multi-GB fetch). One HEAD learns the real size.
+        let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
+        self.index_insert(&bucket, &key, size);
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -472,7 +555,8 @@ impl s3s::S3 for CachingProxy {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let resp = self.inner.copy_object(req).await?;
-        self.index_insert(&bucket, &key, 0);
+        let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
+        self.index_insert(&bucket, &key, size);
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -486,7 +570,7 @@ impl s3s::S3 for CachingProxy {
     // unknown-size ranges and conditional requests still stream through.
     async fn get_object(
         &self,
-        mut req: S3Request<GetObjectInput>,
+        req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let unconditional = req.input.part_number.is_none()
             && req.input.if_match.is_none()
@@ -509,39 +593,18 @@ impl s3s::S3 for CachingProxy {
             }
             // Promote when the index says the whole object fits the cache: one
             // upstream GET (deduped across concurrent ranges by try_get_with),
-            // then every range — this one included — is a local slice.
+            // then every range — this one included — is a local slice. A
+            // refused/failed promote degrades to the passthrough below, never
+            // an error.
             let small = self
                 .index_size(&ckey.0, &ckey.1)
                 .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
             if small {
-                req.input.range = None; // fetch the whole object in the loader
-                let cap = self.max_obj_bytes;
-                let inner = &self.inner;
-                let fetched = self
-                    .obj_cache
-                    .try_get_with(ckey.clone(), async move {
-                        let mut resp = inner.get_object(req).await.map_err(|e| e.to_string())?;
-                        let body = match resp.output.body.take() {
-                            Some(b) => buffer_body(b, cap)
-                                .await
-                                .ok_or_else(|| "s3cache: range-promote buffer overflow".to_owned())?,
-                            None => Bytes::new(),
-                        };
-                        Ok::<_, String>(Arc::new(CachedObject::from_get(&resp.output, body)))
-                    })
-                    .await;
-                match fetched {
-                    Ok(obj) => {
-                        self.metrics.range_promote.fetch_add(1, Ordering::Relaxed);
-                        return obj
-                            .to_get_range(first, last)
-                            .map(|out| Ok(S3Response::new(out)))
-                            .unwrap_or_else(|| Err(s3s::s3_error!(InvalidRange, "range start past end of object")));
-                    }
-                    Err(e) => return Err(s3s::s3_error!(InternalError, "s3cache: range promote failed: {e}")),
+                if let Some(resp) = self.promote_range(&ckey, &req, first, last).await {
+                    return resp;
                 }
             }
-            // Big or not-yet-indexed: stream the range through as before.
+            // Big, not-yet-indexed, or a failed promote: stream the range through.
             self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);
             return self.inner.get_object(req).await;
         }
