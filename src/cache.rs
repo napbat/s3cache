@@ -87,6 +87,33 @@ impl CachedObject {
         }
     }
 
+    /// A 206-shaped GET for an inclusive byte range sliced out of the cached
+    /// body (clamped at EOF). `None` when the range start is past the object.
+    fn to_get_range(&self, first: u64, last: Option<u64>) -> Option<GetObjectOutput> {
+        let total = self.body.len() as u64;
+        if first >= total {
+            return None;
+        }
+        let last_incl = last.map_or(total - 1, |l| l.min(total - 1));
+        let slice = self.body.slice(usize::try_from(first).ok()?..=usize::try_from(last_incl).ok()?);
+        let len = slice.len();
+        Some(GetObjectOutput {
+            body: Some(StreamingBlob::wrap(futures::stream::once(async move { Ok::<Bytes, std::io::Error>(slice) }))),
+            content_length: Some(i64::try_from(len).unwrap_or(i64::MAX)),
+            content_range: Some(format!("bytes {first}-{last_incl}/{total}")),
+            content_type: self.content_type.clone(),
+            e_tag: self.e_tag.clone(),
+            last_modified: self.last_modified.clone(),
+            cache_control: self.cache_control.clone(),
+            content_encoding: self.content_encoding.clone(),
+            content_language: self.content_language.clone(),
+            content_disposition: self.content_disposition.clone(),
+            accept_ranges: self.accept_ranges.clone(),
+            metadata: self.metadata.clone(),
+            ..Default::default()
+        })
+    }
+
     fn to_head(&self) -> HeadObjectOutput {
         HeadObjectOutput {
             content_length: self.content_length,
@@ -132,6 +159,8 @@ pub struct Metrics {
     get_hit: AtomicU64,
     get_miss: AtomicU64,
     get_bypass: AtomicU64,
+    range_hit: AtomicU64,
+    range_promote: AtomicU64,
 }
 
 pub struct CachingProxy {
@@ -209,6 +238,12 @@ impl CachingProxy {
         if let Some(b) = self.state.write().unwrap().get_mut(bucket) {
             b.keys.remove(key);
         }
+    }
+
+    /// The indexed size of a key, if this proxy has seen it (write-through or
+    /// LIST warm-up). Drives the range-promotion decision without a HEAD.
+    fn index_size(&self, bucket: &str, key: &str) -> Option<i64> {
+        self.state.read().unwrap().get(bucket).and_then(|b| b.keys.get(key)).map(|e| e.size)
     }
 
     fn is_synced(&self, bucket: &str) -> bool {
@@ -348,13 +383,15 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
             tick.tick().await;
             info!(
                 "s3cache stats: list_from_index={} list_passthrough={} writes_indexed={} \
-                 get_hit={} get_miss={} get_bypass={}",
+                 get_hit={} get_miss={} get_bypass={} range_hit={} range_promote={}",
                 metrics.list_from_index.load(Ordering::Relaxed),
                 metrics.list_passthrough.load(Ordering::Relaxed),
                 metrics.writes_indexed.load(Ordering::Relaxed),
                 metrics.get_hit.load(Ordering::Relaxed),
                 metrics.get_miss.load(Ordering::Relaxed),
                 metrics.get_bypass.load(Ordering::Relaxed),
+                metrics.range_hit.load(Ordering::Relaxed),
+                metrics.range_promote.load(Ordering::Relaxed),
             );
         }
     });
@@ -440,19 +477,74 @@ impl s3s::S3 for CachingProxy {
         Ok(resp)
     }
 
-    // GET: cacheable (no range/part/conditional) small objects served from the LRU;
-    // miss buffers the body + caches it; oversized/range/conditional stream through.
+    // GET: cacheable (no part/conditional) small objects served from the LRU;
+    // miss buffers the body + caches it. RANGED reads of cacheable-size objects
+    // are served by slicing the cached whole object — promoted (whole-object
+    // fetch, singleflighted by moka's try_get_with) on first touch. docres reads
+    // payload packs and lance data via ranged GETs; streaming every range
+    // through to R2 made each search hit a full upstream round trip. Oversized/
+    // unknown-size ranges and conditional requests still stream through.
     async fn get_object(
         &self,
-        req: S3Request<GetObjectInput>,
+        mut req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let cacheable = req.input.range.is_none()
-            && req.input.part_number.is_none()
+        let unconditional = req.input.part_number.is_none()
             && req.input.if_match.is_none()
             && req.input.if_none_match.is_none()
             && req.input.if_modified_since.is_none()
             && req.input.if_unmodified_since.is_none();
+        let cacheable = unconditional && req.input.range.is_none();
         let ckey = (req.input.bucket.clone(), req.input.key.clone());
+        let int_range = match (unconditional, req.input.range) {
+            (true, Some(s3s::dto::Range::Int { first, last })) => Some((first, last)),
+            _ => None,
+        };
+        if let Some((first, last)) = int_range {
+            // Cached whole object → serve the slice locally.
+            if let Some(obj) = self.obj_cache.get(&ckey).await {
+                if let Some(out) = obj.to_get_range(first, last) {
+                    self.metrics.range_hit.fetch_add(1, Ordering::Relaxed);
+                    return Ok(S3Response::new(out));
+                }
+            }
+            // Promote when the index says the whole object fits the cache: one
+            // upstream GET (deduped across concurrent ranges by try_get_with),
+            // then every range — this one included — is a local slice.
+            let small = self
+                .index_size(&ckey.0, &ckey.1)
+                .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
+            if small {
+                req.input.range = None; // fetch the whole object in the loader
+                let cap = self.max_obj_bytes;
+                let inner = &self.inner;
+                let fetched = self
+                    .obj_cache
+                    .try_get_with(ckey.clone(), async move {
+                        let mut resp = inner.get_object(req).await.map_err(|e| e.to_string())?;
+                        let body = match resp.output.body.take() {
+                            Some(b) => buffer_body(b, cap)
+                                .await
+                                .ok_or_else(|| "s3cache: range-promote buffer overflow".to_owned())?,
+                            None => Bytes::new(),
+                        };
+                        Ok::<_, String>(Arc::new(CachedObject::from_get(&resp.output, body)))
+                    })
+                    .await;
+                match fetched {
+                    Ok(obj) => {
+                        self.metrics.range_promote.fetch_add(1, Ordering::Relaxed);
+                        return obj
+                            .to_get_range(first, last)
+                            .map(|out| Ok(S3Response::new(out)))
+                            .unwrap_or_else(|| Err(s3s::s3_error!(InvalidRange, "range start past end of object")));
+                    }
+                    Err(e) => return Err(s3s::s3_error!(InternalError, "s3cache: range promote failed: {e}")),
+                }
+            }
+            // Big or not-yet-indexed: stream the range through as before.
+            self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);
+            return self.inner.get_object(req).await;
+        }
         if cacheable {
             if let Some(obj) = self.obj_cache.get(&ckey).await {
                 self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
