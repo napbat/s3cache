@@ -9,7 +9,7 @@ helm:
   releaseName: s3cache
   values:
     image:
-      tag: 9ab7e9cbabade225383b966f75d3da35c00b8a5d
+      tag: 960e2b932e1ea23f9f6c55f8b1891150b11f6c44
     upstream:
       endpoint: https://e340c486028724e7b58d09928fdf10e2.r2.cloudflarestorage.com
       buckets: docres
