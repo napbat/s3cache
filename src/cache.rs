@@ -217,10 +217,10 @@ impl CachingProxy {
             Err(e) => {
                 // Self-heal a lying index entry so this object stops
                 // re-attempting promotion, then let the caller serve upstream.
-                if let Some(sz) = e.strip_prefix("oversize ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<i64>().ok()) {
-                    if sz >= 0 {
-                        self.index_insert(&ckey.0, &ckey.1, sz);
-                    }
+                if let Some(sz) = e.strip_prefix("oversize ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<i64>().ok())
+                    && sz >= 0
+                {
+                    self.index_insert(&ckey.0, &ckey.1, sz);
                 }
                 self.metrics.range_promote_reject.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("range promote of {}/{} failed ({e}); falling back to passthrough", ckey.0, ckey.1);
@@ -491,11 +491,11 @@ impl s3s::S3 for CachingProxy {
         };
         if let Some((first, last)) = int_range {
             // Cached whole object → serve the slice locally.
-            if let Some(obj) = self.obj_cache.get(&ckey).await {
-                if let Some(out) = obj.to_get_range(first, last) {
-                    self.metrics.range_hit.fetch_add(1, Ordering::Relaxed);
-                    return Ok(S3Response::new(out));
-                }
+            if let Some(obj) = self.obj_cache.get(&ckey).await
+                && let Some(out) = obj.to_get_range(first, last)
+            {
+                self.metrics.range_hit.fetch_add(1, Ordering::Relaxed);
+                return Ok(S3Response::new(out));
             }
             // Promote when caching is on and the index says the whole object fits: one
             // upstream GET (deduped across concurrent ranges when hot is active), then
@@ -505,38 +505,38 @@ impl s3s::S3 for CachingProxy {
                 && self
                     .index_size(&ckey.0, &ckey.1)
                     .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
-            if small {
-                if let Some(resp) = self.promote_range(&ckey, &req, first, last).await {
-                    return resp;
-                }
+            if small
+                && let Some(resp) = self.promote_range(&ckey, &req, first, last).await
+            {
+                return resp;
             }
             // Big, not-yet-indexed, or a failed promote: stream the range through.
             self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);
             return self.inner.get_object(req).await;
         }
-        if cacheable {
-            if let Some(obj) = self.obj_cache.get(&ckey).await {
-                self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
-                return Ok(S3Response::new(obj.to_get()));
-            }
+        if cacheable
+            && let Some(obj) = self.obj_cache.get(&ckey).await
+        {
+            self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
+            return Ok(S3Response::new(obj.to_get()));
         }
         let mut resp = self.inner.get_object(req).await?;
         let len = resp.output.content_length.unwrap_or(-1);
         let small = len >= 0 && usize::try_from(len).unwrap_or(usize::MAX) <= self.max_obj_bytes;
-        if cacheable && small && self.obj_cache.is_enabled() {
-            if let Some(body) = resp.output.body.take() {
-                match tier::buffer_body(body, self.max_obj_bytes).await {
-                    Some(bytes) => {
-                        self.obj_cache
-                            .insert(ckey, Arc::new(CachedObject::from_get(&resp.output, bytes.clone())))
-                            .await;
-                        self.metrics.get_miss.fetch_add(1, Ordering::Relaxed);
-                        resp.output.body = Some(StreamingBlob::wrap(futures::stream::once(
-                            async move { Ok::<Bytes, std::io::Error>(bytes) },
-                        )));
-                    }
-                    None => return Err(s3s::s3_error!(InternalError, "s3cache: failed to buffer body")),
+        if cacheable && small && self.obj_cache.is_enabled()
+            && let Some(body) = resp.output.body.take()
+        {
+            match tier::buffer_body(body, self.max_obj_bytes).await {
+                Some(bytes) => {
+                    self.obj_cache
+                        .insert(ckey, Arc::new(CachedObject::from_get(&resp.output, bytes.clone())))
+                        .await;
+                    self.metrics.get_miss.fetch_add(1, Ordering::Relaxed);
+                    resp.output.body = Some(StreamingBlob::wrap(futures::stream::once(
+                        async move { Ok::<Bytes, std::io::Error>(bytes) },
+                    )));
                 }
+                None => return Err(s3s::s3_error!(InternalError, "s3cache: failed to buffer body")),
             }
         } else {
             self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);

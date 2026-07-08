@@ -331,18 +331,18 @@ impl TieredCache {
 
     /// Look up a whole cached object: hot first, then warm (a warm hit backfills hot).
     pub async fn get(&self, key: &(String, String)) -> Option<Arc<CachedObject>> {
-        if let Some(hot) = &self.hot {
-            if let Some(obj) = hot.get(key).await {
-                return Some(obj);
-            }
+        if let Some(hot) = &self.hot
+            && let Some(obj) = hot.get(key).await
+        {
+            return Some(obj);
         }
-        if let Some(warm) = &self.warm {
-            if let Some(obj) = warm.get(&key.0, &key.1).await {
-                if let Some(hot) = &self.hot {
-                    hot.insert(key.clone(), obj.clone()).await;
-                }
-                return Some(obj);
+        if let Some(warm) = &self.warm
+            && let Some(obj) = warm.get(&key.0, &key.1).await
+        {
+            if let Some(hot) = &self.hot {
+                hot.insert(key.clone(), obj.clone()).await;
             }
+            return Some(obj);
         }
         None
     }
@@ -380,10 +380,10 @@ impl TieredCache {
         Fut: Future<Output = Result<Arc<CachedObject>, String>> + Send,
     {
         let load = async {
-            if let Some(warm) = &self.warm {
-                if let Some(obj) = warm.get(&key.0, &key.1).await {
-                    return Ok(obj);
-                }
+            if let Some(warm) = &self.warm
+                && let Some(obj) = warm.get(&key.0, &key.1).await
+            {
+                return Ok(obj);
             }
             let obj = origin.await?;
             if let Some(warm) = &self.warm {
