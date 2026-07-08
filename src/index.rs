@@ -10,13 +10,15 @@ use s3s::dto::{CommonPrefix, ListObjectsV2Input, ListObjectsV2Output, Object, Ti
 use tracing::info;
 
 /// One indexed key's LIST metadata: its size and last-modified time.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ObjEntry {
     pub(crate) size: i64,
     pub(crate) last_modified: SystemTime,
 }
 
 /// Per-bucket LIST index: the sorted key set plus whether its warm-up sync has finished.
-#[derive(Default)]
+/// `Clone`/`serde` so the Raft state machine can snapshot the whole index (see `raft`).
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BucketState {
     pub(crate) synced: bool,
     pub(crate) keys: BTreeMap<String, ObjEntry>,

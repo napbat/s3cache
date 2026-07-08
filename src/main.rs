@@ -8,6 +8,11 @@ mod cache;
 mod coherence;
 mod index;
 mod metrics;
+// The embedded Raft index-coherence substrate (replacing the Valkey commit log). Test-gated
+// until it is wired into the proxy's read/write paths, so it adds nothing to the binary yet
+// but is fully compiled, clippy-checked (`--all-targets`), and exercised by its own tests.
+#[cfg(test)]
+mod raft;
 mod tier;
 
 use std::error::Error;
