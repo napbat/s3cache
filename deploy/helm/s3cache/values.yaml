@@ -19,23 +19,21 @@ upstream:
   endpoint: ""            # e.g. https://<acct>.r2.cloudflarestorage.com  (required)
   buckets: ""             # comma-separated buckets to index eagerly
 
-# Object-body cache tiers in front of the S3 origin (which is always the cold source):
-#   off       passthrough, no body cache
-#   hot       node-local heap only (default; matches the single-replica model above)
-#   warm      shared Valkey only — coherent across replicas, no node-local copy
-#   hot+warm  node-local heap in front of shared Valkey
-# NOTE: the LIST index is still node-local in this release, so keep replicaCount at 1
-# until the shared index lands (see the repo roadmap). Warm makes the *body* cache
-# coherent across nodes; it does not yet make the index coherent.
-cache:
-  mode: hot
+# Object-body cache: hot (in-memory) is always on. An optional node-local disk (warm)
+# tier holds more and survives restarts (a fresh pod comes up warm). Mount a volume at
+# diskCache.path; a persistentVolumeClaim survives pod reschedules, emptyDir only restarts.
+diskCache:
+  enabled: false
+  path: /var/cache/s3cache
+  bytes: 10737418240        # 10 GiB
+  volume:                   # any pod-volume spec backing diskCache.path
+    emptyDir: {}
 
-# Shared Valkey/Redis, used by the warm object tier and/or the index commit log. Set
-# valkey.url whenever cache.mode includes warm OR indexLog.enabled is true.
+# Shared Valkey/Redis, used only by the index commit log (cross-node coherence). Required
+# when indexLog.enabled is true. (Being retired in favor of an embedded log — see README.)
 valkey:
   url: ""                 # e.g. redis://valkey.default.svc.cluster.local:6379
   pool: 4                 # Valkey connections per replica
-  ttlSecs: 0              # 0 = keep warm entries until invalidated/evicted
 
 # Cross-node index coherence via a Valkey Streams commit log. Enable this to run more
 # than one replica without their LIST indexes drifting (requires valkey.url). Works with

@@ -50,37 +50,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let cache_bytes: u64 = env_or("S3CACHE_CACHE_BYTES", "268435456").parse().unwrap_or(268_435_456);
     let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608").parse().unwrap_or(8_388_608);
 
-    // Cache tiers: hot (node-local heap), warm (shared Valkey), cold (the S3 origin).
-    // S3CACHE_MODE selects which sit in front of the origin; a warm-only mode skips the
-    // node-local copy so every node stays coherent. S3CACHE_INDEX_LOG additionally shares
-    // the LIST index across nodes via a Valkey Streams commit log (multi-replica safe).
-    let mode = tier::CacheMode::parse(&env_or("S3CACHE_MODE", "hot"));
-    let index_log_on = matches!(env_or("S3CACHE_INDEX_LOG", "false").trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
+    // Object-body cache: hot (node-local heap) in front of an optional node-local disk
+    // tier (warm), in front of the S3 origin (cold). Always layered — no mode to pick.
     let metrics = Arc::new(metrics::Metrics::default());
 
-    // One Valkey pool (appends + warm ops), shared by the warm object cache and the
-    // index commit log; the log additionally gets a dedicated connection for its
-    // blocking reads so they can't stall an append.
-    let valkey_url = (mode.warm() || index_log_on)
-        .then(|| std::env::var("S3CACHE_VALKEY_URL").expect("S3CACHE_VALKEY_URL is required when the warm tier or the index log is enabled"));
-    let valkey = if let Some(url) = &valkey_url {
-        let pool_size: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
-        let pool = tier::connect_valkey(url, pool_size)?;
-        info!("Valkey pool of {pool_size} (connecting in background)");
-        Some(pool)
-    } else {
+    // Optional node-local disk (warm) tier: inclusive, size-limited, survives restarts so
+    // a fresh pod comes up warm instead of stampeding the origin. Set S3CACHE_DISK_CACHE
+    // to a directory (typically a mounted volume) to enable it.
+    let disk_path = env_or("S3CACHE_DISK_CACHE", "");
+    let disk = if disk_path.is_empty() {
         None
+    } else {
+        let disk_bytes: u64 = env_or("S3CACHE_DISK_CACHE_BYTES", "10737418240").parse().unwrap_or(10_737_418_240);
+        info!("disk (warm) tier at `{disk_path}`, up to {disk_bytes} bytes");
+        Some(tier::DiskCache::open(std::path::PathBuf::from(&disk_path), disk_bytes, max_obj_bytes, metrics.clone()).await?)
     };
 
-    let warm = valkey.clone().filter(|_| mode.warm()).map(|pool| {
-        let ttl_secs: u64 = env_or("S3CACHE_WARM_TTL_SECS", "0").parse().unwrap_or(0);
-        info!("warm object tier enabled");
-        tier::WarmCache::new(pool, max_obj_bytes, (ttl_secs > 0).then_some(ttl_secs), metrics.clone())
-    });
-
+    // Cross-node coherence via a Valkey Streams commit log (the only Valkey use). With it
+    // on, reads from node-local state barrier on the log so a peer's just-completed write
+    // is never read stale — always strongly consistent, not optional. Single-node without
+    // the log is already strict (sole writer).
+    let index_log_on = matches!(env_or("S3CACHE_INDEX_LOG", "false").trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
     let index_log = if index_log_on {
-        let pool = valkey.clone().expect("valkey pool present when the index log is enabled");
-        let read = tier::connect_valkey_client(valkey_url.as_deref().unwrap())?;
+        let url = std::env::var("S3CACHE_VALKEY_URL").expect("S3CACHE_VALKEY_URL is required when the index log is enabled");
+        let pool_size: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
+        let pool = coherence::connect_valkey(&url, pool_size)?;
+        let read = coherence::connect_valkey_client(&url)?;
         let stream = env_or("S3CACHE_INDEX_LOG_STREAM", "s3cache:index:log");
         let maxlen: u64 = env_or("S3CACHE_INDEX_LOG_MAXLEN", "1000000").parse().unwrap_or(1_000_000);
         let node = env_or("HOSTNAME", "s3cache");
@@ -90,13 +85,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         None
     };
 
-    // Cross-node reads are always strongly consistent when the index log is on: reads
-    // from node-local state barrier on the log so a peer's just-completed write is never
-    // read stale (single-node without the log is already strict). Not optional — an
-    // object store that returns stale reads is a footgun.
-    info!("cache mode: {mode:?}, index log: {index_log_on}");
-    let cfg = cache::CacheConfig { mode, cache_bytes, max_obj_bytes };
-    let cp = cache::CachingProxy::new(proxy, client, cfg, warm, index_log, metrics.clone());
+    info!("index log (cross-node coherence): {index_log_on}");
+    let cfg = cache::CacheConfig { cache_bytes, max_obj_bytes };
+    let cp = cache::CachingProxy::new(proxy, client, cfg, disk, index_log, metrics.clone());
 
     // Start tailing the shared commit log BEFORE the bootstrap LIST, so the replay window
     // begins at-or-before the LIST's snapshot and no peer write slips through the gap.

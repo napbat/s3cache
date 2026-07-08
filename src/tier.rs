@@ -1,74 +1,27 @@
-//! Object-body cache tiers: **hot** (node-local heap) in front of **warm** (shared
-//! Valkey) in front of **cold** (the S3 origin, always the fallthrough).
-//!
-//! [`CacheMode`] selects which tiers are active. Reads check hot then warm — a warm hit
-//! backfills hot — and writes/invalidations fan out to whichever tiers are on, so each
-//! layer stays a strict cache of the one beneath it. The warm tier is shared by every
-//! node, which is what lets writes on one node be seen by the others (see the crate
-//! roadmap for the commit-log that makes that coherent for OCC).
+//! Layered object-body cache: **hot** (node-local heap) in front of **warm** (a node-local
+//! on-disk cache) in front of **cold** (the S3 origin). Always layered — there is no mode
+//! to pick. The warm disk tier is inclusive (every object written to hot is also written
+//! to disk) and survives process restarts, so a fresh pod comes up warm instead of
+//! stampeding the origin. Cross-node coherence is separate (see `coherence`): a peer's
+//! write invalidates the local hot *and* disk copies, and reads barrier on the log.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
-use fred::prelude::*;
 use futures::StreamExt;
+use moka::notification::RemovalCause;
 use s3s::dto::{ETag, GetObjectOutput, HeadObjectOutput, Metadata, StreamingBlob, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::Metrics;
 
-/// A warm-tier operation may never stall the data path: if Valkey is slow or gone, the
-/// op is abandoned after this and treated as a miss (reads) or a drop (writes).
-const WARM_OP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Which cache tiers sit in front of the cold S3 origin (the origin is always present).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CacheMode {
-    /// No caching: every request passes straight through to the origin.
-    Off,
-    /// Node-local heap only — fastest, but each node's copy is private and can drift.
-    Hot,
-    /// Shared Valkey only — no node-local copy, so every node sees one coherent view.
-    Warm,
-    /// Node-local heap in front of shared Valkey.
-    HotWarm,
-}
-
-impl CacheMode {
-    /// Parse `S3CACHE_MODE`; unknown values fall back to `Hot` (the historical default).
-    #[must_use]
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().replace(['_', ' '], "").as_str() {
-            "off" | "none" | "passthrough" => Self::Off,
-            "hot" | "heap" | "memory" => Self::Hot,
-            "warm" | "valkey" | "redis" => Self::Warm,
-            "hotwarm" | "warmhot" | "hot+warm" | "tiered" | "all" => Self::HotWarm,
-            other => {
-                tracing::warn!("unknown S3CACHE_MODE `{other}`, defaulting to `hot`");
-                Self::Hot
-            }
-        }
-    }
-
-    /// Whether the node-local heap tier is active.
-    #[must_use]
-    pub fn hot(self) -> bool {
-        matches!(self, Self::Hot | Self::HotWarm)
-    }
-
-    /// Whether the shared Valkey tier is active.
-    #[must_use]
-    pub fn warm(self) -> bool {
-        matches!(self, Self::Warm | Self::HotWarm)
-    }
-}
-
 /// A cached object body plus the response metadata needed to reconstruct a GET/HEAD.
-/// `Serialize`/`Deserialize` so the warm tier can round-trip it through Valkey.
+/// `Serialize`/`Deserialize` so the warm disk tier can round-trip it.
 #[derive(Serialize, Deserialize)]
-pub struct CachedObject {
+pub(crate) struct CachedObject {
     body: Bytes,
     content_length: Option<i64>,
     content_type: Option<String>,
@@ -84,7 +37,7 @@ pub struct CachedObject {
 
 impl CachedObject {
     /// Capture a GET response's metadata alongside its (already-buffered) body.
-    pub fn from_get(out: &GetObjectOutput, body: Bytes) -> Self {
+    pub(crate) fn from_get(out: &GetObjectOutput, body: Bytes) -> Self {
         Self {
             body,
             content_length: out.content_length,
@@ -106,7 +59,7 @@ impl CachedObject {
     }
 
     /// Reconstruct a full-body GET response from the cached copy.
-    pub fn to_get(&self) -> GetObjectOutput {
+    pub(crate) fn to_get(&self) -> GetObjectOutput {
         GetObjectOutput {
             body: Some(self.body_blob()),
             content_length: self.content_length,
@@ -125,7 +78,7 @@ impl CachedObject {
 
     /// A 206-shaped GET for an inclusive byte range sliced out of the cached body
     /// (clamped at EOF). `None` when the range start is past the object.
-    pub fn to_get_range(&self, first: u64, last: Option<u64>) -> Option<GetObjectOutput> {
+    pub(crate) fn to_get_range(&self, first: u64, last: Option<u64>) -> Option<GetObjectOutput> {
         let total = self.body.len() as u64;
         if first >= total {
             return None;
@@ -151,7 +104,7 @@ impl CachedObject {
     }
 
     /// Reconstruct a HEAD response from the cached metadata.
-    pub fn to_head(&self) -> HeadObjectOutput {
+    pub(crate) fn to_head(&self) -> HeadObjectOutput {
         HeadObjectOutput {
             content_length: self.content_length,
             content_type: self.content_type.clone(),
@@ -169,7 +122,7 @@ impl CachedObject {
 }
 
 /// Drain a streamed body into memory, bailing (`None`) past `cap` bytes or on error.
-pub async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
+pub(crate) async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
     let mut blob = std::pin::pin!(blob);
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = blob.next().await {
@@ -182,98 +135,98 @@ pub async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
     Some(Bytes::from(buf))
 }
 
-/// Shared object-body cache backed by Valkey/Redis (the warm tier).
-///
-/// Every operation is best-effort: a Valkey error, a decode failure, or a timeout is
-/// treated as a miss (reads) or silently dropped (writes), so a cache outage never
-/// becomes a data-plane outage. Startup never blocks on Valkey — the pool connects and
-/// reconnects in the background, and requests made before it is ready just miss.
-pub struct WarmCache {
-    pool: Pool,
-    /// Objects whose serialized form exceeds this are not stored (mirrors the hot cap).
+/// The node-local heap LRU: `(bucket, key) -> object`. Cheap to clone (an `Arc` inside).
+pub(crate) type HotCache = moka::future::Cache<(String, String), Arc<CachedObject>>;
+
+/// Node-local on-disk warm tier: an inclusive, size-limited cache under a directory that
+/// survives restarts. An in-memory LRU index (weighted by file bytes, bounded by the disk
+/// budget) tracks what's on disk; when an entry leaves the index — evicted for size or
+/// invalidated — its file is deleted. Best-effort: any I/O error is a miss/drop, never a
+/// data-plane failure.
+#[derive(Clone)]
+pub(crate) struct DiskCache {
+    dir: PathBuf,
+    index: moka::future::Cache<String, u64>,
     max_obj_bytes: usize,
-    /// Optional TTL in seconds; `None` keeps warm entries until invalidated or evicted.
-    ttl_secs: Option<i64>,
+    seq: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
 }
 
-/// Build a Valkey connection pool from `url` and start connecting in the background.
-/// Shared by the warm object cache and the index commit log, so both use one pool.
-/// Errors only on a bad URL or pool size — never for the server being down, which
-/// self-heals via the reconnect policy.
-pub fn connect_valkey(url: &str, pool_size: usize) -> anyhow::Result<Pool> {
-    let config = Config::from_url(url)?;
-    let mut builder = Builder::from_config(config);
-    // Reconnect forever with exponential backoff so a Valkey blip self-heals.
-    builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
-    let pool = builder.build_pool(pool_size.max(1))?;
-    pool.connect();
-    Ok(pool)
-}
+impl DiskCache {
+    /// Open (creating if needed) a disk cache under `dir`, bounded to `disk_bytes`, and
+    /// re-index any files already present so the cache survives restarts.
+    pub(crate) async fn open(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize, metrics: Arc<Metrics>) -> anyhow::Result<Self> {
+        tokio::fs::create_dir_all(&dir).await?;
+        let evict_dir = dir.clone();
+        let index = moka::future::Cache::builder()
+            .max_capacity(disk_bytes)
+            .weigher(|_h: &String, size: &u64| u32::try_from(*size).unwrap_or(u32::MAX))
+            .eviction_listener(move |h: Arc<String>, _size, cause| {
+                // `Replaced` = re-inserted at the same path (the put already wrote the new
+                // file), so keep it; size eviction and explicit invalidation delete.
+                if cause != RemovalCause::Replaced {
+                    let _ = std::fs::remove_file(Self::path_in(&evict_dir, &h));
+                }
+            })
+            .build();
+        let cache = Self { dir, index, max_obj_bytes, seq: Arc::new(AtomicU64::new(0)), metrics };
+        cache.reindex().await;
+        Ok(cache)
+    }
 
-/// A single dedicated Valkey connection (also connecting in the background). Used for the
-/// index-log consumer's blocking `XREAD`: a blocking read monopolizes its connection, so
-/// it must not share the pool with the write-path appends (they would stall behind it).
-pub fn connect_valkey_client(url: &str) -> anyhow::Result<Client> {
-    let config = Config::from_url(url)?;
-    let mut builder = Builder::from_config(config);
-    builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
-    let client = builder.build()?;
-    client.connect();
-    Ok(client)
-}
+    /// Blake3 of `bucket\0key` — a fixed-length, path-safe, collision-free filename.
+    fn hash(bucket: &str, key: &str) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(bucket.as_bytes());
+        h.update(&[0]);
+        h.update(key.as_bytes());
+        h.finalize().to_hex().to_string()
+    }
 
-impl WarmCache {
-    /// Wrap an existing (already-connecting) Valkey pool as the warm object cache.
-    #[must_use]
-    pub fn new(pool: Pool, max_obj_bytes: usize, ttl_secs: Option<u64>, metrics: Arc<Metrics>) -> Self {
-        Self {
-            pool,
-            max_obj_bytes,
-            ttl_secs: ttl_secs.map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
-            metrics,
+    fn path_in(dir: &Path, h: &str) -> PathBuf {
+        dir.join(&h[..2]).join(h) // shard by the first two hex chars
+    }
+
+    fn path(&self, h: &str) -> PathBuf {
+        Self::path_in(&self.dir, h)
+    }
+
+    /// Populate the index from files already on disk (restart recovery).
+    async fn reindex(&self) {
+        let Ok(mut shards) = tokio::fs::read_dir(&self.dir).await else { return };
+        while let Ok(Some(shard)) = shards.next_entry().await {
+            if !shard.file_type().await.is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Ok(mut files) = tokio::fs::read_dir(shard.path()).await else { continue };
+            while let Ok(Some(f)) = files.next_entry().await {
+                // Cache files are pure hex (no dot); temp files are `<hash>.<n>.tmp`.
+                if let Ok(meta) = f.metadata().await
+                    && let Some(name) = f.file_name().to_str()
+                    && !name.contains('.')
+                {
+                    self.index.insert(name.to_owned(), meta.len()).await;
+                }
+            }
         }
-    }
-
-    fn rkey(bucket: &str, key: &str) -> String {
-        format!("s3cache:obj:{bucket}:{key}")
-    }
-
-    /// Whether Valkey is connected right now. Guards every op so that when Valkey is down
-    /// we skip *instantly* instead of queuing the command into its `WARM_OP_TIMEOUT` — a
-    /// cache outage must not add seconds of latency to the (origin-served) data path.
-    fn available(&self) -> bool {
-        self.pool.is_connected()
     }
 
     async fn get(&self, bucket: &str, key: &str) -> Option<Arc<CachedObject>> {
-        if !self.available() {
+        let h = Self::hash(bucket, key);
+        self.index.get(&h).await?; // touch LRU recency; miss if not indexed
+        let Ok(bytes) = tokio::fs::read(self.path(&h)).await else {
+            self.index.invalidate(&h).await; // indexed but file gone
+            self.metrics.warm_miss();
             return None;
-        }
-        let rk = Self::rkey(bucket, key);
-        match tokio::time::timeout(WARM_OP_TIMEOUT, self.pool.get::<Option<Bytes>, _>(rk)).await {
-            Ok(Ok(Some(bytes))) => match bincode::deserialize::<CachedObject>(&bytes) {
-                Ok(obj) => {
-                    self.metrics.warm_hit();
-                    Some(Arc::new(obj))
-                }
-                Err(e) => {
-                    tracing::debug!("warm decode failed for {bucket}/{key}: {e}");
-                    self.metrics.warm_error();
-                    None
-                }
-            },
-            Ok(Ok(None)) => {
-                self.metrics.warm_miss();
-                None
+        };
+        match bincode::deserialize::<CachedObject>(&bytes) {
+            Ok(obj) => {
+                self.metrics.warm_hit();
+                Some(Arc::new(obj))
             }
-            Ok(Err(e)) => {
-                tracing::debug!("warm get failed for {bucket}/{key}: {e}");
-                self.metrics.warm_error();
-                None
-            }
-            Err(_) => {
-                tracing::debug!("warm get timed out for {bucket}/{key}");
+            Err(e) => {
+                tracing::debug!("disk decode failed for {bucket}/{key}: {e}");
+                self.index.invalidate(&h).await;
                 self.metrics.warm_error();
                 None
             }
@@ -281,147 +234,126 @@ impl WarmCache {
     }
 
     async fn put(&self, bucket: &str, key: &str, obj: &CachedObject) {
-        if !self.available() {
-            return;
-        }
         let bytes = match bincode::serialize(obj) {
             Ok(b) if b.len() <= self.max_obj_bytes => b,
-            Ok(_) => return, // oversize: leave it to stream through, don't fill Valkey
+            Ok(_) => return, // oversize: leave it to stream through, don't fill the disk
             Err(e) => {
-                tracing::debug!("warm encode failed for {bucket}/{key}: {e}");
+                tracing::debug!("disk encode failed for {bucket}/{key}: {e}");
                 return;
             }
         };
-        let rk = Self::rkey(bucket, key);
-        let expire = self.ttl_secs.map(Expiration::EX);
-        let set = self.pool.set::<(), _, _>(rk, bytes, expire, None, false);
-        match tokio::time::timeout(WARM_OP_TIMEOUT, set).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::debug!("warm set failed for {bucket}/{key}: {e}");
-                self.metrics.warm_error();
-            }
-            Err(_) => {
-                tracing::debug!("warm set timed out for {bucket}/{key}");
-                self.metrics.warm_error();
-            }
+        let h = Self::hash(bucket, key);
+        if let Err(e) = self.write_atomic(&self.path(&h), &bytes).await {
+            tracing::debug!("disk write failed for {bucket}/{key}: {e}");
+            self.metrics.warm_error();
+            return;
         }
+        self.index.insert(h, bytes.len() as u64).await;
     }
 
     async fn invalidate(&self, bucket: &str, key: &str) {
-        if !self.available() {
-            return;
+        // Removing from the index fires the listener, which deletes the file; also remove
+        // directly in case the key was never indexed on this node (a stray file).
+        let h = Self::hash(bucket, key);
+        self.index.invalidate(&h).await;
+        let _ = tokio::fs::remove_file(self.path(&h)).await;
+    }
+
+    /// Write to a unique temp file then rename, so a crash never leaves a partial file and
+    /// concurrent writers don't clobber each other's temp.
+    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
-        let rk = Self::rkey(bucket, key);
-        let del = self.pool.del::<(), _>(rk);
-        match tokio::time::timeout(WARM_OP_TIMEOUT, del).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::debug!("warm del failed for {bucket}/{key}: {e}");
-                self.metrics.warm_error();
-            }
-            Err(_) => {
-                tracing::debug!("warm del timed out for {bucket}/{key}");
-                self.metrics.warm_error();
-            }
+        let n = self.seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("{n}.tmp"));
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, path).await
+    }
+}
+
+/// A cloneable handle to this node's local tiers (hot + optional disk) for the commit-log
+/// consumer to invalidate on a peer's write.
+#[derive(Clone)]
+pub(crate) struct LocalCache {
+    hot: HotCache,
+    warm: Option<DiskCache>,
+}
+
+impl LocalCache {
+    #[must_use]
+    pub(crate) fn new(hot: HotCache, warm: Option<DiskCache>) -> Self {
+        Self { hot, warm }
+    }
+
+    /// Drop a key from every node-local tier so a peer's overwrite is never read stale.
+    pub(crate) async fn invalidate(&self, key: &(String, String)) {
+        self.hot.invalidate(key).await;
+        if let Some(warm) = &self.warm {
+            warm.invalidate(&key.0, &key.1).await;
         }
     }
 }
 
-/// The node-local heap LRU: `(bucket, key) -> object`. Cheap to clone (an `Arc`
-/// inside), so a handle can be shared with the commit-log consumer for invalidation.
-pub type HotCache = moka::future::Cache<(String, String), Arc<CachedObject>>;
-
-/// The active object-body tiers in front of the cold S3 origin: an optional node-local
-/// heap LRU (hot) and an optional shared Valkey store (warm). Both absent (`Off` mode)
-/// makes every method a no-op and reads always miss, i.e. straight passthrough.
-pub struct TieredCache {
-    hot: Option<HotCache>,
-    warm: Option<WarmCache>,
+/// The layered object-body cache: an always-present hot heap LRU and an optional node-local
+/// disk tier, in front of the cold S3 origin.
+pub(crate) struct TieredCache {
+    hot: HotCache,
+    warm: Option<DiskCache>,
 }
 
 impl TieredCache {
-    /// Assemble the tiers `mode` calls for. The hot LRU is weighted by body bytes up to
-    /// `cache_bytes`; `warm` is attached only when the mode enables it.
+    /// Build the cache: a hot LRU weighted by body bytes up to `cache_bytes`, plus the
+    /// optional disk tier.
     #[must_use]
-    pub fn new(mode: CacheMode, cache_bytes: u64, warm: Option<WarmCache>) -> Self {
-        let hot = mode.hot().then(|| {
-            moka::future::Cache::builder()
-                .max_capacity(cache_bytes)
-                .weigher(|_k, v: &Arc<CachedObject>| u32::try_from(v.body.len()).unwrap_or(u32::MAX))
-                .build()
-        });
-        Self {
-            hot,
-            warm: if mode.warm() { warm } else { None },
-        }
+    pub(crate) fn new(cache_bytes: u64, warm: Option<DiskCache>) -> Self {
+        let hot = moka::future::Cache::builder()
+            .max_capacity(cache_bytes)
+            .weigher(|_k, v: &Arc<CachedObject>| u32::try_from(v.body.len()).unwrap_or(u32::MAX))
+            .build();
+        Self { hot, warm }
     }
 
-    /// Whether any tier is active. `false` means every request is a straight passthrough.
+    /// A handle the commit-log consumer uses to invalidate this node's local copies.
     #[must_use]
-    pub fn is_enabled(&self) -> bool {
-        self.hot.is_some() || self.warm.is_some()
+    pub(crate) fn local(&self) -> LocalCache {
+        LocalCache::new(self.hot.clone(), self.warm.clone())
     }
 
-    /// A clone of the hot-tier handle (if hot is active) for the commit-log consumer to
-    /// invalidate on peers' writes. Warm is shared, so the log only touches the hot copy.
-    #[must_use]
-    pub fn hot_handle(&self) -> Option<HotCache> {
-        self.hot.clone()
-    }
-
-    /// Whether a node-local body copy (the hot tier) is held. Such a copy can be stale
-    /// after a peer's overwrite until the log invalidates it, so a strong-consistency GET
-    /// must barrier when this is true; the shared warm tier is synchronously invalidated
-    /// and needs no barrier.
-    #[must_use]
-    pub fn has_local(&self) -> bool {
-        self.hot.is_some()
-    }
-
-    /// Look up a whole cached object: hot first, then warm (a warm hit backfills hot).
-    pub async fn get(&self, key: &(String, String)) -> Option<Arc<CachedObject>> {
-        if let Some(hot) = &self.hot
-            && let Some(obj) = hot.get(key).await
-        {
+    /// Look up a whole cached object: hot, then warm disk (a disk hit backfills hot).
+    pub(crate) async fn get(&self, key: &(String, String)) -> Option<Arc<CachedObject>> {
+        if let Some(obj) = self.hot.get(key).await {
             return Some(obj);
         }
         if let Some(warm) = &self.warm
             && let Some(obj) = warm.get(&key.0, &key.1).await
         {
-            if let Some(hot) = &self.hot {
-                hot.insert(key.clone(), obj.clone()).await;
-            }
+            self.hot.insert(key.clone(), obj.clone()).await;
             return Some(obj);
         }
         None
     }
 
-    /// Store an object into every active tier (warm first, so a warm error still leaves
-    /// hot populated for this node).
-    pub async fn insert(&self, key: (String, String), obj: Arc<CachedObject>) {
+    /// Store into hot and (inclusively) the warm disk tier.
+    pub(crate) async fn insert(&self, key: (String, String), obj: Arc<CachedObject>) {
         if let Some(warm) = &self.warm {
             warm.put(&key.0, &key.1, &obj).await;
         }
-        if let Some(hot) = &self.hot {
-            hot.insert(key, obj).await;
-        }
+        self.hot.insert(key, obj).await;
     }
 
-    /// Drop an object from every active tier.
-    pub async fn invalidate(&self, key: &(String, String)) {
-        if let Some(hot) = &self.hot {
-            hot.invalidate(key).await;
-        }
+    /// Drop an object from every local tier.
+    pub(crate) async fn invalidate(&self, key: &(String, String)) {
+        self.hot.invalidate(key).await;
         if let Some(warm) = &self.warm {
             warm.invalidate(&key.0, &key.1).await;
         }
     }
 
-    /// Get `key`, or run `origin` to fetch it and populate the tiers. When hot is active
-    /// the fetch is singleflighted (moka's `try_get_with`), so concurrent callers share
-    /// one origin round-trip; a warm hit short-circuits the fetch entirely.
-    pub async fn get_or_fetch<Fut>(
+    /// Get `key`, or run `origin` to fetch it and populate the tiers. The fetch is
+    /// singleflighted (moka's `try_get_with`), so concurrent callers share one origin
+    /// round-trip; a disk hit short-circuits the fetch entirely.
+    pub(crate) async fn get_or_fetch<Fut>(
         &self,
         key: &(String, String),
         origin: Fut,
@@ -441,49 +373,38 @@ impl TieredCache {
             }
             Ok(obj)
         };
-        match &self.hot {
-            Some(hot) => hot
-                .try_get_with(key.clone(), load)
-                .await
-                .map_err(|e: Arc<String>| e.to_string()),
-            None => load.await,
-        }
+        self.hot.try_get_with(key.clone(), load).await.map_err(|e: Arc<String>| e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_body, connect_valkey, CacheMode, CachedObject, WarmCache};
+    use super::{buffer_body, CachedObject, DiskCache};
     use crate::metrics::Metrics;
     use bytes::Bytes;
     use s3s::dto::{ETag, GetObjectOutput, Timestamp};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
+
+    static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> std::path::PathBuf {
+        let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("s3cache-disk-{}-{n}", std::process::id()))
+    }
 
     fn sample() -> CachedObject {
         let out = GetObjectOutput {
             content_length: Some(5),
             content_type: Some("text/plain".to_owned()),
             e_tag: Some(ETag::Strong("\"deadbeef\"".to_owned())),
-            // Whole-second timestamp: the DateTime format round-trips it exactly.
             last_modified: Some(Timestamp::from(UNIX_EPOCH + Duration::from_secs(1_700_000_000))),
             metadata: Some(HashMap::from([("k".to_owned(), "v".to_owned())])),
             ..Default::default()
         };
         CachedObject::from_get(&out, Bytes::from_static(b"hello"))
-    }
-
-    #[test]
-    fn mode_parse() {
-        assert_eq!(CacheMode::parse("off"), CacheMode::Off);
-        assert_eq!(CacheMode::parse("HOT"), CacheMode::Hot);
-        assert_eq!(CacheMode::parse(" warm "), CacheMode::Warm);
-        assert_eq!(CacheMode::parse("hot+warm"), CacheMode::HotWarm);
-        assert_eq!(CacheMode::parse("tiered"), CacheMode::HotWarm);
-        assert_eq!(CacheMode::parse("nonsense"), CacheMode::Hot); // default
-        assert!(CacheMode::HotWarm.hot() && CacheMode::HotWarm.warm());
-        assert!(CacheMode::Warm.warm() && !CacheMode::Warm.hot());
     }
 
     #[test]
@@ -507,28 +428,26 @@ mod tests {
         assert!(buffer_body(blob, 4).await.is_none()); // over cap -> None
     }
 
-    // Live round-trip against a real Valkey. Skipped unless S3CACHE_TEST_VALKEY_URL is
-    // set (e.g. `redis://127.0.0.1:6379`), so CI without a server still passes.
     #[tokio::test]
-    async fn warm_roundtrip() {
-        let Ok(url) = std::env::var("S3CACHE_TEST_VALKEY_URL") else {
-            eprintln!("skip warm_roundtrip: set S3CACHE_TEST_VALKEY_URL to run");
-            return;
-        };
-        let metrics = Arc::new(Metrics::default());
-        let pool = connect_valkey(&url, 2).unwrap();
-        let warm = WarmCache::new(pool, 8 * 1024 * 1024, None, metrics);
-        tokio::time::sleep(Duration::from_millis(300)).await; // let the pool connect
+    async fn disk_cache_roundtrip_and_restart_recovery() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = Arc::new(Metrics::default());
+        let cap = 10 * 1024 * 1024;
 
+        let disk = DiskCache::open(dir.clone(), cap, 8 * 1024 * 1024, m.clone()).await.unwrap();
         let obj = sample();
-        warm.put("bucket", "key", &obj).await;
-        let got = warm.get("bucket", "key").await.expect("warm should hit after put");
-        assert_eq!(got.body, obj.body);
-        assert_eq!(got.e_tag, obj.e_tag);
-        assert_eq!(got.metadata, obj.metadata);
-        assert_eq!(got.last_modified, obj.last_modified);
+        disk.put("b", "k", &obj).await;
+        assert_eq!(disk.get("b", "k").await.expect("hit").body, obj.body);
+        assert!(disk.get("b", "missing").await.is_none());
 
-        warm.invalidate("bucket", "key").await;
-        assert!(warm.get("bucket", "key").await.is_none(), "invalidate should remove it");
+        // A fresh cache over the same dir re-indexes the file — survives a restart.
+        let disk2 = DiskCache::open(dir.clone(), cap, 8 * 1024 * 1024, m).await.unwrap();
+        assert!(disk2.get("b", "k").await.is_some(), "disk cache survives restart");
+
+        disk2.invalidate("b", "k").await;
+        assert!(disk2.get("b", "k").await.is_none(), "invalidate deletes the entry");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

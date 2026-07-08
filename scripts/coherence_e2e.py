@@ -14,6 +14,8 @@ seen by the other:
 
 Assumes MinIO and Valkey are reachable (see scripts/coherence-e2e.sh). Exits 0/1.
 """
+import os
+import shutil
 import sys
 import time
 
@@ -63,23 +65,28 @@ def main():
         b.put_object(Bucket=BUCKET, Key="k2", Body=b"from-b")
         check("PUT via B -> LIST via A sees k2 (strong, no poll)", "k2" in keys(a))
 
-        # warm-only mode is also strong for cross-node GET, without a hot copy: a write
-        # invalidates the shared entry synchronously, so a peer's next read is fresh.
-        c_node = h.start_node("nodeC", 18033, BUCKET, mode="warm")
-        d_node = h.start_node("nodeD", 18034, BUCKET, mode="warm")
+        # With the disk (warm) tier on, a peer's overwrite must invalidate the *disk* copy
+        # too, not just hot — else a hot-evicted-but-disk-cached object goes stale.
+        dc, dd_dir = f"/tmp/s3cache-diskC-{os.getpid()}", f"/tmp/s3cache-diskD-{os.getpid()}"
+        for d in (dc, dd_dir):
+            shutil.rmtree(d, ignore_errors=True)
+        c_node = h.start_node("nodeC", 18033, BUCKET, extra={"S3CACHE_DISK_CACHE": dc, "S3CACHE_DISK_CACHE_BYTES": "104857600"})
+        d_node = h.start_node("nodeD", 18034, BUCKET, extra={"S3CACHE_DISK_CACHE": dd_dir, "S3CACHE_DISK_CACHE_BYTES": "104857600"})
         node_c, node_d = c_node, d_node
         try:
             assert h.wait_port(18033) and h.wait_port(18034)
             time.sleep(1.5)
             c, dd = h.s3("http://127.0.0.1:18033"), h.s3("http://127.0.0.1:18034")
             c.put_object(Bucket=BUCKET, Key="w", Body=b"one")
-            check("warm mode: D LIST sees C's write (strong, no poll)", "w" in keys(dd))
-            _ = body(dd, "w")  # D reads it (populates the shared warm entry)
+            check("disk tier: D LIST sees C's write (strong, no poll)", "w" in keys(dd))
+            _ = body(dd, "w")  # D reads it -> now in D's hot AND disk tiers
             c.put_object(Bucket=BUCKET, Key="w", Body=b"two")  # C overwrites
-            check("warm mode: D GET reflects C's overwrite immediately (no poll)",
+            check("disk tier: D GET reflects C's overwrite (hot+disk invalidated, no poll)",
                   body(dd, "w") == b"two")
         finally:
             h.stop_nodes(node_c, node_d)
+            for d in (dc, dd_dir):
+                shutil.rmtree(d, ignore_errors=True)
     except Exception as e:  # noqa: BLE001
         failures.append(f"harness error: {e!r}")
     finally:

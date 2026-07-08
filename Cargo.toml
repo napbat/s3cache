@@ -24,6 +24,7 @@ anyhow = "1"
 fred = "10.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 bincode = "1"
+blake3 = "1.8.5"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

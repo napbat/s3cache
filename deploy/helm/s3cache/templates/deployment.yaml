@@ -42,15 +42,11 @@ spec:
               value: {{ required "upstream.endpoint is required" .Values.upstream.endpoint | quote }}
             - name: S3CACHE_BUCKETS
               value: {{ .Values.upstream.buckets | quote }}
-            - name: S3CACHE_MODE
-              value: {{ .Values.cache.mode | quote }}
-            {{- if .Values.valkey.url }}
-            - name: S3CACHE_VALKEY_URL
-              value: {{ .Values.valkey.url | quote }}
-            - name: S3CACHE_VALKEY_POOL
-              value: {{ .Values.valkey.pool | quote }}
-            - name: S3CACHE_WARM_TTL_SECS
-              value: {{ .Values.valkey.ttlSecs | quote }}
+            {{- if .Values.diskCache.enabled }}
+            - name: S3CACHE_DISK_CACHE
+              value: {{ .Values.diskCache.path | quote }}
+            - name: S3CACHE_DISK_CACHE_BYTES
+              value: {{ .Values.diskCache.bytes | quote }}
             {{- end }}
             {{- if .Values.indexLog.enabled }}
             - name: S3CACHE_INDEX_LOG
@@ -61,6 +57,10 @@ spec:
             - name: S3CACHE_INDEX_LOG_STREAM
               value: {{ . | quote }}
             {{- end }}
+            - name: S3CACHE_VALKEY_URL
+              value: {{ required "valkey.url is required when indexLog.enabled" .Values.valkey.url | quote }}
+            - name: S3CACHE_VALKEY_POOL
+              value: {{ .Values.valkey.pool | quote }}
             {{- end }}
             - name: RUST_LOG
               value: "info"
@@ -82,3 +82,13 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 30
           resources: {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.diskCache.enabled }}
+          volumeMounts:
+            - name: disk-cache
+              mountPath: {{ .Values.diskCache.path }}
+          {{- end }}
+      {{- if .Values.diskCache.enabled }}
+      volumes:
+        - name: disk-cache
+          {{- toYaml .Values.diskCache.volume | nindent 10 }}
+      {{- end }}

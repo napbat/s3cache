@@ -12,7 +12,31 @@ use fred::prelude::*;
 
 use crate::index::{BucketState, ObjEntry};
 use crate::metrics::Metrics;
-use crate::tier::HotCache;
+use crate::tier::LocalCache;
+
+/// Build a Valkey connection pool from `url` and start connecting in the background (for
+/// the index-log appends + one-shot reads). Errors only on a bad URL or pool size — never
+/// for the server being down, which self-heals via the reconnect policy.
+pub(crate) fn connect_valkey(url: &str, pool_size: usize) -> anyhow::Result<Pool> {
+    let config = Config::from_url(url)?;
+    let mut builder = Builder::from_config(config);
+    builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
+    let pool = builder.build_pool(pool_size.max(1))?;
+    pool.connect();
+    Ok(pool)
+}
+
+/// A single dedicated Valkey connection for the consumer's blocking `XREAD`: a blocking
+/// read monopolizes its connection, so it must not share the pool with the write-path
+/// appends (they would stall behind it).
+pub(crate) fn connect_valkey_client(url: &str) -> anyhow::Result<Client> {
+    let config = Config::from_url(url)?;
+    let mut builder = Builder::from_config(config);
+    builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
+    let client = builder.build()?;
+    client.connect();
+    Ok(client)
+}
 
 /// A commit-log Valkey op may never stall a write: abandoned after this, treated as a
 /// dropped append (the peers re-converge on their next full sync).
@@ -168,7 +192,7 @@ impl IndexLog {
         &self,
         start_id: String,
         state: Arc<RwLock<HashMap<String, BucketState>>>,
-        hot: Option<HotCache>,
+        local: Option<LocalCache>,
     ) {
         let (read, stream, node, metrics, applied) = (
             self.read_client.clone(),
@@ -180,7 +204,7 @@ impl IndexLog {
         // The consumer starts at start_id, so the local index reflects everything up to it.
         *applied.write().unwrap() = parse_stream_id(&start_id);
         tokio::spawn(async move {
-            let cx = ConsumerCtx { read: &read, stream: &stream, node: &node, state: &state, hot: hot.as_ref(), applied: &applied, metrics: &metrics };
+            let cx = ConsumerCtx { read: &read, stream: &stream, node: &node, state: &state, local: local.as_ref(), applied: &applied, metrics: &metrics };
             consume_index_log(&cx, start_id).await;
         });
     }
@@ -192,7 +216,7 @@ struct ConsumerCtx<'a> {
     stream: &'a str,
     node: &'a str,
     state: &'a RwLock<HashMap<String, BucketState>>,
-    hot: Option<&'a HotCache>,
+    local: Option<&'a LocalCache>,
     applied: &'a RwLock<StreamId>,
     metrics: &'a Arc<Metrics>,
 }
@@ -232,7 +256,7 @@ async fn consume_index_log(cx: &ConsumerCtx<'_>, mut last_id: String) {
         };
         let Some(entries) = map.get(cx.stream) else { continue };
         for (id, fields) in entries {
-            apply_log_event(cx.node, cx.state, cx.hot, fields).await;
+            apply_log_event(cx.node, cx.state, cx.local, fields).await;
             last_id.clone_from(id);
             // Advance the applied position for every entry (including our own, which
             // apply skips) so the strict-LIST barrier tracks true stream progress.
@@ -247,7 +271,7 @@ async fn consume_index_log(cx: &ConsumerCtx<'_>, mut last_id: String) {
 pub(crate) async fn apply_log_event(
     node: &str,
     state: &RwLock<HashMap<String, BucketState>>,
-    hot: Option<&HotCache>,
+    local: Option<&LocalCache>,
     fields: &HashMap<String, String>,
 ) {
     if fields.get("node").map(String::as_str) == Some(node) {
@@ -278,17 +302,17 @@ pub(crate) async fn apply_log_event(
         }
         _ => return,
     }
-    if let Some(h) = hot {
-        h.invalidate(&(bucket.clone(), key.clone())).await;
+    if let Some(local) = local {
+        local.invalidate(&(bucket.clone(), key.clone())).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_log_event, parse_stream_id, IndexLog};
+    use super::{apply_log_event, connect_valkey, connect_valkey_client, parse_stream_id, IndexLog};
     use crate::index::BucketState;
     use crate::metrics::Metrics;
-    use crate::tier::{connect_valkey, connect_valkey_client, CachedObject, HotCache};
+    use crate::tier::{CachedObject, HotCache, LocalCache};
     use fred::prelude::*;
     use s3s::dto::GetObjectOutput;
     use std::collections::HashMap;
@@ -447,7 +471,7 @@ mod tests {
         assert!(hot.contains_key(&ck));
 
         let state: Index = Arc::new(RwLock::new(HashMap::new()));
-        b.spawn_consumer(b.tail_id().await, state, Some(hot.clone()));
+        b.spawn_consumer(b.tail_id().await, state, Some(LocalCache::new(hot.clone(), None)));
 
         a.append_put("bkt", "obj", 5).await;
         assert!(wait_until(|| !hot.contains_key(&ck)).await, "peer write must drop the local hot copy");

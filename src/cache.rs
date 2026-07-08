@@ -24,14 +24,12 @@ use tracing::info;
 use crate::coherence::IndexLog;
 use crate::index::{list_objects_v2_from_index, sync_bucket_into, BucketState, ObjEntry};
 use crate::metrics::Metrics;
-use crate::tier::{self, CacheMode, CachedObject, TieredCache, WarmCache};
+use crate::tier::{self, CachedObject, DiskCache, TieredCache};
 
-/// Sizing and mode for the object cache, passed to [`CachingProxy::new`].
+/// Sizing for the object cache, passed to [`CachingProxy::new`].
 #[derive(Clone, Copy)]
 pub(crate) struct CacheConfig {
-    /// Which tiers sit in front of the S3 origin.
-    pub(crate) mode: CacheMode,
-    /// Total hot-tier capacity in bytes.
+    /// Total hot (heap) tier capacity in bytes.
     pub(crate) cache_bytes: u64,
     /// Objects larger than this are never cached.
     pub(crate) max_obj_bytes: usize,
@@ -47,7 +45,7 @@ pub(crate) struct CachingProxy {
     /// The LIST index, `Arc` so the background warm-up task shares it with the serving
     /// proxy (the service takes the proxy by value, so the sync can't borrow `self`).
     state: Arc<RwLock<HashMap<String, BucketState>>>,
-    /// Object-body cache: hot heap and/or shared Valkey, per [`CacheMode`].
+    /// Object-body cache: hot heap in front of an optional node-local disk tier.
     obj_cache: TieredCache,
     /// Objects larger than this are never cached (segments stream straight through).
     max_obj_bytes: usize,
@@ -57,15 +55,14 @@ pub(crate) struct CachingProxy {
 }
 
 impl CachingProxy {
-    /// Wire up the proxy. `cfg` selects the object-cache tiers and sizing; `warm` is the
-    /// connected Valkey object cache (ignored unless the mode enables it) and `index_log`
-    /// the shared commit log (both built by the caller). `metrics` is shared so the tiers,
-    /// the log, and the stats task all report into it.
+    /// Wire up the proxy. `cfg` sizes the hot tier; `disk` is the optional node-local disk
+    /// (warm) tier and `index_log` the shared commit log (both built by the caller).
+    /// `metrics` is shared so the tiers, the log, and the stats task all report into it.
     pub(crate) fn new(
         inner: s3s_aws::Proxy,
         client: aws_sdk_s3::Client,
         cfg: CacheConfig,
-        warm: Option<WarmCache>,
+        disk: Option<DiskCache>,
         index_log: Option<IndexLog>,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -73,22 +70,19 @@ impl CachingProxy {
             inner,
             client,
             state: Arc::new(RwLock::new(HashMap::new())),
-            obj_cache: TieredCache::new(cfg.mode, cfg.cache_bytes, warm),
+            obj_cache: TieredCache::new(cfg.cache_bytes, disk),
             max_obj_bytes: cfg.max_obj_bytes,
             index_log,
             metrics,
         }
     }
 
-    /// Strong-consistency read barrier: wait for this node's commit-log consumer to catch
-    /// up to the stream tail so a read from node-local state reflects every write that
-    /// completed before it. Always on when the log is configured (single-node without the
-    /// log is already strict); it also no-ops when Valkey is unreachable. `needs_local` is
-    /// false for LIST (the index is always node-local) and gates GET/HEAD on holding a hot
-    /// copy (the shared warm tier is synchronously invalidated and never stale).
-    async fn read_barrier(&self, needs_local: bool) {
-        if (!needs_local || self.obj_cache.has_local())
-            && let Some(log) = &self.index_log
+    /// Strong-consistency read barrier: before serving a read from node-local state (the
+    /// LIST index, or a hot/disk body copy), wait for this node's commit-log consumer to
+    /// catch up to the stream tail so a peer's just-completed write is never read stale.
+    /// No-op without the log (single-node is already strict) or when Valkey is unreachable.
+    async fn read_barrier(&self) {
+        if let Some(log) = &self.index_log
             && !log.await_fresh().await
         {
             tracing::debug!("consistency barrier timed out; serving current state");
@@ -107,7 +101,7 @@ impl CachingProxy {
         if let Some(log) = &self.index_log {
             let start_id = log.tail_id().await;
             info!("index log: tailing `{}` from {start_id}", log.stream);
-            log.spawn_consumer(start_id, self.state.clone(), self.obj_cache.hot_handle());
+            log.spawn_consumer(start_id, self.state.clone(), Some(self.obj_cache.local()));
         }
     }
 
@@ -258,7 +252,7 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         if self.is_synced(req.input.bucket.as_str()) {
-            self.read_barrier(false).await; // index is node-local -> barrier when strict
+            self.read_barrier().await; // index is node-local -> barrier when strict
             self.metrics.list_from_index.fetch_add(1, Ordering::Relaxed);
             let out = self.list_from_index(&req.input);
             return Ok(S3Response::new(out));
@@ -370,7 +364,7 @@ impl s3s::S3 for CachingProxy {
         // Before any read served from a node-local hot copy, barrier so a peer's
         // overwrite is never read stale (strong consistency); misses go to the origin.
         if cacheable || int_range.is_some() {
-            self.read_barrier(true).await;
+            self.read_barrier().await;
         }
         if let Some((first, last)) = int_range {
             // Cached whole object → serve the slice locally.
@@ -384,10 +378,9 @@ impl s3s::S3 for CachingProxy {
             // upstream GET (deduped across concurrent ranges when hot is active), then
             // every range — this one included — is a slice. A refused/failed promote
             // degrades to the passthrough below, never an error.
-            let small = self.obj_cache.is_enabled()
-                && self
-                    .index_size(&ckey.0, &ckey.1)
-                    .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
+            let small = self
+                .index_size(&ckey.0, &ckey.1)
+                .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
             if small
                 && let Some(resp) = self.promote_range(&ckey, &req, first, last).await
             {
@@ -406,7 +399,7 @@ impl s3s::S3 for CachingProxy {
         let mut resp = self.inner.get_object(req).await?;
         let len = resp.output.content_length.unwrap_or(-1);
         let small = len >= 0 && usize::try_from(len).unwrap_or(usize::MAX) <= self.max_obj_bytes;
-        if cacheable && small && self.obj_cache.is_enabled()
+        if cacheable && small
             && let Some(body) = resp.output.body.take()
         {
             match tier::buffer_body(body, self.max_obj_bytes).await {
@@ -439,7 +432,7 @@ impl s3s::S3 for CachingProxy {
             && req.input.checksum_mode.is_none()
             && req.input.sse_customer_key.is_none();
         if cache_eligible {
-            self.read_barrier(true).await; // strong consistency for a hot-served HEAD
+            self.read_barrier().await; // strong consistency for a hot-served HEAD
             let ckey = (req.input.bucket.clone(), req.input.key.clone());
             if let Some(obj) = self.obj_cache.get(&ckey).await {
                 self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);

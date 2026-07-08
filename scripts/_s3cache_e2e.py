@@ -44,12 +44,11 @@ def wait_port(port, timeout=15):
     return False
 
 
-def start_node(name, port, bucket, mode="hot+warm", index_log=True, extra=None):
+def start_node(name, port, bucket, index_log=True, extra=None):
     env = dict(os.environ,
                S3CACHE_LISTEN=f"127.0.0.1:{port}",
                S3CACHE_UPSTREAM_ENDPOINT=MINIO,
                S3CACHE_VALKEY_URL=VALKEY,
-               S3CACHE_MODE=mode,
                S3CACHE_INDEX_LOG="true" if index_log else "false",
                S3CACHE_BUCKETS=bucket,
                S3CACHE_STATS_SECS="3600",

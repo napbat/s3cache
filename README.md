@@ -14,12 +14,13 @@ endpoint to this proxy; no client code changes.
   `ListObjectsV2` is answered locally with **no upstream LIST call**. LISTs are the
   expensive S3 tier (R2 Class A), and clients that poll/list constantly (e.g. a
   log-structured store allocating slots) dominate the bill; this removes them.
-- **Tiered GET/HEAD object cache — hot / warm / cold.** Cacheable reads (no range / part
+- **Layered GET/HEAD object cache — hot / warm / cold.** Cacheable reads (no range / part
   / conditional headers) of objects up to `S3CACHE_MAX_OBJECT_BYTES` are served from a
-  **hot** node-local LRU (`S3CACHE_CACHE_BYTES` total) and/or a **warm** shared Valkey
-  tier, falling through to **cold** — the S3 origin — on a miss. Ranged reads slice the
-  cached whole object; HEAD is served from the same cache. `S3CACHE_MODE` picks the
-  tiers; larger objects stream straight through. See [Cache modes](#cache-modes).
+  **hot** node-local in-memory LRU (`S3CACHE_CACHE_BYTES`) in front of an optional **warm**
+  node-local *disk* cache (`S3CACHE_DISK_CACHE`), falling through to **cold** — the S3
+  origin — on a miss. Always layered, no mode to pick. Ranged reads slice the cached whole
+  object; HEAD is served from the same cache; larger objects stream straight through. See
+  [Cache tiers](#cache-tiers).
 - **Write-through + invalidation.** `PutObject` / `DeleteObject` / multipart /
   `CopyObject` forward to the upstream (which stays the authority for conditional/OCC
   writes — identical semantics), then update the index **and invalidate the object
@@ -31,21 +32,24 @@ Correctness rests on one property: the proxy is the *only* writer to the bucket,
 its index can't go stale. A restart just re-syncs the index (one LIST) and refills
 on demand — correctness never depends on the cache surviving.
 
-## Cache modes
+## Cache tiers
 
-`S3CACHE_MODE` selects which tiers sit in front of the cold S3 origin:
+The body cache is always layered — there is no mode to select:
 
-| Mode | Tiers | Use it when |
-|---|---|---|
-| `off` | none | You only want LIST-from-index; bodies pass straight through. |
-| `hot` (default) | node-local heap | Single replica; lowest latency. |
-| `warm` | shared Valkey | Multiple replicas that must agree — no node-local copy to drift. |
-| `hot+warm` | heap → Valkey → origin | A fast local cache backed by a shared one. |
+```
+hot (in-memory, small)  ->  warm (node-local disk, large, optional)  ->  cold (S3 origin)
+```
 
-The **warm** tier is a Valkey/Redis instance shared by every replica, so a body cached
-or invalidated on one node is visible to all of them — there is no peer-to-peer chatter,
-Valkey is the rendezvous. Warm operations are best-effort: if Valkey is slow or down, the
-request falls through to the origin, so a cache outage never becomes a data-plane outage.
+- **hot** — an in-memory LRU (`S3CACHE_CACHE_BYTES`), always on.
+- **warm** — an optional node-local **disk** cache under `S3CACHE_DISK_CACHE`
+  (`S3CACHE_DISK_CACHE_BYTES`). It's *inclusive* (every object written to hot is also
+  written to disk) and **survives restarts** — a fresh pod re-indexes the on-disk files
+  and comes up warm instead of stampeding the origin. Size it larger than hot to help.
+  All disk ops are best-effort: an I/O error is a miss, never a data-plane failure.
+- **cold** — the S3 origin.
+
+Both tiers are node-local; cross-node coherence is handled separately (below): a peer's
+write invalidates the local hot *and* disk copies, and reads barrier on the commit log.
 
 ## Cross-node coherence (index commit log)
 
@@ -123,12 +127,12 @@ Single-node deployments (and any without the index log) are strongly consistent 
 | `S3CACHE_LISTEN` | `0.0.0.0:8014` | S3 API listen address |
 | `S3CACHE_UPSTREAM_ENDPOINT` | (required) | Upstream S3 endpoint URL (e.g. R2) |
 | `S3CACHE_BUCKETS` | (empty) | Comma-separated buckets to index eagerly at startup |
-| `S3CACHE_MODE` | `hot` | Cache tiers: `off` / `hot` / `warm` / `hot+warm` (see [Cache modes](#cache-modes)) |
-| `S3CACHE_CACHE_BYTES` | `268435456` (256 MB) | Hot-tier capacity (bytes) |
+| `S3CACHE_CACHE_BYTES` | `268435456` (256 MB) | Hot (in-memory) tier capacity (bytes) |
 | `S3CACHE_MAX_OBJECT_BYTES` | `8388608` (8 MB) | Per-object cache cap; bigger objects stream through |
-| `S3CACHE_VALKEY_URL` | (required for warm/log) | Valkey/Redis URL, e.g. `redis://valkey:6379`; shared by the warm tier and the index log |
+| `S3CACHE_DISK_CACHE` | (empty) | Directory for the warm disk tier; unset = no disk tier |
+| `S3CACHE_DISK_CACHE_BYTES` | `10737418240` (10 GB) | Warm disk tier capacity (bytes) |
+| `S3CACHE_VALKEY_URL` | (required for log) | Valkey/Redis URL for the index commit log, e.g. `redis://valkey:6379` |
 | `S3CACHE_VALKEY_POOL` | `4` | Valkey connections per replica |
-| `S3CACHE_WARM_TTL_SECS` | `0` | Warm entry TTL in seconds; `0` = keep until invalidated/evicted |
 | `S3CACHE_INDEX_LOG` | `false` | Share the LIST index across replicas via a Valkey commit log (see [above](#cross-node-coherence-index-commit-log)) |
 | `S3CACHE_INDEX_LOG_MAXLEN` | `1000000` | Approximate max entries kept in the log stream |
 | `S3CACHE_INDEX_LOG_STREAM` | `s3cache:index:log` | Valkey stream key for the commit log |
