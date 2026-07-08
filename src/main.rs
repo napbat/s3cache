@@ -1,6 +1,7 @@
-//! Transparent S3 caching proxy. Milestone 1: passthrough to the upstream S3 (R2).
-//! Caching (LIST-from-index, GET LRU, write-through index updates) is layered on top
-//! of the upstream `s3s_aws::Proxy` in the `cache` module.
+//! Transparent, S3-compatible caching proxy. Binds an S3 API, forwards to an upstream
+//! S3 (e.g. R2), and layers LIST-from-index + a GET/HEAD LRU on top via the `cache`
+//! module. This is the entry point: it wires config, the upstream client, and the
+//! HTTP server.
 
 mod cache;
 
@@ -102,11 +103,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     Ok(())
 }
 
-/// Raise `RLIMIT_NOFILE`'s soft limit to the hard cap. The proxy holds one accepted
-/// socket per in-cluster client connection plus its upstream pool; docres alone keeps
-/// ~1000 keepalive connections open (an HTTP pool per `LanceDB` dataset), so a
-/// distro-default soft limit of 1024 exhausts and `accept()` starts failing — seen as
-/// probe timeouts on this pod and EMFILE request failures in its clients.
+/// Raise `RLIMIT_NOFILE`'s soft limit to the hard cap. The proxy holds one socket per
+/// inbound connection plus its upstream pool; a chatty client fleet can keep thousands
+/// of keepalive connections open, so the distro-default 1024 soft limit exhausts and
+/// `accept()` starts failing with EMFILE.
 fn raise_fd_limit() {
     #[cfg(unix)]
     match rlimit::Resource::NOFILE.get() {

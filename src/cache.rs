@@ -1,19 +1,14 @@
 //! Caching layer over the upstream `s3s_aws::Proxy`.
 //!
-//! The win: because every client S3 request funnels through this proxy, it sees
-//! every write — so it can answer **LIST** entirely from an in-memory key index
-//! (LISTs are R2 Class-A ops, the expensive tier, and chatty clients issue them
-//! constantly), and it maintains that index from writes. Reads/writes are otherwise
-//! forwarded (write-through): the upstream stays the authority for conditional
-//! (OCC) writes, so correctness is unchanged.
+//! Every client request funnels through this proxy, so it sees every write. That lets
+//! it answer **LIST** from an in-memory key index (LISTs are R2's expensive Class-A
+//! tier) and serve small GET/HEAD bodies from an LRU, while writes forward through to
+//! the upstream — which stays the authority for conditional (OCC) writes.
 //!
-//! Correctness rests on a single property: this proxy is the *only* path to the
-//! bucket. The LIST index warms up lazily — the proxy serves immediately and a
-//! background task does the one full LIST per bucket; until a bucket's index is
-//! complete, LISTs for it pass straight through to the upstream (always correct), then
-//! flip to index-served ([`CachingProxy::is_synced`] gates this). Once warm it's kept
-//! current by observed writes. The GET/HEAD body cache is separately lazy (populate on
-//! miss, invalidate on write).
+//! Correctness rests on one property: this proxy is the *only* path to the bucket. The
+//! index warms lazily — LISTs pass through until a bucket's background full-LIST sync
+//! completes ([`CachingProxy::is_synced`] gates the flip), then observed writes keep it
+//! current. The body cache is separately lazy: populate on miss, invalidate on write.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -28,6 +23,7 @@ use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, Pu
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
+/// One indexed key's LIST metadata: its size and last-modified time.
 struct ObjEntry {
     size: i64,
     last_modified: SystemTime,
@@ -145,12 +141,14 @@ async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
     Some(Bytes::from(buf))
 }
 
+/// Per-bucket LIST index: the sorted key set plus whether its warm-up sync has finished.
 #[derive(Default)]
 struct BucketState {
     synced: bool,
     keys: BTreeMap<String, ObjEntry>,
 }
 
+/// Cache-effectiveness counters, logged periodically by [`spawn_stats`].
 #[derive(Default)]
 pub struct Metrics {
     list_from_index: AtomicU64,
@@ -164,6 +162,8 @@ pub struct Metrics {
     range_promote_reject: AtomicU64,
 }
 
+/// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (a
+/// weighted LRU) in front of an upstream `s3s_aws::Proxy`, forwarding every write.
 pub struct CachingProxy {
     inner: s3s_aws::Proxy,
     /// Direct client used only for the background full LIST warm-up sync.
@@ -203,14 +203,9 @@ impl CachingProxy {
         self.metrics.clone()
     }
 
-    /// Warm the LIST index in the background instead of pre-loading it before serving.
-    /// The proxy binds + serves immediately; a `LIST` for a bucket whose index isn't
-    /// complete yet passes straight through to the upstream ([`is_synced`] gates it), so
-    /// results are always correct during warm-up. Once a bucket's full sync finishes it
-    /// flips to index-served. This keeps startup instant and independent of bucket size,
-    /// rather than blocking the port on a full pre-sync (which grows with the object count).
-    ///
-    /// [`is_synced`]: Self::is_synced
+    /// Warm each bucket's LIST index in the background so startup stays instant and
+    /// independent of bucket size. Until a bucket's full sync finishes its LISTs pass
+    /// through to the upstream (always correct), then flip to index-served.
     pub fn spawn_background_sync(&self, buckets: Vec<String>) {
         let client = self.client.clone();
         let state = self.state.clone();
@@ -254,16 +249,13 @@ impl CachingProxy {
         self.client.head_object().bucket(bucket).key(key).send().await.ok()?.content_length()
     }
 
-    /// Try to serve an int-range GET by promoting the whole object into the LRU
-    /// (one upstream fetch, singleflighted by `try_get_with`). `Some(_)` when
-    /// served — a slice, or `InvalidRange` past EOF; `None` when the promote was
-    /// refused/failed and the caller should stream the range through. The
-    /// loader gets its own request (input is Clone, all fields pub) so the
-    /// caller's — range intact — survives for that fallback. The index size can
-    /// lie (a stale entry, or a write path that didn't carry one), so the
-    /// loader trusts the upstream's Content-Length, refuses oversize bodies
-    /// before buffering, and the reject path writes the real size back so the
-    /// next range takes the bypass immediately instead of re-attempting.
+    /// Serve an int-range GET by promoting the whole object into the LRU (one upstream
+    /// fetch, singleflighted by `try_get_with`) and slicing it. `Some` when served — a
+    /// slice, or `InvalidRange` past EOF; `None` when the promote was refused/failed and
+    /// the caller should stream the range through (the loader gets its own range-cleared
+    /// request so the caller's survives for that fallback). The index size can lie, so the
+    /// loader trusts the upstream's Content-Length, refuses oversize bodies before
+    /// buffering, and writes the real size back on reject so the next range bypasses.
     async fn promote_range(
         &self,
         ckey: &(String, String),
@@ -561,13 +553,11 @@ impl s3s::S3 for CachingProxy {
         Ok(resp)
     }
 
-    // GET: cacheable (no part/conditional) small objects served from the LRU;
-    // miss buffers the body + caches it. RANGED reads of cacheable-size objects
-    // are served by slicing the cached whole object — promoted (whole-object
-    // fetch, singleflighted by moka's try_get_with) on first touch. docres reads
-    // payload packs and lance data via ranged GETs; streaming every range
-    // through to R2 made each search hit a full upstream round trip. Oversized/
-    // unknown-size ranges and conditional requests still stream through.
+    // GET: cacheable (no part/conditional) small objects are served from the LRU; a
+    // miss buffers the body and caches it. Ranged reads of cacheable-size objects are
+    // served by slicing the cached whole object, promoted on first touch (whole-object
+    // fetch, singleflighted by moka's `try_get_with`). Oversized/unknown-size ranges
+    // and conditional requests stream straight through.
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
