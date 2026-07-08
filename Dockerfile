@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1
+# Rust 1.85+ for edition 2024 (rust:1 tracks the latest stable 1.x).
 FROM rust:1-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release && cp target/release/s3cache /usr/local/bin/s3cache
+    cargo build --release --locked && cp target/release/s3cache /usr/local/bin/s3cache
 
 FROM debian:bookworm-slim
 RUN apt-get update \
