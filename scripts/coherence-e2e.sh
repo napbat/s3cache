@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end cross-node coherence test.
+# End-to-end tests: cross-node coherence + parity with direct S3.
 #
-# Spins up MinIO (S3 origin) and Valkey in containers, builds s3cache, and runs
-# scripts/coherence_e2e.py — which launches two real s3cache nodes sharing them and
-# checks that a write on one node is seen by the other (LIST, GET-no-stale, DELETE,
-# both directions). Requires: podman (or docker), python3 + boto3.
+# Spins up MinIO (S3 origin) and Valkey in containers, builds s3cache, and runs both
+# scripts/parity_e2e.py (every operation through the cache matches talking to S3
+# directly) and scripts/coherence_e2e.py (a write on one node is seen by another).
+# Requires: podman (or docker), python3 + boto3.
 #
 #   scripts/coherence-e2e.sh          # start infra, run, tear infra down
 #   KEEP=1 scripts/coherence-e2e.sh   # leave the containers running afterwards
@@ -40,6 +40,11 @@ done
 echo "==> building s3cache (release)"
 cargo build --release
 
-echo "==> running coherence checks"
-MINIO_ENDPOINT="http://127.0.0.1:9000" VALKEY_URL="redis://127.0.0.1:6379" \
-  python3 scripts/coherence_e2e.py
+export MINIO_ENDPOINT="http://127.0.0.1:9000" VALKEY_URL="redis://127.0.0.1:6379"
+
+echo "==> running parity checks (cache vs direct S3)"
+python3 scripts/parity_e2e.py
+
+echo "==> running cross-node coherence checks"
+"$RUNTIME" exec s3cache-e2e-valkey valkey-cli DEL s3cache:index:log >/dev/null 2>&1 || true
+python3 scripts/coherence_e2e.py

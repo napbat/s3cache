@@ -81,10 +81,14 @@ The same log is the durability journal for future write-back coalescing.
   `S3CACHE_TEST_VALKEY_URL=redis://127.0.0.1:6379 cargo test`. They cover peer-write hot
   invalidation, the startup bootstrap/replay window, resume-from-position, ordering,
   multi-bucket convergence, and `MAXLEN` trimming.
-- **End-to-end** (`scripts/coherence-e2e.sh`): spins up MinIO + Valkey, runs **two real
-  s3cache nodes** sharing them, and drives them with boto3 to prove a write on one node is
-  seen by the other (LIST, no-stale GET, DELETE, both directions). Needs podman/docker and
-  `python3` + `boto3`.
+- **End-to-end** (`scripts/coherence-e2e.sh`): spins up MinIO + Valkey and runs two boto3
+  harnesses against **real s3cache nodes**. Needs podman/docker and `python3` + `boto3`.
+  - `parity_e2e.py` — **differential parity**: every operation through the cache returns
+    the same as talking to S3 directly (GET bytes/headers/metadata, HEAD, ranged GET, LIST
+    with prefix/delimiter/pagination/`StartAfter`, conditional PUT & GET / OCC, DELETE,
+    multipart, copy), plus cross-node reads.
+  - `coherence_e2e.py` — a write on one node is seen by another (LIST, no-stale GET,
+    DELETE, both directions).
 
 ## Config (env)
 
