@@ -142,6 +142,13 @@ impl IndexLog {
     /// a timeout: an unreachable Valkey drops the event (logged + counted) rather than
     /// blocking the write; peers re-converge on their next full sync.
     async fn append(&self, op: &str, bucket: &str, key: &str, size: i64) {
+        // Skip instantly when Valkey is down rather than queuing into the timeout — a
+        // dropped append just delays a peer until its next full sync, but it must never
+        // add seconds of latency to the write.
+        if !self.pool.is_connected() {
+            self.metrics.log_error();
+            return;
+        }
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
         let fields: Vec<(&str, String)> = vec![
             ("op", op.to_owned()),
@@ -179,8 +186,15 @@ impl IndexLog {
     /// startup LIST bootstrap so the consumer replays everything appended from that point
     /// — nothing is missed, and re-applying what the bootstrap already saw is idempotent.
     async fn tail_id(&self) -> String {
+        // Bounded by a timeout so a down Valkey at startup can't hang the serve loop
+        // (start_index_log is awaited before binding). Falls back to "0" (replay from the
+        // beginning, which is idempotent) if Valkey is unreachable.
+        let fetch = self.pool.xrevrange(&self.stream, "+", "-", Some(1));
         let res: FredResult<Vec<(String, HashMap<String, String>)>> =
-            self.pool.xrevrange(&self.stream, "+", "-", Some(1)).await;
+            match tokio::time::timeout(LOG_OP_TIMEOUT, fetch).await {
+                Ok(r) => r,
+                Err(_) => return "0".to_owned(),
+            };
         match res {
             Ok(entries) => entries.into_iter().next().map_or_else(|| "0".to_owned(), |(id, _)| id),
             Err(_) => "0".to_owned(),
@@ -216,6 +230,12 @@ async fn consume_index_log(
     metrics: &Arc<Metrics>,
 ) {
     loop {
+        // While Valkey is unreachable, idle instead of hammering it with blocking reads
+        // that would queue and time out; fred reconnects in the background.
+        if !read.is_connected() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
         // Raw `xread` + manual conversion: a BLOCK that times out with no new entries
         // returns nil, which `xread_map` would reject as a decode error — treat nil as
         // "nothing yet". `into_xread_response` then normalizes the RESP2/RESP3 encoding.

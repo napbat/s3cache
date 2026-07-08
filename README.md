@@ -105,6 +105,9 @@ suite (below) asserts that per operation. In practice:
     multipart, copy), plus cross-node reads.
   - `coherence_e2e.py` — a write on one node is seen by another (LIST, no-stale GET,
     DELETE, both directions).
+  - `resilience_e2e.py` — a **Valkey outage is not a data-plane outage**: with Valkey
+    down, PUT/GET/LIST stay correct and fast (served from the origin, no timeout stalls),
+    and cross-node coherence resumes once Valkey recovers.
 
 ## Config (env)
 

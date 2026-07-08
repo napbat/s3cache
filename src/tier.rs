@@ -239,7 +239,17 @@ impl WarmCache {
         format!("s3cache:obj:{bucket}:{key}")
     }
 
+    /// Whether Valkey is connected right now. Guards every op so that when Valkey is down
+    /// we skip *instantly* instead of queuing the command into its `WARM_OP_TIMEOUT` — a
+    /// cache outage must not add seconds of latency to the (origin-served) data path.
+    fn available(&self) -> bool {
+        self.pool.is_connected()
+    }
+
     async fn get(&self, bucket: &str, key: &str) -> Option<Arc<CachedObject>> {
+        if !self.available() {
+            return None;
+        }
         let rk = Self::rkey(bucket, key);
         match tokio::time::timeout(WARM_OP_TIMEOUT, self.pool.get::<Option<Bytes>, _>(rk)).await {
             Ok(Ok(Some(bytes))) => match bincode::deserialize::<CachedObject>(&bytes) {
@@ -271,6 +281,9 @@ impl WarmCache {
     }
 
     async fn put(&self, bucket: &str, key: &str, obj: &CachedObject) {
+        if !self.available() {
+            return;
+        }
         let bytes = match bincode::serialize(obj) {
             Ok(b) if b.len() <= self.max_obj_bytes => b,
             Ok(_) => return, // oversize: leave it to stream through, don't fill Valkey
@@ -296,6 +309,9 @@ impl WarmCache {
     }
 
     async fn invalidate(&self, bucket: &str, key: &str) {
+        if !self.available() {
+            return;
+        }
         let rk = Self::rkey(bucket, key);
         let del = self.pool.del::<(), _>(rk);
         match tokio::time::timeout(WARM_OP_TIMEOUT, del).await {

@@ -48,3 +48,7 @@ python3 scripts/parity_e2e.py
 echo "==> running cross-node coherence checks"
 "$RUNTIME" exec s3cache-e2e-valkey valkey-cli DEL s3cache:index:log >/dev/null 2>&1 || true
 python3 scripts/coherence_e2e.py
+
+echo "==> running resilience checks (Valkey outage != data-plane outage)"
+"$RUNTIME" exec s3cache-e2e-valkey valkey-cli DEL s3cache:index:log >/dev/null 2>&1 || true
+VALKEY_CONTAINER=s3cache-e2e-valkey RUNTIME="$RUNTIME" python3 scripts/resilience_e2e.py
