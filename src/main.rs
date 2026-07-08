@@ -1,9 +1,13 @@
 //! Transparent, S3-compatible caching proxy. Binds an S3 API, forwards to an upstream
-//! S3 (e.g. R2), and layers LIST-from-index + a hot/warm/cold body cache on top via the
-//! `cache` and `tier` modules. This is the entry point: it wires config, the upstream
-//! client, the cache tiers, and the HTTP server.
+//! S3 (e.g. R2), and layers LIST-from-index + a hot/warm/cold body cache on top. This is
+//! the entry point: it wires config, the upstream client, the cache tiers, and the HTTP
+//! server. The proxy lives in `cache`, with the LIST index in `index`, the object-body
+//! tiers in `tier`, the cross-node commit log in `coherence`, and counters in `metrics`.
 
 mod cache;
+mod coherence;
+mod index;
+mod metrics;
 mod tier;
 
 use std::error::Error;
@@ -52,7 +56,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // the LIST index across nodes via a Valkey Streams commit log (multi-replica safe).
     let mode = tier::CacheMode::parse(&env_or("S3CACHE_MODE", "hot"));
     let index_log_on = matches!(env_or("S3CACHE_INDEX_LOG", "false").trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
-    let metrics = Arc::new(cache::Metrics::default());
+    let metrics = Arc::new(metrics::Metrics::default());
 
     // One Valkey pool (appends + warm ops), shared by the warm object cache and the
     // index commit log; the log additionally gets a dedicated connection for its
@@ -81,7 +85,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         let maxlen: u64 = env_or("S3CACHE_INDEX_LOG_MAXLEN", "1000000").parse().unwrap_or(1_000_000);
         let node = env_or("HOSTNAME", "s3cache");
         info!("index log enabled: stream `{stream}` maxlen ~{maxlen} node `{node}`");
-        Some(cache::IndexLog::new(pool, read, stream, maxlen, node, metrics.clone()))
+        Some(coherence::IndexLog::new(pool, read, stream, maxlen, node, metrics.clone()))
     } else {
         None
     };
@@ -111,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         .collect();
     cp.spawn_background_sync(buckets);
     let stats_secs: u64 = env_or("S3CACHE_STATS_SECS", "60").parse().unwrap_or(60);
-    cache::spawn_stats(cp.metrics(), stats_secs);
+    metrics::spawn_stats(cp.metrics(), stats_secs);
 
     let service = {
         let mut b = S3ServiceBuilder::new(cp);

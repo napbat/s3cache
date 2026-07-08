@@ -26,8 +26,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 bincode = "1"
 
 [lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
+pedantic = { level = "deny", priority = -1 }
 
 [profile.release]
 opt-level = 2

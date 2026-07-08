@@ -17,7 +17,7 @@ use futures::StreamExt;
 use s3s::dto::{ETag, GetObjectOutput, HeadObjectOutput, Metadata, StreamingBlob, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::cache::Metrics;
+use crate::metrics::Metrics;
 
 /// A warm-tier operation may never stall the data path: if Valkey is slow or gone, the
 /// op is abandoned after this and treated as a miss (reads) or a drop (writes).
@@ -454,7 +454,7 @@ impl TieredCache {
 #[cfg(test)]
 mod tests {
     use super::{buffer_body, connect_valkey, CacheMode, CachedObject, WarmCache};
-    use crate::cache::Metrics;
+    use crate::metrics::Metrics;
     use bytes::Bytes;
     use s3s::dto::{ETag, GetObjectOutput, Timestamp};
     use std::collections::HashMap;
