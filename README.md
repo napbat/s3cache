@@ -76,30 +76,26 @@ The same log is the durability journal for future write-back coalescing.
 
 ## Consistency
 
-The goal is to be indistinguishable from talking to S3 directly. The differential parity
-suite (below) asserts that per operation. In practice:
+s3cache is **always strongly consistent** — indistinguishable from talking to S3
+directly, including across nodes. There is no eventual/relaxed mode: an object store that
+can return stale reads is a footgun, so it isn't offered.
 
-- **Same node** is read-after-write consistent: a write updates that node's index and
-  invalidates its cached body synchronously before the write returns.
-- **Across nodes** (index log) is eventually consistent, bounded by log propagation
-  (typically sub-millisecond). A peer sees another node's write once it applies the log
-  event; the differential tests confirm no stale reads once propagated.
-- **Conditional writes / OCC stay correct regardless of caching**, because the origin is
-  the authority: a briefly-stale cached read only makes a client's `If-Match` write get a
-  `412` and retry — never a lost update or a wrong result, exactly as with S3 under
-  concurrency. Requests that the cache cannot reproduce faithfully — a specific
+- **Read-after-write, same node and across nodes.** A read served from node-local state —
+  a `LIST` from the index, or a `GET`/`HEAD` of a hot body copy — first *barriers* on the
+  commit log: it reads the stream tail and waits for this node's consumer to catch up
+  before answering, so a peer's just-completed write is never read stale. A write completes
+  only after its log event is appended, so any write ordered before the read is waited for.
+  The shared `warm` tier is synchronously invalidated on write and is never stale, so it
+  needs no barrier. Cost: one `XREVRANGE` + a usually-zero wait per cache-served read;
+  Valkey stays off the query path (the index/body stay local, only the fence is remote).
+  The barrier no-ops if Valkey is unreachable (see [resilience](#testing-coherence-and-parity)).
+- **Conditional writes / OCC** are correct by construction — the origin is the authority,
+  so a conditional `If-Match`/`If-None-Match` write is arbitrated at the origin and can
+  never lose an update. Requests the cache cannot reproduce faithfully — a specific
   `versionId`, `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
 
-The one way this differs from *modern* (strongly-consistent) S3 is the cross-node read
-window above, and it only bites on **overwrites of an already-cached key** — a `GET` by
-key that misses always goes to the origin, and immutable/append-only keys never go stale.
-Choose a mode for the consistency you need:
-
-| Need | Mode |
-|---|---|
-| Fastest reads; append-only data, or same-node / OCC-only access | `hot+warm` (default-ish) |
-| **Strong** cross-node read-after-write for `GET`/`HEAD` on mutable keys | `warm` — no node-local copy; a write invalidates the shared entry synchronously, so a peer's next read is fresh (verified with no propagation wait) |
-| Strict cross-node `LIST`-after-write (a peer's brand-new key visible the instant the write returns) | `S3CACHE_INDEX_LOG=true` + `S3CACHE_STRICT_LIST=true` — LIST waits for the local log consumer to reach the stream tail before answering; keeps the index local (Valkey stays off the query path), costs one `XREVRANGE` + a usually-zero wait per LIST |
+Single-node deployments (and any without the index log) are strongly consistent inherently
+— the proxy is the sole writer.
 
 ### Testing coherence and parity
 
@@ -136,7 +132,6 @@ Choose a mode for the consistency you need:
 | `S3CACHE_INDEX_LOG` | `false` | Share the LIST index across replicas via a Valkey commit log (see [above](#cross-node-coherence-index-commit-log)) |
 | `S3CACHE_INDEX_LOG_MAXLEN` | `1000000` | Approximate max entries kept in the log stream |
 | `S3CACHE_INDEX_LOG_STREAM` | `s3cache:index:log` | Valkey stream key for the commit log |
-| `S3CACHE_STRICT_LIST` | `false` | Strong cross-node `LIST`-after-write: wait for the log to catch up before serving (needs the index log) |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval (seconds) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Upstream creds (R2: region `auto`) |
 

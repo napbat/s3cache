@@ -47,23 +47,24 @@ def main():
             if not ok:
                 failures.append(name)
 
+        # Default consistency is `strong`, so every cross-node read must reflect the peer's
+        # write *immediately* — asserted with NO poll (the read-barrier does the waiting).
         a.put_object(Bucket=BUCKET, Key="k1", Body=b"v1")
-        check("PUT via A -> LIST via B sees k1", h.poll(lambda: "k1" in keys(b)) is not None)
+        check("PUT via A -> LIST via B sees k1 (strong, no poll)", "k1" in keys(b))
 
-        check("GET via B returns v1", body(b, "k1") == b"v1")
+        check("GET via B returns v1", body(b, "k1") == b"v1")  # primes B's hot copy
         a.put_object(Bucket=BUCKET, Key="k1", Body=b"v2-overwritten")
-        check("overwrite via A -> GET via B returns v2 (no stale hot read)",
-              h.poll(lambda: body(b, "k1") == b"v2-overwritten") is not None)
+        check("overwrite via A -> GET via B returns v2 (strong, no poll, no stale hot)",
+              body(b, "k1") == b"v2-overwritten")
 
         a.delete_object(Bucket=BUCKET, Key="k1")
-        check("DELETE via A -> LIST via B loses k1", h.poll(lambda: "k1" not in keys(b)) is not None)
+        check("DELETE via A -> LIST via B loses k1 (strong, no poll)", "k1" not in keys(b))
 
         b.put_object(Bucket=BUCKET, Key="k2", Body=b"from-b")
-        check("PUT via B -> LIST via A sees k2", h.poll(lambda: "k2" in keys(a)) is not None)
+        check("PUT via B -> LIST via A sees k2 (strong, no poll)", "k2" in keys(a))
 
-        # warm-only mode gives *strong* cross-node read-after-write for GET: no node-local
-        # copy, and a write invalidates the shared entry synchronously, so a peer's next
-        # read is fresh with no propagation wait. Verified without polling.
+        # warm-only mode is also strong for cross-node GET, without a hot copy: a write
+        # invalidates the shared entry synchronously, so a peer's next read is fresh.
         c_node = h.start_node("nodeC", 18033, BUCKET, mode="warm")
         d_node = h.start_node("nodeD", 18034, BUCKET, mode="warm")
         node_c, node_d = c_node, d_node
@@ -72,29 +73,13 @@ def main():
             time.sleep(1.5)
             c, dd = h.s3("http://127.0.0.1:18033"), h.s3("http://127.0.0.1:18034")
             c.put_object(Bucket=BUCKET, Key="w", Body=b"one")
-            assert h.poll(lambda: "w" in keys(dd)) is not None  # D learns the key exists
+            check("warm mode: D LIST sees C's write (strong, no poll)", "w" in keys(dd))
             _ = body(dd, "w")  # D reads it (populates the shared warm entry)
             c.put_object(Bucket=BUCKET, Key="w", Body=b"two")  # C overwrites
             check("warm mode: D GET reflects C's overwrite immediately (no poll)",
                   body(dd, "w") == b"two")
         finally:
             h.stop_nodes(node_c, node_d)
-
-        # S3CACHE_STRICT_LIST makes index-served LIST wait for the commit log to catch up,
-        # so a peer sees a brand-new key immediately — no poll.
-        strict = {"S3CACHE_STRICT_LIST": "true"}
-        e_node = h.start_node("nodeE", 18035, BUCKET, extra=strict)
-        f_node = h.start_node("nodeF", 18036, BUCKET, extra=strict)
-        node_e, node_f = e_node, f_node
-        try:
-            assert h.wait_port(18035) and h.wait_port(18036)
-            time.sleep(1.5)
-            e, f = h.s3("http://127.0.0.1:18035"), h.s3("http://127.0.0.1:18036")
-            e.put_object(Bucket=BUCKET, Key="strict-new", Body=b"x")
-            check("strict LIST: F sees E's brand-new key immediately (no poll)",
-                  "strict-new" in keys(f))
-        finally:
-            h.stop_nodes(node_e, node_f)
     except Exception as e:  # noqa: BLE001
         failures.append(f"harness error: {e!r}")
     finally:

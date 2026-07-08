@@ -117,9 +117,6 @@ pub struct CacheConfig {
     pub cache_bytes: u64,
     /// Objects larger than this are never cached.
     pub max_obj_bytes: usize,
-    /// Make index-served LIST strongly consistent across nodes by waiting for the local
-    /// commit-log consumer to catch up to the stream tail before serving (needs the log).
-    pub strict_list: bool,
 }
 
 /// The shared, ordered commit log of index mutations (a Valkey Stream). Each write
@@ -392,8 +389,6 @@ pub struct CachingProxy {
     max_obj_bytes: usize,
     /// Shared commit log for cross-node index coherence, when configured.
     index_log: Option<IndexLog>,
-    /// Whether index-served LIST waits for the commit log to catch up (strong cross-node).
-    strict_list: bool,
     metrics: Arc<Metrics>,
 }
 
@@ -417,8 +412,22 @@ impl CachingProxy {
             obj_cache: TieredCache::new(cfg.mode, cfg.cache_bytes, warm),
             max_obj_bytes: cfg.max_obj_bytes,
             index_log,
-            strict_list: cfg.strict_list,
             metrics,
+        }
+    }
+
+    /// Strong-consistency read barrier: wait for this node's commit-log consumer to catch
+    /// up to the stream tail so a read from node-local state reflects every write that
+    /// completed before it. Always on when the log is configured (single-node without the
+    /// log is already strict); it also no-ops when Valkey is unreachable. `needs_local` is
+    /// false for LIST (the index is always node-local) and gates GET/HEAD on holding a hot
+    /// copy (the shared warm tier is synchronously invalidated and never stale).
+    async fn read_barrier(&self, needs_local: bool) {
+        if (!needs_local || self.obj_cache.has_local())
+            && let Some(log) = &self.index_log
+            && !log.await_fresh().await
+        {
+            tracing::debug!("consistency barrier timed out; serving current state");
         }
     }
 
@@ -740,14 +749,7 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         if self.is_synced(req.input.bucket.as_str()) {
-            // Strong cross-node LIST: wait for the local index to catch up to the stream
-            // tail so this reflects every write that completed before the request.
-            if self.strict_list
-                && let Some(log) = &self.index_log
-                && !log.await_fresh().await
-            {
-                tracing::debug!("strict LIST barrier timed out; serving current index");
-            }
+            self.read_barrier(false).await; // index is node-local -> barrier when strict
             self.metrics.list_from_index.fetch_add(1, Ordering::Relaxed);
             let out = self.list_from_index(&req.input);
             return Ok(S3Response::new(out));
@@ -856,6 +858,11 @@ impl s3s::S3 for CachingProxy {
             (true, Some(s3s::dto::Range::Int { first, last })) => Some((first, last)),
             _ => None,
         };
+        // Before any read served from a node-local hot copy, barrier so a peer's
+        // overwrite is never read stale (strong consistency); misses go to the origin.
+        if cacheable || int_range.is_some() {
+            self.read_barrier(true).await;
+        }
         if let Some((first, last)) = int_range {
             // Cached whole object → serve the slice locally.
             if let Some(obj) = self.obj_cache.get(&ckey).await
@@ -923,6 +930,7 @@ impl s3s::S3 for CachingProxy {
             && req.input.checksum_mode.is_none()
             && req.input.sse_customer_key.is_none();
         if cache_eligible {
+            self.read_barrier(true).await; // strong consistency for a hot-served HEAD
             let ckey = (req.input.bucket.clone(), req.input.key.clone());
             if let Some(obj) = self.obj_cache.get(&ckey).await {
                 self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);

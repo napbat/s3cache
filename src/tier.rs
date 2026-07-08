@@ -370,6 +370,15 @@ impl TieredCache {
         self.hot.clone()
     }
 
+    /// Whether a node-local body copy (the hot tier) is held. Such a copy can be stale
+    /// after a peer's overwrite until the log invalidates it, so a strong-consistency GET
+    /// must barrier when this is true; the shared warm tier is synchronously invalidated
+    /// and needs no barrier.
+    #[must_use]
+    pub fn has_local(&self) -> bool {
+        self.hot.is_some()
+    }
+
     /// Look up a whole cached object: hot first, then warm (a warm hit backfills hot).
     pub async fn get(&self, key: &(String, String)) -> Option<Arc<CachedObject>> {
         if let Some(hot) = &self.hot

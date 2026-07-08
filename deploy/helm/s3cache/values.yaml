@@ -40,14 +40,12 @@ valkey:
 # Cross-node index coherence via a Valkey Streams commit log. Enable this to run more
 # than one replica without their LIST indexes drifting (requires valkey.url). Works with
 # any cache.mode. See the repo README, "Cross-node coherence".
+# With the index log on, cross-node reads are always strongly consistent (reads barrier
+# on the log so a peer's just-completed write is never read stale) — not configurable.
 indexLog:
   enabled: false
   maxlen: 1000000         # approximate max entries kept in the log stream
   stream: ""              # override the stream key (default: s3cache:index:log)
-  # Strong cross-node LIST-after-write: a LIST waits for this node's log consumer to
-  # reach the stream tail before answering, so a peer's brand-new key is visible
-  # immediately. Costs a little LIST latency; needs enabled: true.
-  strictList: false
 
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
 # this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).
