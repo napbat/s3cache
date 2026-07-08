@@ -739,7 +739,14 @@ impl s3s::S3 for CachingProxy {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let unconditional = req.input.part_number.is_none()
+        // Requests whose response the cache can't faithfully reproduce must go to the
+        // origin: a specific version, origin-computed checksums, or SSE-C (whose bytes
+        // must never be served without the caller's key).
+        let origin_only = req.input.version_id.is_some()
+            || req.input.checksum_mode.is_some()
+            || req.input.sse_customer_key.is_some();
+        let unconditional = !origin_only
+            && req.input.part_number.is_none()
             && req.input.if_match.is_none()
             && req.input.if_none_match.is_none()
             && req.input.if_modified_since.is_none()
@@ -805,12 +812,18 @@ impl s3s::S3 for CachingProxy {
         Ok(resp)
     }
 
-    // HEAD served from the object cache when the body is already cached.
+    // HEAD served from the object cache when the body is already cached. Requests that
+    // need the origin (range, part, specific version, checksums, SSE-C) pass through.
     async fn head_object(
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
-        if req.input.range.is_none() && req.input.part_number.is_none() {
+        let cache_eligible = req.input.range.is_none()
+            && req.input.part_number.is_none()
+            && req.input.version_id.is_none()
+            && req.input.checksum_mode.is_none()
+            && req.input.sse_customer_key.is_none();
+        if cache_eligible {
             let ckey = (req.input.bucket.clone(), req.input.key.clone());
             if let Some(obj) = self.obj_cache.get(&ckey).await {
                 self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
@@ -821,7 +834,7 @@ impl s3s::S3 for CachingProxy {
     }
 
     // Full S3 passthrough: every other op forwards to the upstream so any S3
-    // client works (not just docres). Generated from the s3s S3 trait.
+    // client works, not just the cached read/write paths. Generated from the s3s S3 trait.
     async fn abort_multipart_upload(&self, req: S3Request<s3s::dto::AbortMultipartUploadInput>) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
         self.inner.abort_multipart_upload(req).await
     }

@@ -127,6 +127,13 @@ def main():
         c.eq("PUT If-Match parity (stale etag rejected, current accepted)",
              cond_put_ifmatch(p, "occm-proxy"), cond_put_ifmatch(d, "occm-direct"))
 
+        # --- checksum parity: ChecksumMode=ENABLED must match, even after caching ----
+        p.put_object(Bucket=BUCKET, Key="ck", Body=b"checksummed", ChecksumAlgorithm="SHA256")
+        _ = get_fields(p, "ck")  # prime the plain cache entry
+        c.eq("GET ChecksumMode after caching == direct",
+             p.get_object(Bucket=BUCKET, Key="ck", ChecksumMode="ENABLED").get("ChecksumSHA256"),
+             d.get_object(Bucket=BUCKET, Key="ck", ChecksumMode="ENABLED").get("ChecksumSHA256"))
+
         # --- conditional GET parity: If-None-Match -> 304 ---------------------------
         etag = d.head_object(Bucket=BUCKET, Key="obj")["ETag"]
         c.eq("GET If-None-Match(current) -> 304 like direct",
