@@ -19,7 +19,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fred::prelude::*;
-use fred::types::streams::XReadResponse;
 use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, StreamingBlob, Timestamp};
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
@@ -113,7 +112,10 @@ pub struct CacheConfig {
 /// replayable — a reconnecting node resumes from its last-applied ID and can't miss a
 /// write, the failure mode raw pub/sub has — which is what makes it OCC-safe.
 pub struct IndexLog {
+    /// Pool for appends (`XADD`) and one-shot reads — non-blocking, shared with warm.
     pool: Pool,
+    /// Dedicated connection for the consumer's blocking `XREAD` (see `connect_valkey_client`).
+    read_client: Client,
     stream: String,
     maxlen: i64,
     /// This process's id (e.g. the pod name) so it can skip replaying its own events.
@@ -122,11 +124,13 @@ pub struct IndexLog {
 }
 
 impl IndexLog {
-    /// Wrap a connected Valkey pool as the index commit log.
+    /// Wrap a connected Valkey pool (appends) plus a dedicated read connection (the
+    /// blocking consumer) as the index commit log.
     #[must_use]
-    pub fn new(pool: Pool, stream: String, maxlen: u64, node: String, metrics: Arc<Metrics>) -> Self {
+    pub fn new(pool: Pool, read_client: Client, stream: String, maxlen: u64, node: String, metrics: Arc<Metrics>) -> Self {
         Self {
             pool,
+            read_client,
             stream,
             maxlen: i64::try_from(maxlen).unwrap_or(i64::MAX),
             node,
@@ -191,10 +195,10 @@ impl IndexLog {
         state: Arc<RwLock<HashMap<String, BucketState>>>,
         hot: Option<HotCache>,
     ) {
-        let (pool, stream, node, metrics) =
-            (self.pool.clone(), self.stream.clone(), self.node.clone(), self.metrics.clone());
+        let (read, stream, node, metrics) =
+            (self.read_client.clone(), self.stream.clone(), self.node.clone(), self.metrics.clone());
         tokio::spawn(async move {
-            consume_index_log(&pool, &stream, &node, start_id, &state, hot.as_ref(), &metrics).await;
+            consume_index_log(&read, &stream, &node, start_id, &state, hot.as_ref(), &metrics).await;
         });
     }
 }
@@ -203,7 +207,7 @@ impl IndexLog {
 /// cache. A read error just backs off and retries — the position (`last_id`) is kept, so
 /// no event is skipped across a transient Valkey blip.
 async fn consume_index_log(
-    pool: &Pool,
+    read: &Client,
     stream: &str,
     node: &str,
     mut last_id: String,
@@ -212,24 +216,33 @@ async fn consume_index_log(
     metrics: &Arc<Metrics>,
 ) {
     loop {
-        // `xread_map` (not `xread`) normalizes the RESP2/RESP3 encoding difference into a
-        // map — a plain `xread` reply can't be forced into `XReadResponse`.
-        let read: FredResult<XReadResponse<String, String, String, String>> =
-            pool.xread_map(Some(500), Some(5000), stream, &last_id).await;
-        match read {
-            Ok(map) => {
-                let Some(entries) = map.get(stream) else { continue };
-                for (id, fields) in entries {
-                    apply_log_event(node, state, hot, fields).await;
-                    last_id.clone_from(id);
-                    metrics.log_applied();
+        // Raw `xread` + manual conversion: a BLOCK that times out with no new entries
+        // returns nil, which `xread_map` would reject as a decode error — treat nil as
+        // "nothing yet". `into_xread_response` then normalizes the RESP2/RESP3 encoding.
+        let reply: FredResult<Value> = read.xread(Some(500), Some(5000), stream, &last_id).await;
+        let map = match reply {
+            Ok(v) if v.is_null() => continue, // BLOCK timed out with no new entries
+            Ok(v) => match v.into_xread_response::<String, String, String, String>() {
+                Ok(map) => map,
+                Err(e) => {
+                    metrics.log_error();
+                    tracing::warn!("index log decode failed: {e}; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
-            }
+            },
             Err(e) => {
                 metrics.log_error();
                 tracing::warn!("index log read failed: {e}; retrying");
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
             }
+        };
+        let Some(entries) = map.get(stream) else { continue };
+        for (id, fields) in entries {
+            apply_log_event(node, state, hot, fields).await;
+            last_id.clone_from(id);
+            metrics.log_applied();
         }
     }
 }
@@ -1075,13 +1088,41 @@ impl s3s::S3 for CachingProxy {
 #[cfg(test)]
 mod tests {
     use super::{apply_log_event, BucketState, IndexLog, Metrics};
-    use crate::tier::connect_valkey;
+    use crate::tier::{connect_valkey, CachedObject, HotCache};
     use fred::prelude::*;
+    use s3s::dto::GetObjectOutput;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
     type Index = Arc<RwLock<HashMap<String, BucketState>>>;
+
+    // ---- helpers -----------------------------------------------------------------
+
+    static STREAM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique stream key per test so the (parallel) tests never interfere.
+    fn unique_stream() -> String {
+        format!("s3cache:test:{}:{}", std::process::id(), STREAM_SEQ.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Connect a Valkey pool, or `None` (test skips) when `S3CACHE_TEST_VALKEY_URL` is unset.
+    async fn valkey_pool() -> Option<Pool> {
+        let url = std::env::var("S3CACHE_TEST_VALKEY_URL").ok()?;
+        let pool = connect_valkey(&url, 3).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await; // let it connect
+        Some(pool)
+    }
+
+    fn read_client() -> Client {
+        let url = std::env::var("S3CACHE_TEST_VALKEY_URL").unwrap();
+        crate::tier::connect_valkey_client(&url).unwrap()
+    }
+
+    fn log(pool: &Pool, stream: &str, node: &str) -> IndexLog {
+        IndexLog::new(pool.clone(), read_client(), stream.to_owned(), 10_000, node.to_owned(), Arc::new(Metrics::default()))
+    }
 
     fn event(op: &str, bucket: &str, key: &str, size: &str, node: &str) -> HashMap<String, String> {
         HashMap::from([
@@ -1098,6 +1139,7 @@ mod tests {
         state.read().unwrap().get(bucket).and_then(|b| b.keys.get(key)).map(|e| e.size)
     }
 
+    /// Poll `cond` for up to ~3s (the consumer applies within a few ms in practice).
     async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
         for _ in 0..60 {
             if cond() {
@@ -1108,46 +1150,190 @@ mod tests {
         cond()
     }
 
+    fn hot_cache() -> HotCache {
+        moka::future::Cache::builder().max_capacity(1024).build()
+    }
+
+    fn cached(body: &'static [u8]) -> Arc<CachedObject> {
+        Arc::new(CachedObject::from_get(&GetObjectOutput::default(), bytes::Bytes::from_static(body)))
+    }
+
+    // ---- pure apply logic (no Valkey) --------------------------------------------
+
     #[tokio::test]
-    async fn apply_skips_own_and_applies_peer() {
+    async fn apply_peer_own_and_malformed() {
         let state: Index = Arc::new(RwLock::new(HashMap::new()));
+
+        // A peer's put applies.
         apply_log_event("me", &state, None, &event("put", "b", "k", "7", "peer")).await;
         assert_eq!(indexed_size(&state, "b", "k"), Some(7));
+
         // Our own event is ignored — the local index already reflects it.
         apply_log_event("me", &state, None, &event("del", "b", "k", "-1", "me")).await;
         assert_eq!(indexed_size(&state, "b", "k"), Some(7));
+
+        // Malformed (missing key) and unknown ops are skipped, not panics.
+        let mut no_key = event("put", "b", "k2", "1", "peer");
+        no_key.remove("key");
+        apply_log_event("me", &state, None, &no_key).await;
+        apply_log_event("me", &state, None, &event("frobnicate", "b", "k", "1", "peer")).await;
+        assert_eq!(indexed_size(&state, "b", "k2"), None);
+        assert_eq!(indexed_size(&state, "b", "k"), Some(7));
+
         // A peer's delete applies.
         apply_log_event("me", &state, None, &event("del", "b", "k", "-1", "peer")).await;
         assert_eq!(indexed_size(&state, "b", "k"), None);
     }
 
-    // Two IndexLogs on one Valkey stream: node A's writes must reach node B's index via
-    // the background consumer. Skipped unless S3CACHE_TEST_VALKEY_URL is set.
-    #[tokio::test]
-    async fn index_log_cross_node() {
-        let Ok(url) = std::env::var("S3CACHE_TEST_VALKEY_URL") else {
-            eprintln!("skip index_log_cross_node: set S3CACHE_TEST_VALKEY_URL to run");
-            return;
+    // ---- live cross-node coherence (Valkey-gated) --------------------------------
+
+    macro_rules! valkey_or_skip {
+        () => {
+            match valkey_pool().await {
+                Some(p) => p,
+                None => {
+                    eprintln!("skip: set S3CACHE_TEST_VALKEY_URL to run");
+                    return;
+                }
+            }
         };
-        let pool = connect_valkey(&url, 3).unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let stream = format!("s3cache:test:{}", std::process::id());
-        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
 
-        let metrics = Arc::new(Metrics::default());
-        let node_a = IndexLog::new(pool.clone(), stream.clone(), 10_000, "nodeA".to_owned(), metrics.clone());
-        let node_b = IndexLog::new(pool.clone(), stream.clone(), 10_000, "nodeB".to_owned(), metrics);
-
-        // Node B tails from the current tail, then node A writes.
+    /// A put and a delete on node A both reach node B's index via the real consumer.
+    #[tokio::test]
+    async fn cross_node_put_and_delete() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let (a, b) = (log(&pool, &stream, "A"), log(&pool, &stream, "B"));
         let state: Index = Arc::new(RwLock::new(HashMap::new()));
-        let start = node_b.tail_id().await;
-        node_b.spawn_consumer(start, state.clone(), None);
+        b.spawn_consumer(b.tail_id().await, state.clone(), None);
 
-        node_a.append_put("bkt", "obj1", 42).await;
+        a.append_put("bkt", "obj1", 42).await;
         assert!(wait_until(|| indexed_size(&state, "bkt", "obj1") == Some(42)).await, "B should see A's put");
 
-        node_a.append_del("bkt", "obj1").await;
+        a.append_del("bkt", "obj1").await;
         assert!(wait_until(|| indexed_size(&state, "bkt", "obj1").is_none()).await, "B should see A's delete");
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
+
+    /// Many keys across multiple buckets converge on the peer.
+    #[tokio::test]
+    async fn cross_node_multi_bucket() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let (a, b) = (log(&pool, &stream, "A"), log(&pool, &stream, "B"));
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        b.spawn_consumer(b.tail_id().await, state.clone(), None);
+
+        for i in 0..25 {
+            a.append_put("b1", &format!("k{i}"), i).await;
+            a.append_put("b2", &format!("k{i}"), i + 1000).await;
+        }
+        let all = |st: &Index| (0..25).all(|i| {
+            indexed_size(st, "b1", &format!("k{i}")) == Some(i)
+                && indexed_size(st, "b2", &format!("k{i}")) == Some(i + 1000)
+        });
+        assert!(wait_until(|| all(&state)).await, "B should converge on all keys in both buckets");
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
+
+    /// A peer's write invalidates this node's local hot object copy (no stale reads).
+    #[tokio::test]
+    async fn peer_write_invalidates_local_hot() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let (a, b) = (log(&pool, &stream, "A"), log(&pool, &stream, "B"));
+
+        let hot = hot_cache();
+        let ck = ("bkt".to_owned(), "obj".to_owned());
+        hot.insert(ck.clone(), cached(b"stale")).await;
+        assert!(hot.contains_key(&ck));
+
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        b.spawn_consumer(b.tail_id().await, state, Some(hot.clone()));
+
+        a.append_put("bkt", "obj", 5).await;
+        assert!(wait_until(|| !hot.contains_key(&ck)).await, "peer write must drop the local hot copy");
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
+
+    /// Starting from a captured position delivers only newer events — the resume
+    /// guarantee: no re-processing of old entries, no missing of new ones.
+    #[tokio::test]
+    async fn consumer_starts_from_position() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let (a, b) = (log(&pool, &stream, "A"), log(&pool, &stream, "B"));
+
+        a.append_put("b", "before", 1).await;
+        let start = b.tail_id().await; // position after `before`
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        b.spawn_consumer(start, state.clone(), None);
+
+        a.append_put("b", "after", 2).await;
+        assert!(wait_until(|| indexed_size(&state, "b", "after") == Some(2)).await, "sees events after the start");
+        assert_eq!(indexed_size(&state, "b", "before"), None, "does not replay events before the start");
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
+
+    /// Capturing the tail *before* the bootstrap window, then replaying from it, loses no
+    /// write that lands during bootstrap — the ordering `main` relies on at startup.
+    #[tokio::test]
+    async fn bootstrap_replay_has_no_gap() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let (a, b) = (log(&pool, &stream, "A"), log(&pool, &stream, "B"));
+
+        let start = b.tail_id().await; // captured before the "bootstrap"
+        a.append_put("b", "during1", 1).await; // writes that race the bootstrap LIST
+        a.append_put("b", "during2", 2).await;
+
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        b.spawn_consumer(start, state.clone(), None);
+
+        assert!(
+            wait_until(|| indexed_size(&state, "b", "during1") == Some(1) && indexed_size(&state, "b", "during2") == Some(2)).await,
+            "replay from the pre-bootstrap tail must not miss writes"
+        );
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
+
+    /// Stream order is preserved through the consumer: put-then-del clears, del-then-put sets.
+    #[tokio::test]
+    async fn ordering_converges() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let (a, b) = (log(&pool, &stream, "A"), log(&pool, &stream, "B"));
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        b.spawn_consumer(b.tail_id().await, state.clone(), None);
+
+        a.append_put("b", "x", 5).await;
+        a.append_del("b", "x").await;
+        assert!(wait_until(|| indexed_size(&state, "b", "x").is_none()).await, "put then del => absent");
+
+        a.append_del("b", "y").await;
+        a.append_put("b", "y", 9).await;
+        assert!(wait_until(|| indexed_size(&state, "b", "y") == Some(9)).await, "del then put => present");
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
+
+    /// Approximate `MAXLEN` trimming bounds the stream instead of growing without limit.
+    #[tokio::test]
+    async fn maxlen_bounds_the_stream() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let small = IndexLog::new(pool.clone(), read_client(), stream.clone(), 20, "A".to_owned(), Arc::new(Metrics::default()));
+        for i in 0..200 {
+            small.append_put("b", &format!("k{i}"), i).await;
+        }
+        let len: i64 = pool.xlen(stream.as_str()).await.unwrap();
+        assert!((20..150).contains(&len), "MAXLEN ~20 should bound the stream (got {len})");
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }

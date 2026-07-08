@@ -54,12 +54,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let index_log_on = matches!(env_or("S3CACHE_INDEX_LOG", "false").trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
     let metrics = Arc::new(cache::Metrics::default());
 
-    // One Valkey pool, shared by the warm object cache and the index commit log.
-    let valkey = if mode.warm() || index_log_on {
-        let url = std::env::var("S3CACHE_VALKEY_URL")
-            .expect("S3CACHE_VALKEY_URL is required when the warm tier or the index log is enabled");
+    // One Valkey pool (appends + warm ops), shared by the warm object cache and the
+    // index commit log; the log additionally gets a dedicated connection for its
+    // blocking reads so they can't stall an append.
+    let valkey_url = (mode.warm() || index_log_on)
+        .then(|| std::env::var("S3CACHE_VALKEY_URL").expect("S3CACHE_VALKEY_URL is required when the warm tier or the index log is enabled"));
+    let valkey = if let Some(url) = &valkey_url {
         let pool_size: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
-        let pool = tier::connect_valkey(&url, pool_size)?;
+        let pool = tier::connect_valkey(url, pool_size)?;
         info!("Valkey pool of {pool_size} (connecting in background)");
         Some(pool)
     } else {
@@ -72,13 +74,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         tier::WarmCache::new(pool, max_obj_bytes, (ttl_secs > 0).then_some(ttl_secs), metrics.clone())
     });
 
-    let index_log = valkey.filter(|_| index_log_on).map(|pool| {
+    let index_log = if index_log_on {
+        let pool = valkey.clone().expect("valkey pool present when the index log is enabled");
+        let read = tier::connect_valkey_client(valkey_url.as_deref().unwrap())?;
         let stream = env_or("S3CACHE_INDEX_LOG_STREAM", "s3cache:index:log");
         let maxlen: u64 = env_or("S3CACHE_INDEX_LOG_MAXLEN", "1000000").parse().unwrap_or(1_000_000);
         let node = env_or("HOSTNAME", "s3cache");
         info!("index log enabled: stream `{stream}` maxlen ~{maxlen} node `{node}`");
-        cache::IndexLog::new(pool, stream, maxlen, node, metrics.clone())
-    });
+        Some(cache::IndexLog::new(pool, read, stream, maxlen, node, metrics.clone()))
+    } else {
+        None
+    };
 
     info!("cache mode: {mode:?}, index log: {index_log_on}");
     let cfg = cache::CacheConfig { mode, cache_bytes, max_obj_bytes };

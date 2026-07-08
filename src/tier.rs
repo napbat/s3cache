@@ -211,6 +211,18 @@ pub fn connect_valkey(url: &str, pool_size: usize) -> anyhow::Result<Pool> {
     Ok(pool)
 }
 
+/// A single dedicated Valkey connection (also connecting in the background). Used for the
+/// index-log consumer's blocking `XREAD`: a blocking read monopolizes its connection, so
+/// it must not share the pool with the write-path appends (they would stall behind it).
+pub fn connect_valkey_client(url: &str) -> anyhow::Result<Client> {
+    let config = Config::from_url(url)?;
+    let mut builder = Builder::from_config(config);
+    builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
+    let client = builder.build()?;
+    client.connect();
+    Ok(client)
+}
+
 impl WarmCache {
     /// Wrap an existing (already-connecting) Valkey pool as the warm object cache.
     #[must_use]

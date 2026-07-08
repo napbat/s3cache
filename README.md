@@ -74,6 +74,18 @@ Roadmap: **OCC** (atomic read-modify-write) on top of the log — the stream is 
 linearization order, so a conditional write becomes "append if the version is unchanged."
 The same log is the durability journal for future write-back coalescing.
 
+### Testing coherence
+
+- **Unit / protocol tests** (`cargo test`): the coherence tests against a live Valkey run
+  only when `S3CACHE_TEST_VALKEY_URL` is set, e.g.
+  `S3CACHE_TEST_VALKEY_URL=redis://127.0.0.1:6379 cargo test`. They cover peer-write hot
+  invalidation, the startup bootstrap/replay window, resume-from-position, ordering,
+  multi-bucket convergence, and `MAXLEN` trimming.
+- **End-to-end** (`scripts/coherence-e2e.sh`): spins up MinIO + Valkey, runs **two real
+  s3cache nodes** sharing them, and drives them with boto3 to prove a write on one node is
+  seen by the other (LIST, no-stale GET, DELETE, both directions). Needs podman/docker and
+  `python3` + `boto3`.
+
 ## Config (env)
 
 | Var | Default | Meaning |
