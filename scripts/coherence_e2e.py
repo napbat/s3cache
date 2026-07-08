@@ -60,6 +60,25 @@ def main():
 
         b.put_object(Bucket=BUCKET, Key="k2", Body=b"from-b")
         check("PUT via B -> LIST via A sees k2", h.poll(lambda: "k2" in keys(a)) is not None)
+
+        # warm-only mode gives *strong* cross-node read-after-write for GET: no node-local
+        # copy, and a write invalidates the shared entry synchronously, so a peer's next
+        # read is fresh with no propagation wait. Verified without polling.
+        c_node = h.start_node("nodeC", 18033, BUCKET, mode="warm")
+        d_node = h.start_node("nodeD", 18034, BUCKET, mode="warm")
+        node_c, node_d = c_node, d_node
+        try:
+            assert h.wait_port(18033) and h.wait_port(18034)
+            time.sleep(1.5)
+            c, dd = h.s3("http://127.0.0.1:18033"), h.s3("http://127.0.0.1:18034")
+            c.put_object(Bucket=BUCKET, Key="w", Body=b"one")
+            assert h.poll(lambda: "w" in keys(dd)) is not None  # D learns the key exists
+            _ = body(dd, "w")  # D reads it (populates the shared warm entry)
+            c.put_object(Bucket=BUCKET, Key="w", Body=b"two")  # C overwrites
+            check("warm mode: D GET reflects C's overwrite immediately (no poll)",
+                  body(dd, "w") == b"two")
+        finally:
+            h.stop_nodes(node_c, node_d)
     except Exception as e:  # noqa: BLE001
         failures.append(f"harness error: {e!r}")
     finally:

@@ -90,6 +90,17 @@ suite (below) asserts that per operation. In practice:
   concurrency. Requests that the cache cannot reproduce faithfully — a specific
   `versionId`, `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
 
+The one way this differs from *modern* (strongly-consistent) S3 is the cross-node read
+window above, and it only bites on **overwrites of an already-cached key** — a `GET` by
+key that misses always goes to the origin, and immutable/append-only keys never go stale.
+Choose a mode for the consistency you need:
+
+| Need | Mode |
+|---|---|
+| Fastest reads; append-only data, or same-node / OCC-only access | `hot+warm` (default-ish) |
+| **Strong** cross-node read-after-write for `GET`/`HEAD` on mutable keys | `warm` — no node-local copy; a write invalidates the shared entry synchronously, so a peer's next read is fresh (verified with no propagation wait) |
+| Strict cross-node `LIST`-after-write (a peer's brand-new key visible the instant the write returns) | not provided — the index is deliberately local for speed; it converges in sub-ms |
+
 ### Testing coherence and parity
 
 - **Unit / protocol tests** (`cargo test`): the coherence tests against a live Valkey run
