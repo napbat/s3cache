@@ -86,8 +86,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         None
     };
 
-    info!("cache mode: {mode:?}, index log: {index_log_on}");
-    let cfg = cache::CacheConfig { mode, cache_bytes, max_obj_bytes };
+    // Strong cross-node LIST: index-served LIST waits for the commit log to catch up
+    // before answering (needs the index log; no effect single-node, which is already
+    // strict). Trades a little LIST latency for read-after-write across nodes.
+    let strict_list = matches!(env_or("S3CACHE_STRICT_LIST", "false").trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
+    info!("cache mode: {mode:?}, index log: {index_log_on}, strict LIST: {strict_list}");
+    let cfg = cache::CacheConfig { mode, cache_bytes, max_obj_bytes, strict_list };
     let cp = cache::CachingProxy::new(proxy, client, cfg, warm, index_log, metrics.clone());
 
     // Start tailing the shared commit log BEFORE the bootstrap LIST, so the replay window

@@ -61,6 +61,10 @@ spec:
             - name: S3CACHE_INDEX_LOG_STREAM
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.indexLog.strictList }}
+            - name: S3CACHE_STRICT_LIST
+              value: "true"
+            {{- end }}
             {{- end }}
             - name: RUST_LOG
               value: "info"

@@ -99,7 +99,7 @@ Choose a mode for the consistency you need:
 |---|---|
 | Fastest reads; append-only data, or same-node / OCC-only access | `hot+warm` (default-ish) |
 | **Strong** cross-node read-after-write for `GET`/`HEAD` on mutable keys | `warm` — no node-local copy; a write invalidates the shared entry synchronously, so a peer's next read is fresh (verified with no propagation wait) |
-| Strict cross-node `LIST`-after-write (a peer's brand-new key visible the instant the write returns) | not provided — the index is deliberately local for speed; it converges in sub-ms |
+| Strict cross-node `LIST`-after-write (a peer's brand-new key visible the instant the write returns) | `S3CACHE_INDEX_LOG=true` + `S3CACHE_STRICT_LIST=true` — LIST waits for the local log consumer to reach the stream tail before answering; keeps the index local (Valkey stays off the query path), costs one `XREVRANGE` + a usually-zero wait per LIST |
 
 ### Testing coherence and parity
 
@@ -136,6 +136,7 @@ Choose a mode for the consistency you need:
 | `S3CACHE_INDEX_LOG` | `false` | Share the LIST index across replicas via a Valkey commit log (see [above](#cross-node-coherence-index-commit-log)) |
 | `S3CACHE_INDEX_LOG_MAXLEN` | `1000000` | Approximate max entries kept in the log stream |
 | `S3CACHE_INDEX_LOG_STREAM` | `s3cache:index:log` | Valkey stream key for the commit log |
+| `S3CACHE_STRICT_LIST` | `false` | Strong cross-node `LIST`-after-write: wait for the log to catch up before serving (needs the index log) |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval (seconds) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Upstream creds (R2: region `auto`) |
 

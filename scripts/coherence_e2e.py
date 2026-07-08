@@ -79,6 +79,22 @@ def main():
                   body(dd, "w") == b"two")
         finally:
             h.stop_nodes(node_c, node_d)
+
+        # S3CACHE_STRICT_LIST makes index-served LIST wait for the commit log to catch up,
+        # so a peer sees a brand-new key immediately — no poll.
+        strict = {"S3CACHE_STRICT_LIST": "true"}
+        e_node = h.start_node("nodeE", 18035, BUCKET, extra=strict)
+        f_node = h.start_node("nodeF", 18036, BUCKET, extra=strict)
+        node_e, node_f = e_node, f_node
+        try:
+            assert h.wait_port(18035) and h.wait_port(18036)
+            time.sleep(1.5)
+            e, f = h.s3("http://127.0.0.1:18035"), h.s3("http://127.0.0.1:18036")
+            e.put_object(Bucket=BUCKET, Key="strict-new", Body=b"x")
+            check("strict LIST: F sees E's brand-new key immediately (no poll)",
+                  "strict-new" in keys(f))
+        finally:
+            h.stop_nodes(node_e, node_f)
     except Exception as e:  # noqa: BLE001
         failures.append(f"harness error: {e!r}")
     finally:

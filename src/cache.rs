@@ -29,6 +29,19 @@ use crate::tier::{self, CacheMode, CachedObject, HotCache, TieredCache, WarmCach
 /// dropped append (the peers re-converge on their next full sync).
 const LOG_OP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a strict LIST waits for the local consumer to catch up to the stream tail
+/// before serving anyway (degrading to eventual rather than hanging the request).
+const LIST_BARRIER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A Valkey Stream entry ID `<ms>-<seq>`, parsed into an ordered pair (`"0"` = the
+/// origin). Tuple ordering matches stream order, so positions compare with `>=`.
+type StreamId = (u64, u64);
+
+fn parse_stream_id(id: &str) -> StreamId {
+    let (ms, seq) = id.split_once('-').unwrap_or((id, "0"));
+    (ms.parse().unwrap_or(0), seq.parse().unwrap_or(0))
+}
+
 /// One indexed key's LIST metadata: its size and last-modified time.
 struct ObjEntry {
     size: i64,
@@ -104,6 +117,9 @@ pub struct CacheConfig {
     pub cache_bytes: u64,
     /// Objects larger than this are never cached.
     pub max_obj_bytes: usize,
+    /// Make index-served LIST strongly consistent across nodes by waiting for the local
+    /// commit-log consumer to catch up to the stream tail before serving (needs the log).
+    pub strict_list: bool,
 }
 
 /// The shared, ordered commit log of index mutations (a Valkey Stream). Each write
@@ -120,6 +136,9 @@ pub struct IndexLog {
     maxlen: i64,
     /// This process's id (e.g. the pod name) so it can skip replaying its own events.
     node: String,
+    /// The highest stream ID this node's consumer has processed. Read by the strict-LIST
+    /// barrier to tell whether the local index has caught up to a given stream position.
+    applied: Arc<RwLock<StreamId>>,
     metrics: Arc<Metrics>,
 }
 
@@ -134,8 +153,43 @@ impl IndexLog {
             stream,
             maxlen: i64::try_from(maxlen).unwrap_or(i64::MAX),
             node,
+            applied: Arc::new(RwLock::new((0, 0))),
             metrics,
         }
+    }
+
+    /// Wait until this node's consumer has applied every event committed to the stream as
+    /// of now, so a following index-served LIST reflects all writes that completed before
+    /// this call (strong cross-node read-after-write for LIST). Best-effort: returns
+    /// immediately if Valkey is unreachable or the stream is empty, and gives up after
+    /// `LIST_BARRIER_TIMEOUT` rather than hanging the request. Returns whether it caught up.
+    async fn await_fresh(&self) -> bool {
+        let Some(target) = self.latest_id().await else {
+            return true; // empty stream / unreachable -> nothing to wait for
+        };
+        let mut waited = Duration::ZERO;
+        let step = Duration::from_millis(5);
+        loop {
+            if *self.applied.read().unwrap() >= target {
+                return true;
+            }
+            if waited >= LIST_BARRIER_TIMEOUT {
+                return false;
+            }
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+    }
+
+    /// The stream's current tail as a parsed [`StreamId`], or `None` if empty/unreachable.
+    async fn latest_id(&self) -> Option<StreamId> {
+        if !self.pool.is_connected() {
+            return None;
+        }
+        let fetch = self.pool.xrevrange(&self.stream, "+", "-", Some(1));
+        let res: FredResult<Vec<(String, HashMap<String, String>)>> =
+            tokio::time::timeout(LOG_OP_TIMEOUT, fetch).await.ok()?;
+        res.ok()?.into_iter().next().map(|(id, _)| parse_stream_id(&id))
     }
 
     /// Append a write event, capped with approximate `MAXLEN` trimming. Best-effort with
@@ -209,60 +263,74 @@ impl IndexLog {
         state: Arc<RwLock<HashMap<String, BucketState>>>,
         hot: Option<HotCache>,
     ) {
-        let (read, stream, node, metrics) =
-            (self.read_client.clone(), self.stream.clone(), self.node.clone(), self.metrics.clone());
+        let (read, stream, node, metrics, applied) = (
+            self.read_client.clone(),
+            self.stream.clone(),
+            self.node.clone(),
+            self.metrics.clone(),
+            self.applied.clone(),
+        );
+        // The consumer starts at start_id, so the local index reflects everything up to it.
+        *applied.write().unwrap() = parse_stream_id(&start_id);
         tokio::spawn(async move {
-            consume_index_log(&read, &stream, &node, start_id, &state, hot.as_ref(), &metrics).await;
+            let cx = ConsumerCtx { read: &read, stream: &stream, node: &node, state: &state, hot: hot.as_ref(), applied: &applied, metrics: &metrics };
+            consume_index_log(&cx, start_id).await;
         });
     }
+}
+
+/// The shared handles a running index-log consumer borrows for its lifetime.
+struct ConsumerCtx<'a> {
+    read: &'a Client,
+    stream: &'a str,
+    node: &'a str,
+    state: &'a RwLock<HashMap<String, BucketState>>,
+    hot: Option<&'a HotCache>,
+    applied: &'a RwLock<StreamId>,
+    metrics: &'a Arc<Metrics>,
 }
 
 /// Tail the index commit log forever, applying each event to the local index and hot
 /// cache. A read error just backs off and retries — the position (`last_id`) is kept, so
 /// no event is skipped across a transient Valkey blip.
-async fn consume_index_log(
-    read: &Client,
-    stream: &str,
-    node: &str,
-    mut last_id: String,
-    state: &RwLock<HashMap<String, BucketState>>,
-    hot: Option<&HotCache>,
-    metrics: &Arc<Metrics>,
-) {
+async fn consume_index_log(cx: &ConsumerCtx<'_>, mut last_id: String) {
     loop {
         // While Valkey is unreachable, idle instead of hammering it with blocking reads
         // that would queue and time out; fred reconnects in the background.
-        if !read.is_connected() {
+        if !cx.read.is_connected() {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         }
         // Raw `xread` + manual conversion: a BLOCK that times out with no new entries
         // returns nil, which `xread_map` would reject as a decode error — treat nil as
         // "nothing yet". `into_xread_response` then normalizes the RESP2/RESP3 encoding.
-        let reply: FredResult<Value> = read.xread(Some(500), Some(5000), stream, &last_id).await;
+        let reply: FredResult<Value> = cx.read.xread(Some(500), Some(5000), cx.stream, &last_id).await;
         let map = match reply {
             Ok(v) if v.is_null() => continue, // BLOCK timed out with no new entries
             Ok(v) => match v.into_xread_response::<String, String, String, String>() {
                 Ok(map) => map,
                 Err(e) => {
-                    metrics.log_error();
+                    cx.metrics.log_error();
                     tracing::warn!("index log decode failed: {e}; retrying");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             },
             Err(e) => {
-                metrics.log_error();
+                cx.metrics.log_error();
                 tracing::warn!("index log read failed: {e}; retrying");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
-        let Some(entries) = map.get(stream) else { continue };
+        let Some(entries) = map.get(cx.stream) else { continue };
         for (id, fields) in entries {
-            apply_log_event(node, state, hot, fields).await;
+            apply_log_event(cx.node, cx.state, cx.hot, fields).await;
             last_id.clone_from(id);
-            metrics.log_applied();
+            // Advance the applied position for every entry (including our own, which
+            // apply skips) so the strict-LIST barrier tracks true stream progress.
+            *cx.applied.write().unwrap() = parse_stream_id(id);
+            cx.metrics.log_applied();
         }
     }
 }
@@ -324,6 +392,8 @@ pub struct CachingProxy {
     max_obj_bytes: usize,
     /// Shared commit log for cross-node index coherence, when configured.
     index_log: Option<IndexLog>,
+    /// Whether index-served LIST waits for the commit log to catch up (strong cross-node).
+    strict_list: bool,
     metrics: Arc<Metrics>,
 }
 
@@ -347,6 +417,7 @@ impl CachingProxy {
             obj_cache: TieredCache::new(cfg.mode, cfg.cache_bytes, warm),
             max_obj_bytes: cfg.max_obj_bytes,
             index_log,
+            strict_list: cfg.strict_list,
             metrics,
         }
     }
@@ -669,6 +740,14 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         if self.is_synced(req.input.bucket.as_str()) {
+            // Strong cross-node LIST: wait for the local index to catch up to the stream
+            // tail so this reflects every write that completed before the request.
+            if self.strict_list
+                && let Some(log) = &self.index_log
+                && !log.await_fresh().await
+            {
+                tracing::debug!("strict LIST barrier timed out; serving current index");
+            }
             self.metrics.list_from_index.fetch_add(1, Ordering::Relaxed);
             let out = self.list_from_index(&req.input);
             return Ok(S3Response::new(out));
@@ -1129,7 +1208,7 @@ impl s3s::S3 for CachingProxy {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_log_event, list_objects_v2_from_index, BucketState, IndexLog, Metrics, ObjEntry};
+    use super::{apply_log_event, list_objects_v2_from_index, parse_stream_id, BucketState, IndexLog, Metrics, ObjEntry};
     use crate::tier::{connect_valkey, CachedObject, HotCache};
     use fred::prelude::*;
     use s3s::dto::{GetObjectOutput, ListObjectsV2Input};
@@ -1315,6 +1394,16 @@ mod tests {
         assert_eq!(out.key_count, Some(0));
     }
 
+    #[test]
+    fn stream_id_orders_numerically() {
+        // The strict-LIST barrier compares parsed positions; string order would be wrong.
+        assert_eq!(parse_stream_id("0"), (0, 0));
+        assert_eq!(parse_stream_id("1700000000000-5"), (1_700_000_000_000, 5));
+        assert!(parse_stream_id("10-0") > parse_stream_id("9-0")); // 10 > 9, not "10" < "9"
+        assert!(parse_stream_id("100-2") > parse_stream_id("100-1"));
+        assert!(parse_stream_id("101-0") > parse_stream_id("100-9"));
+    }
+
     // ---- live cross-node coherence (Valkey-gated) --------------------------------
 
     macro_rules! valkey_or_skip {
@@ -1464,6 +1553,27 @@ mod tests {
         }
         let len: i64 = pool.xlen(stream.as_str()).await.unwrap();
         assert!((20..150).contains(&len), "MAXLEN ~20 should bound the stream (got {len})");
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+    }
+
+    /// The strict-LIST barrier must block while the local position is behind the stream
+    /// tail and release once caught up — proven deterministically (no consumer running,
+    /// so `applied` only moves when we move it), not by lucky timing.
+    #[tokio::test]
+    async fn strict_barrier_blocks_until_caught_up() {
+        let pool = valkey_or_skip!();
+        let stream = unique_stream();
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+        let lg = IndexLog::new(pool.clone(), read_client(), stream.clone(), 10_000, "n".to_owned(), Arc::new(Metrics::default()));
+
+        assert!(lg.await_fresh().await, "empty stream: nothing to wait for");
+
+        lg.append_put("b", "k", 1).await; // tail advances; applied is still (0,0)
+        assert!(!lg.await_fresh().await, "must NOT release while behind the tail (times out)");
+
+        *lg.applied.write().unwrap() = lg.latest_id().await.unwrap(); // simulate catch-up
+        assert!(lg.await_fresh().await, "releases once caught up to the tail");
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }

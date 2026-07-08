@@ -44,6 +44,10 @@ indexLog:
   enabled: false
   maxlen: 1000000         # approximate max entries kept in the log stream
   stream: ""              # override the stream key (default: s3cache:index:log)
+  # Strong cross-node LIST-after-write: a LIST waits for this node's log consumer to
+  # reach the stream tail before answering, so a peer's brand-new key is visible
+  # immediately. Costs a little LIST latency; needs enabled: true.
+  strictList: false
 
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
 # this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).
