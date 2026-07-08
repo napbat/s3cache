@@ -6,10 +6,16 @@ metadata:
     app.kubernetes.io/name: s3cache
 spec:
   replicas: {{ .Values.replicaCount }}
-  # Single writer's view of the bucket → the index is authoritative. Recreate avoids
-  # two proxies briefly diverging (each has its own in-memory index) during a roll.
   strategy:
+    {{- if .Values.indexLog.enabled }}
+    # The shared index commit log keeps replicas coherent, so a rolling update (and
+    # replicaCount > 1) is safe.
+    type: RollingUpdate
+    {{- else }}
+    # No shared index: each proxy has its own in-memory index, so Recreate avoids two
+    # of them briefly diverging during a roll. Keep replicaCount at 1 in this mode.
     type: Recreate
+    {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: s3cache
@@ -45,6 +51,16 @@ spec:
               value: {{ .Values.valkey.pool | quote }}
             - name: S3CACHE_WARM_TTL_SECS
               value: {{ .Values.valkey.ttlSecs | quote }}
+            {{- end }}
+            {{- if .Values.indexLog.enabled }}
+            - name: S3CACHE_INDEX_LOG
+              value: "true"
+            - name: S3CACHE_INDEX_LOG_MAXLEN
+              value: {{ .Values.indexLog.maxlen | quote }}
+            {{- with .Values.indexLog.stream }}
+            - name: S3CACHE_INDEX_LOG_STREAM
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: RUST_LOG
               value: "info"

@@ -47,15 +47,32 @@ or invalidated on one node is visible to all of them — there is no peer-to-pee
 Valkey is the rendezvous. Warm operations are best-effort: if Valkey is slow or down, the
 request falls through to the origin, so a cache outage never becomes a data-plane outage.
 
-> **One replica for now.** The LIST index is still node-local in this release. Running
-> multiple replicas is safe for the *body* cache in `warm`/`hot+warm`, but their indexes
-> can still diverge, so stay single-replica until the shared index lands (see Roadmap).
+## Cross-node coherence (index commit log)
 
-Roadmap: a shared **commit log** (Valkey Streams) that every replica tails to keep its
-local LIST index coherent and to invalidate hot entries — replayable, so a reconnecting
-node can't miss a write. That log doubles as the durability journal for write-back
-coalescing and as the linearization order for **OCC** (atomic read-modify-write), which
-is what lets the fleet scale past one replica without index drift.
+By default each replica keeps its own LIST index, so running more than one would let
+their indexes drift. Setting **`S3CACHE_INDEX_LOG=true`** (with `S3CACHE_VALKEY_URL`)
+turns on a shared, ordered **commit log** — a Valkey Stream — that fixes this:
+
+- every write appends one compact event (`put`/`del` + bucket/key/size) to the stream;
+- every replica runs a background consumer that tails the stream and applies peers'
+  events to its own local index and drops the key from its local hot cache.
+
+So the fast path stays in local memory (LIST is still served from RAM, no per-request
+Valkey round-trip) while writes on any node reach all nodes. The log is **replayable** —
+each node tracks its position and resumes after a reconnect, so it can't miss an event
+the way fire-and-forget pub/sub can. On startup a node captures the stream tail, does its
+one full LIST bootstrap, then replays from that point (re-applying is idempotent), so no
+write slips through the gap. The stream is capped (`S3CACHE_INDEX_LOG_MAXLEN`, approximate
+`MAXLEN` trimming). Appends are best-effort with a timeout: if Valkey is down a write
+still succeeds and peers re-converge on their next restart/bootstrap.
+
+With the index log on, **multiple replicas are safe** — this is the mechanism that lifts
+the historical single-replica constraint. It works with any body-cache mode (e.g. `hot`
+bodies + a coherent shared index).
+
+Roadmap: **OCC** (atomic read-modify-write) on top of the log — the stream is already the
+linearization order, so a conditional write becomes "append if the version is unchanged."
+The same log is the durability journal for future write-back coalescing.
 
 ## Config (env)
 
@@ -67,9 +84,12 @@ is what lets the fleet scale past one replica without index drift.
 | `S3CACHE_MODE` | `hot` | Cache tiers: `off` / `hot` / `warm` / `hot+warm` (see [Cache modes](#cache-modes)) |
 | `S3CACHE_CACHE_BYTES` | `268435456` (256 MB) | Hot-tier capacity (bytes) |
 | `S3CACHE_MAX_OBJECT_BYTES` | `8388608` (8 MB) | Per-object cache cap; bigger objects stream through |
-| `S3CACHE_VALKEY_URL` | (required for warm) | Valkey/Redis URL for the warm tier, e.g. `redis://valkey:6379` |
-| `S3CACHE_VALKEY_POOL` | `4` | Warm-tier connections per replica |
+| `S3CACHE_VALKEY_URL` | (required for warm/log) | Valkey/Redis URL, e.g. `redis://valkey:6379`; shared by the warm tier and the index log |
+| `S3CACHE_VALKEY_POOL` | `4` | Valkey connections per replica |
 | `S3CACHE_WARM_TTL_SECS` | `0` | Warm entry TTL in seconds; `0` = keep until invalidated/evicted |
+| `S3CACHE_INDEX_LOG` | `false` | Share the LIST index across replicas via a Valkey commit log (see [above](#cross-node-coherence-index-commit-log)) |
+| `S3CACHE_INDEX_LOG_MAXLEN` | `1000000` | Approximate max entries kept in the log stream |
+| `S3CACHE_INDEX_LOG_STREAM` | `s3cache:index:log` | Valkey stream key for the commit log |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval (seconds) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Upstream creds (R2: region `auto`) |
 

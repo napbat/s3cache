@@ -48,22 +48,45 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     // Cache tiers: hot (node-local heap), warm (shared Valkey), cold (the S3 origin).
     // S3CACHE_MODE selects which sit in front of the origin; a warm-only mode skips the
-    // node-local copy so every node stays coherent (see the roadmap for the OCC path).
+    // node-local copy so every node stays coherent. S3CACHE_INDEX_LOG additionally shares
+    // the LIST index across nodes via a Valkey Streams commit log (multi-replica safe).
     let mode = tier::CacheMode::parse(&env_or("S3CACHE_MODE", "hot"));
+    let index_log_on = matches!(env_or("S3CACHE_INDEX_LOG", "false").trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
     let metrics = Arc::new(cache::Metrics::default());
-    let warm = if mode.warm() {
+
+    // One Valkey pool, shared by the warm object cache and the index commit log.
+    let valkey = if mode.warm() || index_log_on {
         let url = std::env::var("S3CACHE_VALKEY_URL")
-            .expect("S3CACHE_VALKEY_URL is required when S3CACHE_MODE enables the warm (Valkey) tier");
-        let pool: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
-        let ttl_secs: u64 = env_or("S3CACHE_WARM_TTL_SECS", "0").parse().unwrap_or(0);
-        let warm = tier::WarmCache::connect(&url, pool, max_obj_bytes, (ttl_secs > 0).then_some(ttl_secs), metrics.clone())?;
-        info!("warm tier enabled: Valkey pool of {pool} (connecting in background)");
-        Some(warm)
+            .expect("S3CACHE_VALKEY_URL is required when the warm tier or the index log is enabled");
+        let pool_size: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
+        let pool = tier::connect_valkey(&url, pool_size)?;
+        info!("Valkey pool of {pool_size} (connecting in background)");
+        Some(pool)
     } else {
         None
     };
-    info!("cache mode: {mode:?}");
-    let cp = cache::CachingProxy::new(proxy, client, mode, cache_bytes, max_obj_bytes, warm, metrics.clone());
+
+    let warm = valkey.clone().filter(|_| mode.warm()).map(|pool| {
+        let ttl_secs: u64 = env_or("S3CACHE_WARM_TTL_SECS", "0").parse().unwrap_or(0);
+        info!("warm object tier enabled");
+        tier::WarmCache::new(pool, max_obj_bytes, (ttl_secs > 0).then_some(ttl_secs), metrics.clone())
+    });
+
+    let index_log = valkey.filter(|_| index_log_on).map(|pool| {
+        let stream = env_or("S3CACHE_INDEX_LOG_STREAM", "s3cache:index:log");
+        let maxlen: u64 = env_or("S3CACHE_INDEX_LOG_MAXLEN", "1000000").parse().unwrap_or(1_000_000);
+        let node = env_or("HOSTNAME", "s3cache");
+        info!("index log enabled: stream `{stream}` maxlen ~{maxlen} node `{node}`");
+        cache::IndexLog::new(pool, stream, maxlen, node, metrics.clone())
+    });
+
+    info!("cache mode: {mode:?}, index log: {index_log_on}");
+    let cfg = cache::CacheConfig { mode, cache_bytes, max_obj_bytes };
+    let cp = cache::CachingProxy::new(proxy, client, cfg, warm, index_log, metrics.clone());
+
+    // Start tailing the shared commit log BEFORE the bootstrap LIST, so the replay window
+    // begins at-or-before the LIST's snapshot and no peer write slips through the gap.
+    cp.start_index_log().await;
 
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the

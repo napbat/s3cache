@@ -18,11 +18,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use fred::prelude::*;
+use fred::types::streams::XReadResponse;
 use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, StreamingBlob, Timestamp};
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
-use crate::tier::{self, CacheMode, CachedObject, TieredCache, WarmCache};
+use crate::tier::{self, CacheMode, CachedObject, HotCache, TieredCache, WarmCache};
+
+/// A commit-log Valkey op may never stall a write: abandoned after this, treated as a
+/// dropped append (the peers re-converge on their next full sync).
+const LOG_OP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// One indexed key's LIST metadata: its size and last-modified time.
 struct ObjEntry {
@@ -53,6 +59,9 @@ pub struct Metrics {
     warm_hit: AtomicU64,
     warm_miss: AtomicU64,
     warm_error: AtomicU64,
+    log_appended: AtomicU64,
+    log_applied: AtomicU64,
+    log_error: AtomicU64,
 }
 
 impl Metrics {
@@ -70,6 +79,200 @@ impl Metrics {
     pub(crate) fn warm_error(&self) {
         self.warm_error.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Record an index-log event appended for peers (a local write).
+    pub(crate) fn log_appended(&self) {
+        self.log_appended.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an index-log event consumed from the stream (own or a peer's).
+    pub(crate) fn log_applied(&self) {
+        self.log_applied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an index-log append/read error or timeout.
+    pub(crate) fn log_error(&self) {
+        self.log_error.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Sizing and mode for the object cache, passed to [`CachingProxy::new`].
+#[derive(Clone, Copy)]
+pub struct CacheConfig {
+    /// Which tiers sit in front of the S3 origin.
+    pub mode: CacheMode,
+    /// Total hot-tier capacity in bytes.
+    pub cache_bytes: u64,
+    /// Objects larger than this are never cached.
+    pub max_obj_bytes: usize,
+}
+
+/// The shared, ordered commit log of index mutations (a Valkey Stream). Each write
+/// appends one event; every node tails the stream and applies peers' events to its local
+/// index and hot cache, so a write on one node reaches all of them. The log is
+/// replayable — a reconnecting node resumes from its last-applied ID and can't miss a
+/// write, the failure mode raw pub/sub has — which is what makes it OCC-safe.
+pub struct IndexLog {
+    pool: Pool,
+    stream: String,
+    maxlen: i64,
+    /// This process's id (e.g. the pod name) so it can skip replaying its own events.
+    node: String,
+    metrics: Arc<Metrics>,
+}
+
+impl IndexLog {
+    /// Wrap a connected Valkey pool as the index commit log.
+    #[must_use]
+    pub fn new(pool: Pool, stream: String, maxlen: u64, node: String, metrics: Arc<Metrics>) -> Self {
+        Self {
+            pool,
+            stream,
+            maxlen: i64::try_from(maxlen).unwrap_or(i64::MAX),
+            node,
+            metrics,
+        }
+    }
+
+    /// Append a write event, capped with approximate `MAXLEN` trimming. Best-effort with
+    /// a timeout: an unreachable Valkey drops the event (logged + counted) rather than
+    /// blocking the write; peers re-converge on their next full sync.
+    async fn append(&self, op: &str, bucket: &str, key: &str, size: i64) {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let fields: Vec<(&str, String)> = vec![
+            ("op", op.to_owned()),
+            ("bucket", bucket.to_owned()),
+            ("key", key.to_owned()),
+            ("size", size.to_string()),
+            ("node", self.node.clone()),
+            ("ts", ts.to_string()),
+        ];
+        let add = self
+            .pool
+            .xadd::<String, _, _, _, _>(&self.stream, false, ("MAXLEN", "~", self.maxlen), "*", fields);
+        match tokio::time::timeout(LOG_OP_TIMEOUT, add).await {
+            Ok(Ok(_)) => self.metrics.log_appended(),
+            Ok(Err(e)) => {
+                tracing::warn!("index log append failed for {op} {bucket}/{key}: {e}");
+                self.metrics.log_error();
+            }
+            Err(_) => {
+                tracing::warn!("index log append timed out for {op} {bucket}/{key}");
+                self.metrics.log_error();
+            }
+        }
+    }
+
+    async fn append_put(&self, bucket: &str, key: &str, size: i64) {
+        self.append("put", bucket, key, size).await;
+    }
+
+    async fn append_del(&self, bucket: &str, key: &str) {
+        self.append("del", bucket, key, -1).await;
+    }
+
+    /// The stream's current tail ID (or `"0"` if empty / unreachable). Captured before the
+    /// startup LIST bootstrap so the consumer replays everything appended from that point
+    /// — nothing is missed, and re-applying what the bootstrap already saw is idempotent.
+    async fn tail_id(&self) -> String {
+        let res: FredResult<Vec<(String, HashMap<String, String>)>> =
+            self.pool.xrevrange(&self.stream, "+", "-", Some(1)).await;
+        match res {
+            Ok(entries) => entries.into_iter().next().map_or_else(|| "0".to_owned(), |(id, _)| id),
+            Err(_) => "0".to_owned(),
+        }
+    }
+
+    /// Spawn the background consumer that tails the stream from just after `start_id` and
+    /// applies peers' events to `state` and `hot`.
+    fn spawn_consumer(
+        &self,
+        start_id: String,
+        state: Arc<RwLock<HashMap<String, BucketState>>>,
+        hot: Option<HotCache>,
+    ) {
+        let (pool, stream, node, metrics) =
+            (self.pool.clone(), self.stream.clone(), self.node.clone(), self.metrics.clone());
+        tokio::spawn(async move {
+            consume_index_log(&pool, &stream, &node, start_id, &state, hot.as_ref(), &metrics).await;
+        });
+    }
+}
+
+/// Tail the index commit log forever, applying each event to the local index and hot
+/// cache. A read error just backs off and retries — the position (`last_id`) is kept, so
+/// no event is skipped across a transient Valkey blip.
+async fn consume_index_log(
+    pool: &Pool,
+    stream: &str,
+    node: &str,
+    mut last_id: String,
+    state: &RwLock<HashMap<String, BucketState>>,
+    hot: Option<&HotCache>,
+    metrics: &Arc<Metrics>,
+) {
+    loop {
+        // `xread_map` (not `xread`) normalizes the RESP2/RESP3 encoding difference into a
+        // map — a plain `xread` reply can't be forced into `XReadResponse`.
+        let read: FredResult<XReadResponse<String, String, String, String>> =
+            pool.xread_map(Some(500), Some(5000), stream, &last_id).await;
+        match read {
+            Ok(map) => {
+                let Some(entries) = map.get(stream) else { continue };
+                for (id, fields) in entries {
+                    apply_log_event(node, state, hot, fields).await;
+                    last_id.clone_from(id);
+                    metrics.log_applied();
+                }
+            }
+            Err(e) => {
+                metrics.log_error();
+                tracing::warn!("index log read failed: {e}; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// Apply one commit-log event to the local index and drop the key from the local hot
+/// cache. Skips this node's own events (already reflected locally) and any malformed one.
+async fn apply_log_event(
+    node: &str,
+    state: &RwLock<HashMap<String, BucketState>>,
+    hot: Option<&HotCache>,
+    fields: &HashMap<String, String>,
+) {
+    if fields.get("node").map(String::as_str) == Some(node) {
+        return;
+    }
+    let (Some(op), Some(bucket), Some(key)) = (fields.get("op"), fields.get("bucket"), fields.get("key")) else {
+        return;
+    };
+    match op.as_str() {
+        "put" => {
+            let size = fields.get("size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
+            let last_modified = fields
+                .get("ts")
+                .and_then(|s| s.parse::<u64>().ok())
+                .map_or_else(SystemTime::now, |ms| UNIX_EPOCH + Duration::from_millis(ms));
+            state
+                .write()
+                .unwrap()
+                .entry(bucket.clone())
+                .or_default()
+                .keys
+                .insert(key.clone(), ObjEntry { size, last_modified });
+        }
+        "del" => {
+            if let Some(b) = state.write().unwrap().get_mut(bucket) {
+                b.keys.remove(key);
+            }
+        }
+        _ => return,
+    }
+    if let Some(h) = hot {
+        h.invalidate(&(bucket.clone(), key.clone())).await;
+    }
 }
 
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
@@ -86,34 +289,62 @@ pub struct CachingProxy {
     obj_cache: TieredCache,
     /// Objects larger than this are never cached (segments stream straight through).
     max_obj_bytes: usize,
+    /// Shared commit log for cross-node index coherence, when configured.
+    index_log: Option<IndexLog>,
     metrics: Arc<Metrics>,
 }
 
 impl CachingProxy {
-    /// Wire up the proxy. `mode` selects the object-cache tiers; `warm` is the connected
-    /// Valkey backend (built by the caller when the mode enables it) and is ignored for
-    /// hot-only/off modes. `metrics` is shared so the warm tier and stats task see it.
+    /// Wire up the proxy. `cfg` selects the object-cache tiers and sizing; `warm` is the
+    /// connected Valkey object cache (ignored unless the mode enables it) and `index_log`
+    /// the shared commit log (both built by the caller). `metrics` is shared so the tiers,
+    /// the log, and the stats task all report into it.
     pub fn new(
         inner: s3s_aws::Proxy,
         client: aws_sdk_s3::Client,
-        mode: CacheMode,
-        cache_bytes: u64,
-        max_obj_bytes: usize,
+        cfg: CacheConfig,
         warm: Option<WarmCache>,
+        index_log: Option<IndexLog>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             inner,
             client,
             state: Arc::new(RwLock::new(HashMap::new())),
-            obj_cache: TieredCache::new(mode, cache_bytes, warm),
-            max_obj_bytes,
+            obj_cache: TieredCache::new(cfg.mode, cfg.cache_bytes, warm),
+            max_obj_bytes: cfg.max_obj_bytes,
+            index_log,
             metrics,
         }
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+
+    /// Start tailing the shared commit log (if configured) so this node applies peers'
+    /// writes. Captures the stream tail *before* returning, so it must be called before
+    /// [`spawn_background_sync`](Self::spawn_background_sync) to avoid a gap between the
+    /// bootstrap LIST and the replay window.
+    pub async fn start_index_log(&self) {
+        if let Some(log) = &self.index_log {
+            let start_id = log.tail_id().await;
+            info!("index log: tailing `{}` from {start_id}", log.stream);
+            log.spawn_consumer(start_id, self.state.clone(), self.obj_cache.hot_handle());
+        }
+    }
+
+    /// Append a write to the shared commit log, if configured. No-op otherwise.
+    async fn log_put(&self, bucket: &str, key: &str, size: i64) {
+        if let Some(log) = &self.index_log {
+            log.append_put(bucket, key, size).await;
+        }
+    }
+
+    async fn log_del(&self, bucket: &str, key: &str) {
+        if let Some(log) = &self.index_log {
+            log.append_del(bucket, key).await;
+        }
     }
 
     /// Warm each bucket's LIST index in the background so startup stays instant and
@@ -367,7 +598,7 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
             info!(
                 "s3cache stats: list_from_index={} list_passthrough={} writes_indexed={} \
                  get_hit={} get_miss={} get_bypass={} range_hit={} range_promote={} range_promote_reject={} \
-                 warm_hit={} warm_miss={} warm_error={}",
+                 warm_hit={} warm_miss={} warm_error={} log_appended={} log_applied={} log_error={}",
                 metrics.list_from_index.load(Ordering::Relaxed),
                 metrics.list_passthrough.load(Ordering::Relaxed),
                 metrics.writes_indexed.load(Ordering::Relaxed),
@@ -380,6 +611,9 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
                 metrics.warm_hit.load(Ordering::Relaxed),
                 metrics.warm_miss.load(Ordering::Relaxed),
                 metrics.warm_error.load(Ordering::Relaxed),
+                metrics.log_appended.load(Ordering::Relaxed),
+                metrics.log_applied.load(Ordering::Relaxed),
+                metrics.log_error.load(Ordering::Relaxed),
             );
         }
     });
@@ -411,6 +645,7 @@ impl s3s::S3 for CachingProxy {
         let size = req.input.content_length.unwrap_or(0);
         let resp = self.inner.put_object(req).await?;
         self.index_insert(&bucket, &key, size);
+        self.log_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -423,6 +658,7 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let resp = self.inner.delete_object(req).await?;
         self.index_remove(&bucket, &key);
+        self.log_del(&bucket, &key).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -436,6 +672,7 @@ impl s3s::S3 for CachingProxy {
         let resp = self.inner.delete_objects(req).await?;
         for k in keys {
             self.index_remove(&bucket, &k);
+            self.log_del(&bucket, &k).await;
             self.obj_cache.invalidate(&(bucket.clone(), k)).await;
         }
         Ok(resp)
@@ -453,6 +690,7 @@ impl s3s::S3 for CachingProxy {
         // entry promoted a multi-GB fetch). One HEAD learns the real size.
         let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
         self.index_insert(&bucket, &key, size);
+        self.log_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -466,6 +704,7 @@ impl s3s::S3 for CachingProxy {
         let resp = self.inner.copy_object(req).await?;
         let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
         self.index_insert(&bucket, &key, size);
+        self.log_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -830,5 +1069,86 @@ impl s3s::S3 for CachingProxy {
     }
     async fn write_get_object_response(&self, req: S3Request<s3s::dto::WriteGetObjectResponseInput>) -> S3Result<S3Response<s3s::dto::WriteGetObjectResponseOutput>> {
         self.inner.write_get_object_response(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_log_event, BucketState, IndexLog, Metrics};
+    use crate::tier::connect_valkey;
+    use fred::prelude::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+
+    type Index = Arc<RwLock<HashMap<String, BucketState>>>;
+
+    fn event(op: &str, bucket: &str, key: &str, size: &str, node: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("op".to_owned(), op.to_owned()),
+            ("bucket".to_owned(), bucket.to_owned()),
+            ("key".to_owned(), key.to_owned()),
+            ("size".to_owned(), size.to_owned()),
+            ("node".to_owned(), node.to_owned()),
+            ("ts".to_owned(), "0".to_owned()),
+        ])
+    }
+
+    fn indexed_size(state: &Index, bucket: &str, key: &str) -> Option<i64> {
+        state.read().unwrap().get(bucket).and_then(|b| b.keys.get(key)).map(|e| e.size)
+    }
+
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..60 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        cond()
+    }
+
+    #[tokio::test]
+    async fn apply_skips_own_and_applies_peer() {
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        apply_log_event("me", &state, None, &event("put", "b", "k", "7", "peer")).await;
+        assert_eq!(indexed_size(&state, "b", "k"), Some(7));
+        // Our own event is ignored — the local index already reflects it.
+        apply_log_event("me", &state, None, &event("del", "b", "k", "-1", "me")).await;
+        assert_eq!(indexed_size(&state, "b", "k"), Some(7));
+        // A peer's delete applies.
+        apply_log_event("me", &state, None, &event("del", "b", "k", "-1", "peer")).await;
+        assert_eq!(indexed_size(&state, "b", "k"), None);
+    }
+
+    // Two IndexLogs on one Valkey stream: node A's writes must reach node B's index via
+    // the background consumer. Skipped unless S3CACHE_TEST_VALKEY_URL is set.
+    #[tokio::test]
+    async fn index_log_cross_node() {
+        let Ok(url) = std::env::var("S3CACHE_TEST_VALKEY_URL") else {
+            eprintln!("skip index_log_cross_node: set S3CACHE_TEST_VALKEY_URL to run");
+            return;
+        };
+        let pool = connect_valkey(&url, 3).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stream = format!("s3cache:test:{}", std::process::id());
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
+
+        let metrics = Arc::new(Metrics::default());
+        let node_a = IndexLog::new(pool.clone(), stream.clone(), 10_000, "nodeA".to_owned(), metrics.clone());
+        let node_b = IndexLog::new(pool.clone(), stream.clone(), 10_000, "nodeB".to_owned(), metrics);
+
+        // Node B tails from the current tail, then node A writes.
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        let start = node_b.tail_id().await;
+        node_b.spawn_consumer(start, state.clone(), None);
+
+        node_a.append_put("bkt", "obj1", 42).await;
+        assert!(wait_until(|| indexed_size(&state, "bkt", "obj1") == Some(42)).await, "B should see A's put");
+
+        node_a.append_del("bkt", "obj1").await;
+        assert!(wait_until(|| indexed_size(&state, "bkt", "obj1").is_none()).await, "B should see A's delete");
+
+        let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }
 }

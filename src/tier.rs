@@ -197,28 +197,30 @@ pub struct WarmCache {
     metrics: Arc<Metrics>,
 }
 
+/// Build a Valkey connection pool from `url` and start connecting in the background.
+/// Shared by the warm object cache and the index commit log, so both use one pool.
+/// Errors only on a bad URL or pool size — never for the server being down, which
+/// self-heals via the reconnect policy.
+pub fn connect_valkey(url: &str, pool_size: usize) -> anyhow::Result<Pool> {
+    let config = Config::from_url(url)?;
+    let mut builder = Builder::from_config(config);
+    // Reconnect forever with exponential backoff so a Valkey blip self-heals.
+    builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
+    let pool = builder.build_pool(pool_size.max(1))?;
+    pool.connect();
+    Ok(pool)
+}
+
 impl WarmCache {
-    /// Build a Valkey pool from `url` and start connecting in the background. Returns an
-    /// error only if the URL or pool size is invalid — never for the server being down.
-    pub fn connect(
-        url: &str,
-        pool_size: usize,
-        max_obj_bytes: usize,
-        ttl_secs: Option<u64>,
-        metrics: Arc<Metrics>,
-    ) -> anyhow::Result<Self> {
-        let config = Config::from_url(url)?;
-        let mut builder = Builder::from_config(config);
-        // Reconnect forever with exponential backoff so a Valkey blip self-heals.
-        builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
-        let pool = builder.build_pool(pool_size.max(1))?;
-        pool.connect();
-        Ok(Self {
+    /// Wrap an existing (already-connecting) Valkey pool as the warm object cache.
+    #[must_use]
+    pub fn new(pool: Pool, max_obj_bytes: usize, ttl_secs: Option<u64>, metrics: Arc<Metrics>) -> Self {
+        Self {
             pool,
             max_obj_bytes,
             ttl_secs: ttl_secs.map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
             metrics,
-        })
+        }
     }
 
     fn rkey(bucket: &str, key: &str) -> String {
@@ -298,11 +300,15 @@ impl WarmCache {
     }
 }
 
+/// The node-local heap LRU: `(bucket, key) -> object`. Cheap to clone (an `Arc`
+/// inside), so a handle can be shared with the commit-log consumer for invalidation.
+pub type HotCache = moka::future::Cache<(String, String), Arc<CachedObject>>;
+
 /// The active object-body tiers in front of the cold S3 origin: an optional node-local
 /// heap LRU (hot) and an optional shared Valkey store (warm). Both absent (`Off` mode)
 /// makes every method a no-op and reads always miss, i.e. straight passthrough.
 pub struct TieredCache {
-    hot: Option<moka::future::Cache<(String, String), Arc<CachedObject>>>,
+    hot: Option<HotCache>,
     warm: Option<WarmCache>,
 }
 
@@ -327,6 +333,13 @@ impl TieredCache {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.hot.is_some() || self.warm.is_some()
+    }
+
+    /// A clone of the hot-tier handle (if hot is active) for the commit-log consumer to
+    /// invalidate on peers' writes. Warm is shared, so the log only touches the hot copy.
+    #[must_use]
+    pub fn hot_handle(&self) -> Option<HotCache> {
+        self.hot.clone()
     }
 
     /// Look up a whole cached object: hot first, then warm (a warm hit backfills hot).
@@ -403,7 +416,7 @@ impl TieredCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_body, CacheMode, CachedObject, WarmCache};
+    use super::{buffer_body, connect_valkey, CacheMode, CachedObject, WarmCache};
     use crate::cache::Metrics;
     use bytes::Bytes;
     use s3s::dto::{ETag, GetObjectOutput, Timestamp};
@@ -466,7 +479,8 @@ mod tests {
             return;
         };
         let metrics = Arc::new(Metrics::default());
-        let warm = WarmCache::connect(&url, 2, 8 * 1024 * 1024, None, metrics).unwrap();
+        let pool = connect_valkey(&url, 2).unwrap();
+        let warm = WarmCache::new(pool, 8 * 1024 * 1024, None, metrics);
         tokio::time::sleep(Duration::from_millis(300)).await; // let the pool connect
 
         let obj = sample();

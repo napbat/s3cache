@@ -1,8 +1,8 @@
-# Single replica is intentional and load-bearing: the in-memory LIST index is
-# authoritative and correct ONLY as the sole path to the bucket, so this must stay 1
-# (see the chart's Recreate strategy). HA is by fast restart — a fresh pod serves
-# immediately and warms its LIST index from R2 in the background — not by horizontal
-# replication (which would let replicas' indexes diverge and miss each other's writes).
+# Replica count. With indexLog.enabled=false (default) the in-memory LIST index is
+# node-local, so this MUST stay 1 (replicas would diverge) — HA is by fast restart, and
+# the chart uses the Recreate strategy. With indexLog.enabled=true the replicas share
+# one coherent index over the commit log, so you can safely raise this (and the chart
+# switches to RollingUpdate).
 replicaCount: 1
 
 image:
@@ -30,11 +30,20 @@ upstream:
 cache:
   mode: hot
 
-# Shared warm tier (Valkey/Redis). Only consulted when cache.mode includes warm.
+# Shared Valkey/Redis, used by the warm object tier and/or the index commit log. Set
+# valkey.url whenever cache.mode includes warm OR indexLog.enabled is true.
 valkey:
   url: ""                 # e.g. redis://valkey.default.svc.cluster.local:6379
   pool: 4                 # Valkey connections per replica
   ttlSecs: 0              # 0 = keep warm entries until invalidated/evicted
+
+# Cross-node index coherence via a Valkey Streams commit log. Enable this to run more
+# than one replica without their LIST indexes drifting (requires valkey.url). Works with
+# any cache.mode. See the repo README, "Cross-node coherence".
+indexLog:
+  enabled: false
+  maxlen: 1000000         # approximate max entries kept in the log stream
+  stream: ""              # override the stream key (default: s3cache:index:log)
 
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
 # this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).
