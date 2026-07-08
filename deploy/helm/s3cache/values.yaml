@@ -17,7 +17,24 @@ imagePullSecret:
 # Upstream S3 (R2) the proxy forwards to.
 upstream:
   endpoint: ""            # e.g. https://<acct>.r2.cloudflarestorage.com  (required)
-  buckets: ""             # comma-separated buckets to index eagerly, e.g. "docres"
+  buckets: ""             # comma-separated buckets to index eagerly
+
+# Object-body cache tiers in front of the S3 origin (which is always the cold source):
+#   off       passthrough, no body cache
+#   hot       node-local heap only (default; matches the single-replica model above)
+#   warm      shared Valkey only — coherent across replicas, no node-local copy
+#   hot+warm  node-local heap in front of shared Valkey
+# NOTE: the LIST index is still node-local in this release, so keep replicaCount at 1
+# until the shared index lands (see the repo roadmap). Warm makes the *body* cache
+# coherent across nodes; it does not yet make the index coherent.
+cache:
+  mode: hot
+
+# Shared warm tier (Valkey/Redis). Only consulted when cache.mode includes warm.
+valkey:
+  url: ""                 # e.g. redis://valkey.default.svc.cluster.local:6379
+  pool: 4                 # Valkey connections per replica
+  ttlSecs: 0              # 0 = keep warm entries until invalidated/evicted
 
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
 # this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).

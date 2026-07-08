@@ -1,11 +1,13 @@
 //! Transparent, S3-compatible caching proxy. Binds an S3 API, forwards to an upstream
-//! S3 (e.g. R2), and layers LIST-from-index + a GET/HEAD LRU on top via the `cache`
-//! module. This is the entry point: it wires config, the upstream client, and the
-//! HTTP server.
+//! S3 (e.g. R2), and layers LIST-from-index + a hot/warm/cold body cache on top via the
+//! `cache` and `tier` modules. This is the entry point: it wires config, the upstream
+//! client, the cache tiers, and the HTTP server.
 
 mod cache;
+mod tier;
 
 use std::error::Error;
+use std::sync::Arc;
 
 use aws_credential_types::provider::ProvideCredentials;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -39,11 +41,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             .build(),
     );
     let proxy = s3s_aws::Proxy::from(client.clone());
-    // Object-cache sizing: total LRU capacity + per-object cap (bigger objects, e.g.
-    // segment blobs, stream straight through and aren't cached).
+    // Object-cache sizing: total capacity + per-object cap (bigger objects, e.g. segment
+    // blobs, stream straight through and aren't cached).
     let cache_bytes: u64 = env_or("S3CACHE_CACHE_BYTES", "268435456").parse().unwrap_or(268_435_456);
     let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608").parse().unwrap_or(8_388_608);
-    let cp = cache::CachingProxy::new(proxy, client, cache_bytes, max_obj_bytes);
+
+    // Cache tiers: hot (node-local heap), warm (shared Valkey), cold (the S3 origin).
+    // S3CACHE_MODE selects which sit in front of the origin; a warm-only mode skips the
+    // node-local copy so every node stays coherent (see the roadmap for the OCC path).
+    let mode = tier::CacheMode::parse(&env_or("S3CACHE_MODE", "hot"));
+    let metrics = Arc::new(cache::Metrics::default());
+    let warm = if mode.warm() {
+        let url = std::env::var("S3CACHE_VALKEY_URL")
+            .expect("S3CACHE_VALKEY_URL is required when S3CACHE_MODE enables the warm (Valkey) tier");
+        let pool: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
+        let ttl_secs: u64 = env_or("S3CACHE_WARM_TTL_SECS", "0").parse().unwrap_or(0);
+        let warm = tier::WarmCache::connect(&url, pool, max_obj_bytes, (ttl_secs > 0).then_some(ttl_secs), metrics.clone())?;
+        info!("warm tier enabled: Valkey pool of {pool} (connecting in background)");
+        Some(warm)
+    } else {
+        None
+    };
+    info!("cache mode: {mode:?}");
+    let cp = cache::CachingProxy::new(proxy, client, mode, cache_bytes, max_obj_bytes, warm, metrics.clone());
 
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the

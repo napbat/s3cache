@@ -18,127 +18,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
-use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, StreamingBlob, Metadata, ETag, Timestamp};
+use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, Object, CommonPrefix, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, StreamingBlob, Timestamp};
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
+
+use crate::tier::{self, CacheMode, CachedObject, TieredCache, WarmCache};
 
 /// One indexed key's LIST metadata: its size and last-modified time.
 struct ObjEntry {
     size: i64,
     last_modified: SystemTime,
-}
-
-/// A cached object body + the response metadata needed to reconstruct a GET/HEAD.
-struct CachedObject {
-    body: Bytes,
-    content_length: Option<i64>,
-    content_type: Option<String>,
-    e_tag: Option<ETag>,
-    last_modified: Option<Timestamp>,
-    cache_control: Option<String>,
-    content_encoding: Option<String>,
-    content_language: Option<String>,
-    content_disposition: Option<String>,
-    accept_ranges: Option<String>,
-    metadata: Option<Metadata>,
-}
-
-impl CachedObject {
-    fn from_get(out: &GetObjectOutput, body: Bytes) -> Self {
-        Self {
-            body,
-            content_length: out.content_length,
-            content_type: out.content_type.clone(),
-            e_tag: out.e_tag.clone(),
-            last_modified: out.last_modified.clone(),
-            cache_control: out.cache_control.clone(),
-            content_encoding: out.content_encoding.clone(),
-            content_language: out.content_language.clone(),
-            content_disposition: out.content_disposition.clone(),
-            accept_ranges: out.accept_ranges.clone(),
-            metadata: out.metadata.clone(),
-        }
-    }
-
-    fn body_blob(&self) -> StreamingBlob {
-        let b = self.body.clone();
-        StreamingBlob::wrap(futures::stream::once(async move { Ok::<Bytes, std::io::Error>(b) }))
-    }
-
-    fn to_get(&self) -> GetObjectOutput {
-        GetObjectOutput {
-            body: Some(self.body_blob()),
-            content_length: self.content_length,
-            content_type: self.content_type.clone(),
-            e_tag: self.e_tag.clone(),
-            last_modified: self.last_modified.clone(),
-            cache_control: self.cache_control.clone(),
-            content_encoding: self.content_encoding.clone(),
-            content_language: self.content_language.clone(),
-            content_disposition: self.content_disposition.clone(),
-            accept_ranges: self.accept_ranges.clone(),
-            metadata: self.metadata.clone(),
-            ..Default::default()
-        }
-    }
-
-    /// A 206-shaped GET for an inclusive byte range sliced out of the cached
-    /// body (clamped at EOF). `None` when the range start is past the object.
-    fn to_get_range(&self, first: u64, last: Option<u64>) -> Option<GetObjectOutput> {
-        let total = self.body.len() as u64;
-        if first >= total {
-            return None;
-        }
-        let last_incl = last.map_or(total - 1, |l| l.min(total - 1));
-        let slice = self.body.slice(usize::try_from(first).ok()?..=usize::try_from(last_incl).ok()?);
-        let len = slice.len();
-        Some(GetObjectOutput {
-            body: Some(StreamingBlob::wrap(futures::stream::once(async move { Ok::<Bytes, std::io::Error>(slice) }))),
-            content_length: Some(i64::try_from(len).unwrap_or(i64::MAX)),
-            content_range: Some(format!("bytes {first}-{last_incl}/{total}")),
-            content_type: self.content_type.clone(),
-            e_tag: self.e_tag.clone(),
-            last_modified: self.last_modified.clone(),
-            cache_control: self.cache_control.clone(),
-            content_encoding: self.content_encoding.clone(),
-            content_language: self.content_language.clone(),
-            content_disposition: self.content_disposition.clone(),
-            accept_ranges: self.accept_ranges.clone(),
-            metadata: self.metadata.clone(),
-            ..Default::default()
-        })
-    }
-
-    fn to_head(&self) -> HeadObjectOutput {
-        HeadObjectOutput {
-            content_length: self.content_length,
-            content_type: self.content_type.clone(),
-            e_tag: self.e_tag.clone(),
-            last_modified: self.last_modified.clone(),
-            cache_control: self.cache_control.clone(),
-            content_encoding: self.content_encoding.clone(),
-            content_language: self.content_language.clone(),
-            content_disposition: self.content_disposition.clone(),
-            accept_ranges: self.accept_ranges.clone(),
-            metadata: self.metadata.clone(),
-            ..Default::default()
-        }
-    }
-}
-
-/// Drain a streamed body into memory, bailing (None) past `cap` bytes or on error.
-async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
-    let mut blob = std::pin::pin!(blob);
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = blob.next().await {
-        let b = chunk.ok()?;
-        if buf.len() + b.len() > cap {
-            return None;
-        }
-        buf.extend_from_slice(&b);
-    }
-    Some(Bytes::from(buf))
 }
 
 /// Per-bucket LIST index: the sorted key set plus whether its warm-up sync has finished.
@@ -148,7 +37,8 @@ struct BucketState {
     keys: BTreeMap<String, ObjEntry>,
 }
 
-/// Cache-effectiveness counters, logged periodically by [`spawn_stats`].
+/// Cache-effectiveness counters, logged periodically by [`spawn_stats`]. The `warm_*`
+/// counters cover the shared Valkey tier; the others cover the index and the hot path.
 #[derive(Default)]
 pub struct Metrics {
     list_from_index: AtomicU64,
@@ -160,10 +50,31 @@ pub struct Metrics {
     range_hit: AtomicU64,
     range_promote: AtomicU64,
     range_promote_reject: AtomicU64,
+    warm_hit: AtomicU64,
+    warm_miss: AtomicU64,
+    warm_error: AtomicU64,
 }
 
-/// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (a
-/// weighted LRU) in front of an upstream `s3s_aws::Proxy`, forwarding every write.
+impl Metrics {
+    /// Record a warm-tier (Valkey) hit — the object was served from the shared cache.
+    pub(crate) fn warm_hit(&self) {
+        self.warm_hit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a warm-tier miss — the key was absent in Valkey.
+    pub(crate) fn warm_miss(&self) {
+        self.warm_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a warm-tier error/timeout/decode failure (all handled as a miss/drop).
+    pub(crate) fn warm_error(&self) {
+        self.warm_error.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
+/// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
+/// every write.
 pub struct CachingProxy {
     inner: s3s_aws::Proxy,
     /// Direct client used only for the background full LIST warm-up sync.
@@ -171,31 +82,33 @@ pub struct CachingProxy {
     /// The LIST index, `Arc` so the background warm-up task shares it with the serving
     /// proxy (the service takes the proxy by value, so the sync can't borrow `self`).
     state: Arc<RwLock<HashMap<String, BucketState>>>,
-    /// Object-body LRU (weighted by bytes). Key = (bucket, key).
-    obj_cache: moka::future::Cache<(String, String), Arc<CachedObject>>,
+    /// Object-body cache: hot heap and/or shared Valkey, per [`CacheMode`].
+    obj_cache: TieredCache,
     /// Objects larger than this are never cached (segments stream straight through).
     max_obj_bytes: usize,
     metrics: Arc<Metrics>,
 }
 
 impl CachingProxy {
+    /// Wire up the proxy. `mode` selects the object-cache tiers; `warm` is the connected
+    /// Valkey backend (built by the caller when the mode enables it) and is ignored for
+    /// hot-only/off modes. `metrics` is shared so the warm tier and stats task see it.
     pub fn new(
         inner: s3s_aws::Proxy,
         client: aws_sdk_s3::Client,
+        mode: CacheMode,
         cache_bytes: u64,
         max_obj_bytes: usize,
+        warm: Option<WarmCache>,
+        metrics: Arc<Metrics>,
     ) -> Self {
-        let obj_cache = moka::future::Cache::builder()
-            .max_capacity(cache_bytes)
-            .weigher(|_k, v: &Arc<CachedObject>| u32::try_from(v.body.len()).unwrap_or(u32::MAX))
-            .build();
         Self {
             inner,
             client,
             state: Arc::new(RwLock::new(HashMap::new())),
-            obj_cache,
+            obj_cache: TieredCache::new(mode, cache_bytes, warm),
             max_obj_bytes,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
         }
     }
 
@@ -249,8 +162,8 @@ impl CachingProxy {
         self.client.head_object().bucket(bucket).key(key).send().await.ok()?.content_length()
     }
 
-    /// Serve an int-range GET by promoting the whole object into the LRU (one upstream
-    /// fetch, singleflighted by `try_get_with`) and slicing it. `Some` when served — a
+    /// Serve an int-range GET by promoting the whole object into the tiered cache (one
+    /// upstream fetch, singleflighted when hot is active) and slicing it. `Some` when served — a
     /// slice, or `InvalidRange` past EOF; `None` when the promote was refused/failed and
     /// the caller should stream the range through (the loader gets its own range-cleared
     /// request so the caller's survives for that fallback). The index size can lie, so the
@@ -276,23 +189,23 @@ impl CachingProxy {
         };
         let cap = self.max_obj_bytes;
         let inner = &self.inner;
-        let fetched = self
-            .obj_cache
-            .try_get_with(ckey.clone(), async move {
-                let mut resp = inner.get_object(whole).await.map_err(|e| e.to_string())?;
-                let declared = resp.output.content_length.unwrap_or(-1);
-                if declared < 0 || usize::try_from(declared).unwrap_or(usize::MAX) > cap {
-                    return Err(format!("oversize {declared}"));
-                }
-                let body = match resp.output.body.take() {
-                    Some(b) => buffer_body(b, cap)
-                        .await
-                        .ok_or_else(|| format!("oversize {declared} (body past declared length)"))?,
-                    None => Bytes::new(),
-                };
-                Ok::<_, String>(Arc::new(CachedObject::from_get(&resp.output, body)))
-            })
-            .await;
+        let origin = async move {
+            let mut resp = inner.get_object(whole).await.map_err(|e| e.to_string())?;
+            let declared = resp.output.content_length.unwrap_or(-1);
+            if declared < 0 || usize::try_from(declared).unwrap_or(usize::MAX) > cap {
+                return Err(format!("oversize {declared}"));
+            }
+            let body = match resp.output.body.take() {
+                Some(b) => tier::buffer_body(b, cap)
+                    .await
+                    .ok_or_else(|| format!("oversize {declared} (body past declared length)"))?,
+                None => Bytes::new(),
+            };
+            Ok::<_, String>(Arc::new(CachedObject::from_get(&resp.output, body)))
+        };
+        // Box the promotion future: it carries a full cloned request + buffered body,
+        // large enough that keeping it on the stack trips clippy's `large_futures`.
+        let fetched = Box::pin(self.obj_cache.get_or_fetch(ckey, origin)).await;
         match fetched {
             Ok(obj) => {
                 self.metrics.range_promote.fetch_add(1, Ordering::Relaxed);
@@ -453,7 +366,8 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
             tick.tick().await;
             info!(
                 "s3cache stats: list_from_index={} list_passthrough={} writes_indexed={} \
-                 get_hit={} get_miss={} get_bypass={} range_hit={} range_promote={} range_promote_reject={}",
+                 get_hit={} get_miss={} get_bypass={} range_hit={} range_promote={} range_promote_reject={} \
+                 warm_hit={} warm_miss={} warm_error={}",
                 metrics.list_from_index.load(Ordering::Relaxed),
                 metrics.list_passthrough.load(Ordering::Relaxed),
                 metrics.writes_indexed.load(Ordering::Relaxed),
@@ -463,6 +377,9 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
                 metrics.range_hit.load(Ordering::Relaxed),
                 metrics.range_promote.load(Ordering::Relaxed),
                 metrics.range_promote_reject.load(Ordering::Relaxed),
+                metrics.warm_hit.load(Ordering::Relaxed),
+                metrics.warm_miss.load(Ordering::Relaxed),
+                metrics.warm_error.load(Ordering::Relaxed),
             );
         }
     });
@@ -553,11 +470,10 @@ impl s3s::S3 for CachingProxy {
         Ok(resp)
     }
 
-    // GET: cacheable (no part/conditional) small objects are served from the LRU; a
-    // miss buffers the body and caches it. Ranged reads of cacheable-size objects are
-    // served by slicing the cached whole object, promoted on first touch (whole-object
-    // fetch, singleflighted by moka's `try_get_with`). Oversized/unknown-size ranges
-    // and conditional requests stream straight through.
+    // GET: cacheable (no part/conditional) small objects are served from the tiered
+    // cache; a miss buffers the body and caches it. Ranged reads of cacheable-size
+    // objects are served by slicing the cached whole object, promoted on first touch.
+    // Oversized/unknown-size ranges and conditional requests stream straight through.
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
@@ -581,14 +497,14 @@ impl s3s::S3 for CachingProxy {
                     return Ok(S3Response::new(out));
                 }
             }
-            // Promote when the index says the whole object fits the cache: one
-            // upstream GET (deduped across concurrent ranges by try_get_with),
-            // then every range — this one included — is a local slice. A
-            // refused/failed promote degrades to the passthrough below, never
-            // an error.
-            let small = self
-                .index_size(&ckey.0, &ckey.1)
-                .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
+            // Promote when caching is on and the index says the whole object fits: one
+            // upstream GET (deduped across concurrent ranges when hot is active), then
+            // every range — this one included — is a slice. A refused/failed promote
+            // degrades to the passthrough below, never an error.
+            let small = self.obj_cache.is_enabled()
+                && self
+                    .index_size(&ckey.0, &ckey.1)
+                    .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
             if small {
                 if let Some(resp) = self.promote_range(&ckey, &req, first, last).await {
                     return resp;
@@ -607,9 +523,9 @@ impl s3s::S3 for CachingProxy {
         let mut resp = self.inner.get_object(req).await?;
         let len = resp.output.content_length.unwrap_or(-1);
         let small = len >= 0 && usize::try_from(len).unwrap_or(usize::MAX) <= self.max_obj_bytes;
-        if cacheable && small {
+        if cacheable && small && self.obj_cache.is_enabled() {
             if let Some(body) = resp.output.body.take() {
-                match buffer_body(body, self.max_obj_bytes).await {
+                match tier::buffer_body(body, self.max_obj_bytes).await {
                     Some(bytes) => {
                         self.obj_cache
                             .insert(ckey, Arc::new(CachedObject::from_get(&resp.output, bytes.clone())))

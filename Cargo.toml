@@ -2,7 +2,7 @@
 name = "s3cache"
 version = "0.1.0"
 edition = "2021"
-description = "Transparent S3 caching proxy — serves LIST from an in-memory key index and GET from an LRU cache, write-through to an upstream S3 (Cloudflare R2). Cuts S3 request costs for chatty clients."
+description = "Transparent S3 caching proxy — serves LIST from an in-memory key index and GET from a tiered hot (heap) / warm (Valkey) / cold (origin) object cache, write-through to an upstream S3. Cuts S3 request costs for chatty clients."
 license = "MIT"
 
 [dependencies]
@@ -15,12 +15,15 @@ aws-credential-types = "1"
 tokio = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
 moka = { version = "0.12", features = ["future"] }
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rlimit = "0.10"
 anyhow = "1"
+fred = "10.1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+bincode = "1"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

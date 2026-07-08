@@ -36,6 +36,16 @@ spec:
               value: {{ required "upstream.endpoint is required" .Values.upstream.endpoint | quote }}
             - name: S3CACHE_BUCKETS
               value: {{ .Values.upstream.buckets | quote }}
+            - name: S3CACHE_MODE
+              value: {{ .Values.cache.mode | quote }}
+            {{- if .Values.valkey.url }}
+            - name: S3CACHE_VALKEY_URL
+              value: {{ .Values.valkey.url | quote }}
+            - name: S3CACHE_VALKEY_POOL
+              value: {{ .Values.valkey.pool | quote }}
+            - name: S3CACHE_WARM_TTL_SECS
+              value: {{ .Values.valkey.ttlSecs | quote }}
+            {{- end }}
             - name: RUST_LOG
               value: "info"
           # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION for the upstream.
