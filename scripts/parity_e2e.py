@@ -126,6 +126,11 @@ def main():
              cond_put_ifnonematch(p, "occ-proxy"), cond_put_ifnonematch(d, "occ-direct"))
         c.eq("PUT If-Match parity (stale etag rejected, current accepted)",
              cond_put_ifmatch(p, "occm-proxy"), cond_put_ifmatch(d, "occm-direct"))
+        # cond_put_* wrote the *-direct keys straight to the origin (behind the proxy),
+        # which the proxy — the sole writer by design — never sees. Remove them so the
+        # later full-bucket LIST comparison isn't polluted by keys only the origin knows.
+        for k in ("occ-direct", "occm-direct"):
+            d.delete_object(Bucket=BUCKET, Key=k)
 
         # --- checksum parity: ChecksumMode=ENABLED must match, even after caching ----
         p.put_object(Bucket=BUCKET, Key="ck", Body=b"checksummed", ChecksumAlgorithm="SHA256")
@@ -156,6 +161,36 @@ def main():
         p.copy_object(Bucket=BUCKET, Key="multi-copy", CopySource={"Bucket": BUCKET, "Key": "multi"})
         c.eq("copy GET body == direct", get_fields(p, "multi-copy")["body"], get_fields(d, "multi-copy")["body"])
         c.ok("copy LIST present", ("multi-copy", len(part) + 4) in list_norm(p)["keys"])
+
+        # --- edge cases: zero-byte, oversize (streamed), odd keys, batch delete, 404 -
+        p.put_object(Bucket=BUCKET, Key="empty", Body=b"")
+        c.eq("zero-byte GET == direct", get_fields(p, "empty")["body"], get_fields(d, "empty")["body"])
+        c.eq("zero-byte cached GET stays empty", get_fields(p, "empty")["body"], b"")
+        c.ok("zero-byte listed with size 0", ("empty", 0) in list_norm(p)["keys"])
+
+        big = b"Z" * (9 * 1024 * 1024)  # larger than the default 8 MiB per-object cap
+        p.put_object(Bucket=BUCKET, Key="big", Body=big)
+        c.eq("oversize GET (streamed) == direct", get_fields(p, "big")["body"], get_fields(d, "big")["body"])
+        c.eq("oversize ranged GET == direct",
+             get_fields(p, "big", Range="bytes=1000-2000")["body"],
+             get_fields(d, "big", Range="bytes=1000-2000")["body"])
+
+        for k in ["a key with spaces.txt", "uni/тест/文件.bin", "weird+=&chars.dat"]:
+            p.put_object(Bucket=BUCKET, Key=k, Body=k.encode())
+            c.eq(f"odd-key GET {k!r} == direct", get_fields(p, k)["body"], get_fields(d, k)["body"])
+        c.eq("LIST incl. odd keys (ordered) == direct", list_norm(p)["keys"], list_norm(d)["keys"])
+
+        p.put_object(Bucket=BUCKET, Key="del1", Body=b"1")
+        p.put_object(Bucket=BUCKET, Key="del2", Body=b"2")
+        p.delete_objects(Bucket=BUCKET, Delete={"Objects": [{"Key": "del1"}, {"Key": "del2"}]})
+        listed = {k for k, _ in list_norm(p)["keys"]}
+        c.ok("batch delete drops keys from LIST", "del1" not in listed and "del2" not in listed)
+        c.eq("batch delete -> GET 404 like direct", get_err(p, "del1"), get_err(d, "del1"))
+
+        c.eq("HEAD missing key == direct error", head_err(p, "nope"), head_err(d, "nope"))
+
+        pe = p.put_object(Bucket=BUCKET, Key="petag", Body=b"etagcheck")["ETag"]
+        c.eq("PUT ETag == origin ETag", pe, d.head_object(Bucket=BUCKET, Key="petag")["ETag"])
 
         # --- cross-node parity: write on P, read on Q, must equal direct -------------
         p.put_object(Bucket=BUCKET, Key="xn", Body=b"v1", ContentType="text/plain")
@@ -193,6 +228,14 @@ def range_err(cli, key, rng):
 def get_err(cli, key):
     try:
         cli.get_object(Bucket=BUCKET, Key=key)
+        return "no-error"
+    except ClientError as e:
+        return h.err_code(e)
+
+
+def head_err(cli, key):
+    try:
+        cli.head_object(Bucket=BUCKET, Key=key)
         return "no-error"
     except ClientError as e:
         return h.err_code(e)

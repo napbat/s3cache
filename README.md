@@ -74,7 +74,23 @@ Roadmap: **OCC** (atomic read-modify-write) on top of the log — the stream is 
 linearization order, so a conditional write becomes "append if the version is unchanged."
 The same log is the durability journal for future write-back coalescing.
 
-### Testing coherence
+## Consistency
+
+The goal is to be indistinguishable from talking to S3 directly. The differential parity
+suite (below) asserts that per operation. In practice:
+
+- **Same node** is read-after-write consistent: a write updates that node's index and
+  invalidates its cached body synchronously before the write returns.
+- **Across nodes** (index log) is eventually consistent, bounded by log propagation
+  (typically sub-millisecond). A peer sees another node's write once it applies the log
+  event; the differential tests confirm no stale reads once propagated.
+- **Conditional writes / OCC stay correct regardless of caching**, because the origin is
+  the authority: a briefly-stale cached read only makes a client's `If-Match` write get a
+  `412` and retry — never a lost update or a wrong result, exactly as with S3 under
+  concurrency. Requests that the cache cannot reproduce faithfully — a specific
+  `versionId`, `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
+
+### Testing coherence and parity
 
 - **Unit / protocol tests** (`cargo test`): the coherence tests against a live Valkey run
   only when `S3CACHE_TEST_VALKEY_URL` is set, e.g.
