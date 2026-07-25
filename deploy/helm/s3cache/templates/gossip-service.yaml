@@ -1,0 +1,18 @@
+# Headless service backing the StatefulSet: gives each pod the stable DNS name
+# (s3cache-N.s3cache-gossip) the gossip seed points at. publishNotReadyAddresses so a
+# starting peer can resolve the seed before anything passes readiness.
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3cache-gossip
+  labels:
+    app.kubernetes.io/name: s3cache
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: s3cache
+  ports:
+    - name: gossip
+      port: {{ .Values.gossip.port }}
+      protocol: UDP

@@ -1,21 +1,16 @@
 apiVersion: apps/v1
-kind: Deployment
+# A StatefulSet in every mode: stable pod names are the gossip node identities when
+# coherence is on, and its delete-then-recreate rolling update means two copies of one
+# ordinal never overlap (which is all single-replica mode needs from the old Recreate).
+kind: StatefulSet
 metadata:
   name: s3cache
   labels:
     app.kubernetes.io/name: s3cache
 spec:
   replicas: {{ .Values.replicaCount }}
-  strategy:
-    {{- if .Values.indexLog.enabled }}
-    # The shared index commit log keeps replicas coherent, so a rolling update (and
-    # replicaCount > 1) is safe.
-    type: RollingUpdate
-    {{- else }}
-    # No shared index: each proxy has its own in-memory index, so Recreate avoids two
-    # of them briefly diverging during a roll. Keep replicaCount at 1 in this mode.
-    type: Recreate
-    {{- end }}
+  serviceName: s3cache-gossip
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app.kubernetes.io/name: s3cache
@@ -35,6 +30,11 @@ spec:
           ports:
             - name: s3
               containerPort: 8014
+            {{- if .Values.gossip.enabled }}
+            - name: gossip
+              containerPort: {{ .Values.gossip.port }}
+              protocol: UDP
+            {{- end }}
           env:
             - name: S3CACHE_LISTEN
               value: "0.0.0.0:8014"
@@ -48,19 +48,21 @@ spec:
             - name: S3CACHE_DISK_CACHE_BYTES
               value: {{ .Values.diskCache.bytes | quote }}
             {{- end }}
-            {{- if .Values.indexLog.enabled }}
-            - name: S3CACHE_INDEX_LOG
-              value: "true"
-            - name: S3CACHE_INDEX_LOG_MAXLEN
-              value: {{ .Values.indexLog.maxlen | quote }}
-            {{- with .Values.indexLog.stream }}
-            - name: S3CACHE_INDEX_LOG_STREAM
-              value: {{ . | quote }}
-            {{- end }}
-            - name: S3CACHE_VALKEY_URL
-              value: {{ required "valkey.url is required when indexLog.enabled" .Values.valkey.url | quote }}
-            - name: S3CACHE_VALKEY_POOL
-              value: {{ .Values.valkey.pool | quote }}
+            {{- if .Values.gossip.enabled }}
+            # Pod name = gossip node id (HOSTNAME is set by the kubelet). Pod-0 is the
+            # only static seed; the rest resolves via gossiped advertisements. The
+            # advertise address must be the routable pod IP (peers parse it as an
+            # address), hence the downward API rather than a DNS name.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: S3CACHE_GOSSIP_BIND
+              value: "0.0.0.0:{{ .Values.gossip.port }}"
+            - name: S3CACHE_GOSSIP_ADVERTISE
+              value: "$(POD_IP):{{ .Values.gossip.port }}"
+            - name: S3CACHE_GOSSIP_SEEDS
+              value: "s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }}"
             {{- end }}
             - name: RUST_LOG
               value: "info"

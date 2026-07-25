@@ -40,6 +40,29 @@ use crate::tier::LocalCache;
 /// gets a gap (flush + origin resync) instead of per-event application.
 const FEED_CAPACITY: usize = 4096;
 
+/// Attempts (one per second) to resolve a gossip seed's DNS name before
+/// giving up — a `StatefulSet` peer's record can lag its own startup.
+const SEED_RESOLVE_ATTEMPTS: u32 = 30;
+
+/// Resolves `host:port` (a DNS name or a literal address) to a socket
+/// address, retrying briefly; `None` when it never resolves.
+async fn resolve_seed(addr: &str) -> Option<std::net::SocketAddr> {
+    for attempt in 0..SEED_RESOLVE_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        match tokio::net::lookup_host(addr).await {
+            Ok(mut addrs) => {
+                if let Some(sock) = addrs.next() {
+                    return Some(sock);
+                }
+            }
+            Err(error) => tracing::debug!("resolving gossip seed `{addr}`: {error}"),
+        }
+    }
+    None
+}
+
 /// What one durable write did, as advertised to peers.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum IndexOp {
@@ -244,22 +267,34 @@ pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
     if let Some(advertise) = advertise {
         builder = builder.advertise_addr(advertise);
     }
+    let node = builder.spawn();
+    let group = node.join_group("s3cache");
+    // Seeds resolve off the startup path (DNS for a just-starting peer may
+    // lag, and a slow resolver must not delay serving): each one registers
+    // with the transport and joins via `add_peer` once its address is known.
     let seeds = std::env::var("S3CACHE_GOSSIP_SEEDS").unwrap_or_default();
     for seed in seeds.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let Some((id, addr)) = seed.split_once('=') else {
             warn!("ignoring malformed gossip seed `{seed}` (want id=host:port)");
             continue;
         };
-        match addr.parse() {
-            Ok(sock) => {
-                transport.register_peer(NodeId::new(id), sock);
-                builder = builder.seed(NodeId::new(id));
-            }
-            Err(error) => warn!("ignoring gossip seed `{seed}`: {error}"),
+        if id == node_name {
+            continue; // a pod seeding itself (uniform config) is a no-op
         }
+        let (id, addr) = (id.to_owned(), addr.to_owned());
+        let (transport, group) = (transport.clone(), group.clone());
+        tokio::spawn(async move {
+            match resolve_seed(&addr).await {
+                Some(sock) => {
+                    transport.register_peer(NodeId::new(id.as_str()), sock);
+                    group.add_peer(NodeId::new(id.as_str()));
+                }
+                None => {
+                    warn!("gossip seed `{id}={addr}` never resolved; relying on inbound contact");
+                }
+            }
+        });
     }
-    let node = builder.spawn();
-    let group = node.join_group("s3cache");
     info!("gossip coherence bound on `{bind}` as `{node_name}`");
     Some(WriteSync::attach(group, me, Some(node)))
 }

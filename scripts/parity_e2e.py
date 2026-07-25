@@ -6,7 +6,7 @@ For each operation we perform it through a cache node and directly against the o
 contents/pagination, ranged reads, conditional (OCC) writes/reads, multipart, copy — and
 finally that a write on one node is seen identically on another (coherence).
 
-Assumes MinIO + Valkey are reachable (see scripts/coherence-e2e.sh). Exits 0/1.
+Assumes MinIO is reachable (see scripts/coherence-e2e.sh). Exits 0/1.
 """
 import sys
 import time

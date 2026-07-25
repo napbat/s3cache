@@ -2,7 +2,7 @@
 """End-to-end cross-node coherence test for s3cache.
 
 Launches two real s3cache nodes (A and B) in front of one shared S3 origin (MinIO) and
-one shared Valkey, with the index commit log enabled, then proves a write on one node is
+gossiping over loopback UDP, then proves a write on one node is
 seen by the other:
 
   1. PUT via A  -> B's index-served LIST shows the key   (index coherence)
@@ -12,7 +12,7 @@ seen by the other:
   3. DELETE via A -> B's LIST loses the key
   4. reverse direction: PUT via B -> A's LIST shows it
 
-Assumes MinIO and Valkey are reachable (see scripts/coherence-e2e.sh). Exits 0/1.
+Assumes MinIO is reachable (see scripts/coherence-e2e.sh). Exits 0/1.
 """
 import os
 import shutil
