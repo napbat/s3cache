@@ -1,8 +1,8 @@
 [package]
 name = "s3cache"
 version = "0.1.0"
-edition = "2021"
-description = "Transparent S3 caching proxy — serves LIST from an in-memory key index and GET from an LRU cache, write-through to an upstream S3 (Cloudflare R2). Cuts S3 request costs for chatty clients."
+edition = "2024"
+description = "Transparent S3 caching proxy — serves LIST from an in-memory key index and GET from a tiered hot (heap) / warm (disk) / cold (origin) object cache, write-through to an upstream S3. Cuts S3 request costs for chatty clients."
 license = "MIT"
 
 [dependencies]
@@ -14,17 +14,23 @@ aws-sdk-s3 = "1"
 aws-credential-types = "1"
 tokio = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
-moka = { version = "0.12", features = ["future"] }
-bytes = "1"
+tierstore = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
+tierstore-mmap = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
+tierstore-moka = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
+groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency", "udp"] }
+bytes = { version = "1", features = ["serde"] }
+http = "1"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rlimit = "0.10"
 anyhow = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+bincode = "1"
+blake3 = "1.8.5"
 
 [lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
+pedantic = { level = "deny", priority = -1 }
 
 [profile.release]
 opt-level = 2

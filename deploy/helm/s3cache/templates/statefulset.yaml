@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+# A StatefulSet in every mode: stable pod names are the gossip node identities when
+# coherence is on, and its delete-then-recreate rolling update means two copies of one
+# ordinal never overlap (which is all single-replica mode needs from the old Recreate).
+kind: StatefulSet
+metadata:
+  name: s3cache
+  labels:
+    app.kubernetes.io/name: s3cache
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: s3cache-gossip
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3cache
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3cache
+    spec:
+      {{- with .Values.imagePullSecret.existingSecret }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      containers:
+        - name: s3cache
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: s3
+              containerPort: 8014
+            {{- if .Values.gossip.enabled }}
+            - name: gossip
+              containerPort: {{ .Values.gossip.port }}
+              protocol: UDP
+            {{- end }}
+          env:
+            - name: S3CACHE_LISTEN
+              value: "0.0.0.0:8014"
+            - name: S3CACHE_UPSTREAM_ENDPOINT
+              value: {{ required "upstream.endpoint is required" .Values.upstream.endpoint | quote }}
+            - name: S3CACHE_BUCKETS
+              value: {{ .Values.upstream.buckets | quote }}
+            {{- if .Values.diskCache.enabled }}
+            - name: S3CACHE_DISK_CACHE
+              value: {{ .Values.diskCache.path | quote }}
+            - name: S3CACHE_DISK_CACHE_BYTES
+              value: {{ .Values.diskCache.bytes | quote }}
+            {{- end }}
+            {{- if .Values.gossip.enabled }}
+            # Pod name = gossip node id (HOSTNAME is set by the kubelet). Pod-0 is the
+            # only static seed; the rest resolves via gossiped advertisements. The
+            # advertise address must be the routable pod IP (peers parse it as an
+            # address), hence the downward API rather than a DNS name.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: S3CACHE_GOSSIP_BIND
+              value: "0.0.0.0:{{ .Values.gossip.port }}"
+            - name: S3CACHE_GOSSIP_ADVERTISE
+              value: "$(POD_IP):{{ .Values.gossip.port }}"
+            - name: S3CACHE_GOSSIP_SEEDS
+              value: "s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }}"
+            {{- end }}
+            - name: RUST_LOG
+              value: "info"
+          # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION for the upstream.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.auth.existingSecret }}
+          # No startupProbe needed: the proxy binds + serves immediately and warms its LIST
+          # index in the background (LISTs pass through until warm), so readiness/liveness
+          # can engage right away regardless of bucket size.
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.diskCache.enabled }}
+          volumeMounts:
+            - name: disk-cache
+              mountPath: {{ .Values.diskCache.path }}
+          {{- end }}
+      {{- if .Values.diskCache.enabled }}
+      volumes:
+        - name: disk-cache
+          {{- toYaml .Values.diskCache.volume | nindent 10 }}
+      {{- end }}

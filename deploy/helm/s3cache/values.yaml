@@ -1,8 +1,7 @@
-# Single replica is intentional and load-bearing: the in-memory LIST index is
-# authoritative and correct ONLY as the sole path to the bucket, so this must stay 1
-# (see the chart's Recreate strategy). HA is by fast restart — a fresh pod serves
-# immediately and warms its LIST index from R2 in the background — not by horizontal
-# replication (which would let replicas' indexes diverge and miss each other's writes).
+# Replica count. With gossip.enabled=false (default) the in-memory LIST index is
+# node-local, so this MUST stay 1 (replicas would diverge) — HA is by fast restart.
+# With gossip.enabled=true the replicas keep each other coherent over the write feed,
+# so you can safely raise this.
 replicaCount: 1
 
 image:
@@ -17,7 +16,26 @@ imagePullSecret:
 # Upstream S3 (R2) the proxy forwards to.
 upstream:
   endpoint: ""            # e.g. https://<acct>.r2.cloudflarestorage.com  (required)
-  buckets: ""             # comma-separated buckets to index eagerly, e.g. "docres"
+  buckets: ""             # comma-separated buckets to index eagerly
+
+# Object-body cache: hot (in-memory) is always on. An optional node-local disk (warm)
+# tier holds more and survives restarts (a fresh pod comes up warm). Mount a volume at
+# diskCache.path; a persistentVolumeClaim survives pod reschedules, emptyDir only restarts.
+diskCache:
+  enabled: false
+  path: /var/cache/s3cache
+  bytes: 10737418240        # 10 GiB
+  volume:                   # any pod-volume spec backing diskCache.path
+    emptyDir: {}
+
+# Cross-node coherence via the gossip write feed (groupnet) — no extra services.
+# Enable to run more than one replica without their LIST indexes drifting: pods gossip
+# over a headless UDP service, pod-0 is the only static seed (everyone else resolves
+# through gossiped advertisements), and pod names are the node identities. Multi-node
+# freshness is bounded by one gossip/push hop — see the repo README, "Consistency".
+gossip:
+  enabled: false
+  port: 7946
 
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
 # this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).

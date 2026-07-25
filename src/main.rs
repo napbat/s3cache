@@ -1,10 +1,18 @@
-//! Transparent S3 caching proxy. Milestone 1: passthrough to the upstream S3 (R2).
-//! Caching (LIST-from-index, GET LRU, write-through index updates) is layered on top
-//! of the upstream `s3s_aws::Proxy` in the `cache` module.
+//! Transparent, S3-compatible caching proxy. Binds an S3 API, forwards to an upstream
+//! S3 (e.g. R2), and layers LIST-from-index + a hot/warm/cold body cache on top. This is
+//! the entry point: it wires config, the upstream client, the cache tiers, and the HTTP
+//! server. The proxy lives in `cache`, with the LIST index in `index`, the object-body
+//! tiers in `tier`, cross-node coherence (the gossip write feed) in `sync`, and counters
+//! in `metrics`.
 
 mod cache;
+mod index;
+mod metrics;
+mod sync;
+mod tier;
 
 use std::error::Error;
+use std::sync::Arc;
 
 use aws_credential_types::provider::ProvideCredentials;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -16,6 +24,24 @@ use tracing::info;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+/// Wire the gossip apply loop into the proxy: peers' events fold into the
+/// LIST index and invalidate local copies; a gap flushes and resyncs.
+fn start_coherence(
+    cp: &cache::CachingProxy,
+    write_sync: Option<&Arc<sync::WriteSync>>,
+    buckets: &[String],
+    metrics: &Arc<metrics::Metrics>,
+) {
+    if let Some(write_sync) = write_sync {
+        write_sync.start_apply(
+            cp.local_cache(),
+            cp.index_state(),
+            cp.gap_resync_handle(buckets.to_vec()),
+            metrics.clone(),
+        );
+    }
 }
 
 #[tokio::main]
@@ -38,11 +64,58 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             .build(),
     );
     let proxy = s3s_aws::Proxy::from(client.clone());
-    // Object-cache sizing: total LRU capacity + per-object cap (bigger objects, e.g.
-    // segment blobs, stream straight through and aren't cached).
-    let cache_bytes: u64 = env_or("S3CACHE_CACHE_BYTES", "268435456").parse().unwrap_or(268_435_456);
-    let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608").parse().unwrap_or(8_388_608);
-    let cp = cache::CachingProxy::new(proxy, client, cache_bytes, max_obj_bytes);
+    // Object-cache sizing: total capacity + per-object cap (bigger objects, e.g. segment
+    // blobs, stream straight through and aren't cached).
+    let cache_bytes: u64 = env_or("S3CACHE_CACHE_BYTES", "268435456")
+        .parse()
+        .unwrap_or(268_435_456);
+    let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608")
+        .parse()
+        .unwrap_or(8_388_608);
+
+    // Object-body cache: hot (node-local heap) in front of an optional node-local disk
+    // tier (warm), in front of the S3 origin (cold). Always layered — no mode to pick.
+    let metrics = Arc::new(metrics::Metrics::default());
+
+    // Optional node-local disk (warm) tier: inclusive, size-limited, survives restarts so
+    // a fresh pod comes up warm instead of stampeding the origin. Set S3CACHE_DISK_CACHE
+    // to a directory (typically a mounted volume) to enable it.
+    let disk_path = env_or("S3CACHE_DISK_CACHE", "");
+    let disk = if disk_path.is_empty() {
+        None
+    } else {
+        let disk_bytes: u64 = env_or("S3CACHE_DISK_CACHE_BYTES", "10737418240")
+            .parse()
+            .unwrap_or(10_737_418_240);
+        info!("disk (warm) tier at `{disk_path}`, up to {disk_bytes} bytes");
+        Some(tier::open_warm(
+            std::path::PathBuf::from(&disk_path),
+            disk_bytes,
+            max_obj_bytes,
+        )?)
+    };
+
+    let node_name = env_or("HOSTNAME", "s3cache");
+
+    // Cross-node coherence: the gossip write feed (see `sync`). Peers' writes fold into
+    // the LIST index and invalidate local body copies at network latency; strict reads
+    // barrier on feed heads. Set S3CACHE_GOSSIP_BIND (and S3CACHE_GOSSIP_SEEDS as
+    // comma-separated id=host:port pairs) to enable; single-node needs none of it.
+    let write_sync = sync::from_env(&node_name).await.map(Arc::new);
+    info!("gossip coherence (write feed): {}", write_sync.is_some());
+
+    let cfg = cache::CacheConfig {
+        cache_bytes,
+        max_obj_bytes,
+    };
+    let cp = cache::CachingProxy::new(
+        proxy,
+        client,
+        cfg,
+        disk,
+        write_sync.clone(),
+        metrics.clone(),
+    );
 
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the
@@ -55,9 +128,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
+    start_coherence(&cp, write_sync.as_ref(), &buckets, &metrics);
     cp.spawn_background_sync(buckets);
     let stats_secs: u64 = env_or("S3CACHE_STATS_SECS", "60").parse().unwrap_or(60);
-    cache::spawn_stats(cp.metrics(), stats_secs);
+    metrics::spawn_stats(cp.metrics(), stats_secs);
 
     let service = {
         let mut b = S3ServiceBuilder::new(cp);
@@ -102,11 +176,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     Ok(())
 }
 
-/// Raise `RLIMIT_NOFILE`'s soft limit to the hard cap. The proxy holds one accepted
-/// socket per in-cluster client connection plus its upstream pool; docres alone keeps
-/// ~1000 keepalive connections open (an HTTP pool per `LanceDB` dataset), so a
-/// distro-default soft limit of 1024 exhausts and `accept()` starts failing — seen as
-/// probe timeouts on this pod and EMFILE request failures in its clients.
+/// Raise `RLIMIT_NOFILE`'s soft limit to the hard cap. The proxy holds one socket per
+/// inbound connection plus its upstream pool; a chatty client fleet can keep thousands
+/// of keepalive connections open, so the distro-default 1024 soft limit exhausts and
+/// `accept()` starts failing with EMFILE.
 fn raise_fd_limit() {
     #[cfg(unix)]
     match rlimit::Resource::NOFILE.get() {

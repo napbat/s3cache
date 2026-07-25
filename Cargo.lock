@@ -33,6 +33,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -594,10 +600,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+
+[[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
+]
 
 [[package]]
 name = "block-buffer"
@@ -628,6 +657,9 @@ name = "bytes"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bytes-utils"
@@ -712,6 +744,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -766,27 +804,27 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-channel"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
 dependencies = [
  "crossbeam-utils",
 ]
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
 
 [[package]]
 name = "crossbeam-utils"
-version = "0.8.21"
+version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crypto-bigint"
@@ -939,7 +977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1154,6 +1192,72 @@ dependencies = [
  "ff",
  "rand_core",
  "subtle",
+]
+
+[[package]]
+name = "groupnet"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+dependencies = [
+ "groupnet-consistency",
+ "groupnet-core",
+ "groupnet-runtime",
+ "groupnet-transport",
+ "groupnet-transport-mem",
+ "groupnet-transport-udp",
+]
+
+[[package]]
+name = "groupnet-consistency"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+dependencies = [
+ "groupnet-core",
+ "groupnet-runtime",
+ "tokio",
+]
+
+[[package]]
+name = "groupnet-core"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+
+[[package]]
+name = "groupnet-runtime"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+dependencies = [
+ "groupnet-core",
+ "groupnet-transport",
+ "tokio",
+]
+
+[[package]]
+name = "groupnet-transport"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+dependencies = [
+ "groupnet-core",
+]
+
+[[package]]
+name = "groupnet-transport-mem"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+dependencies = [
+ "groupnet-core",
+ "groupnet-transport",
+ "tokio",
+]
+
+[[package]]
+name = "groupnet-transport-udp"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+dependencies = [
+ "groupnet-core",
+ "groupnet-transport",
+ "tokio",
 ]
 
 [[package]]
@@ -1415,7 +1519,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1635,6 +1739,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1823,9 +1936,9 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "portable-atomic"
-version = "1.13.1"
+version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
 
 [[package]]
 name = "potential_utf"
@@ -2064,13 +2177,20 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "bincode",
+ "blake3",
  "bytes",
  "futures",
+ "groupnet",
+ "http 1.4.2",
  "hyper-util",
- "moka",
  "rlimit",
  "s3s",
  "s3s-aws",
+ "serde",
+ "tierstore",
+ "tierstore-mmap",
+ "tierstore-moka",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2486,6 +2606,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tierstore"
+version = "0.1.0"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
+dependencies = [
+ "tierstore-core",
+]
+
+[[package]]
+name = "tierstore-core"
+version = "0.1.0"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
+
+[[package]]
+name = "tierstore-mmap"
+version = "0.1.0"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
+dependencies = [
+ "bytes",
+ "memmap2",
+ "tierstore-core",
+]
+
+[[package]]
+name = "tierstore-moka"
+version = "0.1.0"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
+dependencies = [
+ "moka",
+ "tierstore-core",
 ]
 
 [[package]]
