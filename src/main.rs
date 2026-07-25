@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     } else {
         let disk_bytes: u64 = env_or("S3CACHE_DISK_CACHE_BYTES", "10737418240").parse().unwrap_or(10_737_418_240);
         info!("disk (warm) tier at `{disk_path}`, up to {disk_bytes} bytes");
-        Some(tier::DiskCache::open(std::path::PathBuf::from(&disk_path), disk_bytes, max_obj_bytes, metrics.clone()).await?)
+        Some(tier::open_warm(std::path::PathBuf::from(&disk_path), disk_bytes, max_obj_bytes)?)
     };
 
     // Cross-node coherence via a Valkey Streams commit log (the only Valkey use). With it

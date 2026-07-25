@@ -1,22 +1,31 @@
 //! Layered object-body cache: **hot** (node-local heap) in front of **warm** (a node-local
 //! on-disk cache) in front of **cold** (the S3 origin). Always layered — there is no mode
-//! to pick. The warm disk tier is inclusive (every object written to hot is also written
-//! to disk) and survives process restarts, so a fresh pod comes up warm instead of
-//! stampeding the origin. Cross-node coherence is separate (see `coherence`): a peer's
-//! write invalidates the local hot *and* disk copies, and reads barrier on the log.
+//! to pick. Built on `tierstore`: the hot tier is a byte-budgeted in-memory LRU, the warm
+//! tier is a byte-budgeted, restart-surviving mmap-disk store (values served as
+//! kernel-evictable mapped bytes) reached through a codec (bincode of `(key, object)`)
+//! and a blocking-I/O offload pool. Warm is inclusive (fills write hot *and* disk) and
+//! best-effort by policy: a disk error or oversize rejection never blocks the hot fill or
+//! the data plane. Origin fetches are singleflighted probe-then-gate, so only misses
+//! contend and concurrent callers share one round-trip. Cross-node coherence is separate
+//! (see `coherence`): a peer's write invalidates the local hot *and* disk copies, and
+//! reads barrier on the log.
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use moka::notification::RemovalCause;
 use s3s::dto::{ETag, GetObjectOutput, HeadObjectOutput, Metadata, StreamingBlob, Timestamp};
 use serde::{Deserialize, Serialize};
+use tierstore::{CodecTier, Eviction, KeyStatus, MemoryTier, OffloadTier, SingleFlight};
+use tierstore_mmap::MmapDiskTier;
 
 use crate::metrics::Metrics;
+
+/// `(bucket, key)` — the cache's addressing unit.
+pub(crate) type CacheKey = (String, String);
 
 /// A cached object body plus the response metadata needed to reconstruct a GET/HEAD.
 /// `Serialize`/`Deserialize` so the warm disk tier can round-trip it.
@@ -135,251 +144,197 @@ pub(crate) async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes
     Some(Bytes::from(buf))
 }
 
-/// The node-local heap LRU: `(bucket, key) -> object`. Cheap to clone (an `Arc` inside).
-pub(crate) type HotCache = moka::future::Cache<(String, String), Arc<CachedObject>>;
+/// Blake3 of `bucket\0key` — a fixed-length, path-safe, collision-free warm-tier key.
+fn warm_key(bucket: &str, key: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(bucket.as_bytes());
+    h.update(&[0]);
+    h.update(key.as_bytes());
+    h.finalize().to_hex().to_string()
+}
 
-/// Node-local on-disk warm tier: an inclusive, size-limited cache under a directory that
-/// survives restarts. An in-memory LRU index (weighted by file bytes, bounded by the disk
-/// budget) tracks what's on disk; when an entry leaves the index — evicted for size or
-/// invalidated — its file is deleted. Best-effort: any I/O error is a miss/drop, never a
-/// data-plane failure.
-#[derive(Clone)]
-pub(crate) struct DiskCache {
-    dir: PathBuf,
-    index: moka::future::Cache<String, u64>,
-    max_obj_bytes: usize,
-    seq: Arc<AtomicU64>,
+/// The warm tier: typed objects over a byte-budgeted, restart-surviving mmap-disk store,
+/// with the blocking file I/O on a dedicated worker pool. The codec embeds the cache key
+/// in the encoding, so entries the disk tier evicts decode back fully typed.
+pub(crate) type WarmTier = OffloadTier<CodecTier<MmapDiskTier, CacheKey, Arc<CachedObject>>>;
+
+/// Worker threads for the warm tier's blocking file I/O.
+const WARM_IO_THREADS: usize = 4;
+
+/// Open (creating if needed) the warm disk tier under `dir`, byte-bounded to `disk_bytes`;
+/// files already present are re-indexed so the cache survives restarts. Objects whose
+/// encoding exceeds `max_obj_bytes` are rejected by the codec — under the cache's
+/// best-effort write policy that skips the disk fill without failing the hot one.
+pub(crate) fn open_warm(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize) -> anyhow::Result<WarmTier> {
+    let budget = NonZeroU64::new(disk_bytes.max(1)).unwrap_or(NonZeroU64::MIN);
+    let disk = MmapDiskTier::open_bounded(dir, budget)?;
+    let codec = CodecTier::new(
+        disk,
+        |key: &CacheKey| warm_key(&key.0, &key.1),
+        move |key: &CacheKey, obj: &Arc<CachedObject>| {
+            let bytes = bincode::serialize(&(key, obj.as_ref())).map_err(tierstore::BoxError::from)?;
+            if bytes.len() > max_obj_bytes {
+                return Err("encoded object exceeds S3CACHE_MAX_OBJECT_BYTES".into());
+            }
+            Ok(Bytes::from(bytes))
+        },
+        |bytes: Bytes| {
+            let (key, obj): (CacheKey, CachedObject) =
+                bincode::deserialize(&bytes).map_err(tierstore::BoxError::from)?;
+            Ok((key, Arc::new(obj)))
+        },
+    );
+    Ok(OffloadTier::new(codec, NonZeroUsize::new(WARM_IO_THREADS).unwrap_or(NonZeroUsize::MIN)))
+}
+
+/// The shared cache core: the tierstore hierarchy plus fill gates and metrics.
+struct Core {
+    cache: tierstore::TieredCache<CacheKey, Arc<CachedObject>>,
+    fills: SingleFlight<CacheKey>,
     metrics: Arc<Metrics>,
+    has_warm: bool,
 }
 
-impl DiskCache {
-    /// Open (creating if needed) a disk cache under `dir`, bounded to `disk_bytes`, and
-    /// re-index any files already present so the cache survives restarts.
-    pub(crate) async fn open(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize, metrics: Arc<Metrics>) -> anyhow::Result<Self> {
-        tokio::fs::create_dir_all(&dir).await?;
-        let evict_dir = dir.clone();
-        let index = moka::future::Cache::builder()
-            .max_capacity(disk_bytes)
-            .weigher(|_h: &String, size: &u64| u32::try_from(*size).unwrap_or(u32::MAX))
-            .eviction_listener(move |h: Arc<String>, _size, cause| {
-                // `Replaced` = re-inserted at the same path (the put already wrote the new
-                // file), so keep it; size eviction and explicit invalidation delete.
-                if cause != RemovalCause::Replaced {
-                    let _ = std::fs::remove_file(Self::path_in(&evict_dir, &h));
-                }
-            })
-            .build();
-        let cache = Self { dir, index, max_obj_bytes, seq: Arc::new(AtomicU64::new(0)), metrics };
-        cache.reindex().await;
-        Ok(cache)
-    }
-
-    /// Blake3 of `bucket\0key` — a fixed-length, path-safe, collision-free filename.
-    fn hash(bucket: &str, key: &str) -> String {
-        let mut h = blake3::Hasher::new();
-        h.update(bucket.as_bytes());
-        h.update(&[0]);
-        h.update(key.as_bytes());
-        h.finalize().to_hex().to_string()
-    }
-
-    fn path_in(dir: &Path, h: &str) -> PathBuf {
-        dir.join(&h[..2]).join(h) // shard by the first two hex chars
-    }
-
-    fn path(&self, h: &str) -> PathBuf {
-        Self::path_in(&self.dir, h)
-    }
-
-    /// Populate the index from files already on disk (restart recovery).
-    async fn reindex(&self) {
-        let Ok(mut shards) = tokio::fs::read_dir(&self.dir).await else { return };
-        while let Ok(Some(shard)) = shards.next_entry().await {
-            if !shard.file_type().await.is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            let Ok(mut files) = tokio::fs::read_dir(shard.path()).await else { continue };
-            while let Ok(Some(f)) = files.next_entry().await {
-                // Cache files are pure hex (no dot); temp files are `<hash>.<n>.tmp`.
-                if let Ok(meta) = f.metadata().await
-                    && let Some(name) = f.file_name().to_str()
-                    && !name.contains('.')
-                {
-                    self.index.insert(name.to_owned(), meta.len()).await;
-                }
-            }
-        }
-    }
-
-    async fn get(&self, bucket: &str, key: &str) -> Option<Arc<CachedObject>> {
-        let h = Self::hash(bucket, key);
-        self.index.get(&h).await?; // touch LRU recency; miss if not indexed
-        let Ok(bytes) = tokio::fs::read(self.path(&h)).await else {
-            self.index.invalidate(&h).await; // indexed but file gone
-            self.metrics.warm_miss();
-            return None;
-        };
-        match bincode::deserialize::<CachedObject>(&bytes) {
-            Ok(obj) => {
-                self.metrics.warm_hit();
-                Some(Arc::new(obj))
-            }
-            Err(e) => {
-                tracing::debug!("disk decode failed for {bucket}/{key}: {e}");
-                self.index.invalidate(&h).await;
-                self.metrics.warm_error();
-                None
-            }
-        }
-    }
-
-    async fn put(&self, bucket: &str, key: &str, obj: &CachedObject) {
-        let bytes = match bincode::serialize(obj) {
-            Ok(b) if b.len() <= self.max_obj_bytes => b,
-            Ok(_) => return, // oversize: leave it to stream through, don't fill the disk
-            Err(e) => {
-                tracing::debug!("disk encode failed for {bucket}/{key}: {e}");
-                return;
-            }
-        };
-        let h = Self::hash(bucket, key);
-        if let Err(e) = self.write_atomic(&self.path(&h), &bytes).await {
-            tracing::debug!("disk write failed for {bucket}/{key}: {e}");
+impl Core {
+    /// One routed lookup with tier provenance for the warm metrics: a hit below the hot
+    /// tier is a warm hit (and is promoted into hot by policy); an incomplete report means
+    /// a tier failed and was routed around.
+    async fn lookup(&self, key: &CacheKey) -> Option<Arc<CachedObject>> {
+        let report = self.cache.router().read_many(std::slice::from_ref(key)).await.ok()?;
+        if !report.is_complete() {
             self.metrics.warm_error();
-            return;
         }
-        self.index.insert(h, bytes.len() as u64).await;
-    }
-
-    async fn invalidate(&self, bucket: &str, key: &str) {
-        // Removing from the index fires the listener, which deletes the file; also remove
-        // directly in case the key was never indexed on this node (a stray file).
-        let h = Self::hash(bucket, key);
-        self.index.invalidate(&h).await;
-        let _ = tokio::fs::remove_file(self.path(&h)).await;
-    }
-
-    /// Write to a unique temp file then rename, so a crash never leaves a partial file and
-    /// concurrent writers don't clobber each other's temp.
-    async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        if let Some(KeyStatus::Hit { tier, value }) = report.statuses.into_iter().next() {
+            if tier > 0 {
+                self.metrics.warm_hit();
+            }
+            Some(value)
+        } else {
+            if self.has_warm {
+                self.metrics.warm_miss();
+            }
+            None
         }
-        let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("{n}.tmp"));
-        tokio::fs::write(&tmp, bytes).await?;
-        tokio::fs::rename(&tmp, path).await
-    }
-}
-
-/// A cloneable handle to this node's local tiers (hot + optional disk) for the commit-log
-/// consumer to invalidate on a peer's write.
-#[derive(Clone)]
-pub(crate) struct LocalCache {
-    hot: HotCache,
-    warm: Option<DiskCache>,
-}
-
-impl LocalCache {
-    #[must_use]
-    pub(crate) fn new(hot: HotCache, warm: Option<DiskCache>) -> Self {
-        Self { hot, warm }
     }
 
-    /// Drop a key from every node-local tier so a peer's overwrite is never read stale.
-    pub(crate) async fn invalidate(&self, key: &(String, String)) {
-        self.hot.invalidate(key).await;
-        if let Some(warm) = &self.warm {
-            warm.invalidate(&key.0, &key.1).await;
+    /// Best-effort fill of hot and (inclusively) warm: a disk rejection or I/O error is
+    /// skipped by policy, never surfaced to the data plane.
+    async fn insert(&self, key: CacheKey, obj: Arc<CachedObject>) {
+        if self.cache.put(key, obj).await.is_err() {
+            self.metrics.warm_error();
+        }
+    }
+
+    /// Drop an object from every local tier. A tier that fails to delete is counted; its
+    /// copy lingers only until eviction and is never authoritative.
+    async fn invalidate(&self, key: &CacheKey) {
+        if self.cache.invalidate(key).await.is_err() {
+            self.metrics.warm_error();
         }
     }
 }
 
-/// The layered object-body cache: an always-present hot heap LRU and an optional node-local
-/// disk tier, in front of the cold S3 origin.
+/// The layered object-body cache handle held by the proxy.
 pub(crate) struct TieredCache {
-    hot: HotCache,
-    warm: Option<DiskCache>,
+    core: Arc<Core>,
 }
 
 impl TieredCache {
     /// Build the cache: a hot LRU weighted by body bytes up to `cache_bytes`, plus the
-    /// optional disk tier.
+    /// optional warm disk tier. Fill singleflight is handled here (probe-then-gate), so
+    /// the tierstore-level gate is disabled.
     #[must_use]
-    pub(crate) fn new(cache_bytes: u64, warm: Option<DiskCache>) -> Self {
-        let hot = moka::future::Cache::builder()
-            .max_capacity(cache_bytes)
-            .weigher(|_k, v: &Arc<CachedObject>| u32::try_from(v.body.len()).unwrap_or(u32::MAX))
-            .build();
-        Self { hot, warm }
+    pub(crate) fn new(cache_bytes: u64, warm: Option<WarmTier>, metrics: Arc<Metrics>) -> Self {
+        let capacity = NonZeroUsize::new(usize::try_from(cache_bytes).unwrap_or(usize::MAX).max(1))
+            .unwrap_or(NonZeroUsize::MIN);
+        let hot = MemoryTier::bounded_bytes(capacity, |_key: &CacheKey, obj: &Arc<CachedObject>| {
+            obj.body.len()
+        })
+        .with_eviction(Eviction::Lru);
+        let has_warm = warm.is_some();
+        let builder = tierstore::TieredCache::builder().tier(hot).single_flight(false);
+        let cache = match warm {
+            Some(warm) => builder.tier(warm),
+            None => builder,
+        }
+        .build();
+        Self {
+            core: Arc::new(Core {
+                cache,
+                fills: SingleFlight::new(),
+                metrics,
+                has_warm,
+            }),
+        }
     }
 
     /// A handle the commit-log consumer uses to invalidate this node's local copies.
     #[must_use]
     pub(crate) fn local(&self) -> LocalCache {
-        LocalCache::new(self.hot.clone(), self.warm.clone())
+        LocalCache { core: Arc::clone(&self.core) }
     }
 
-    /// Look up a whole cached object: hot, then warm disk (a disk hit backfills hot).
-    pub(crate) async fn get(&self, key: &(String, String)) -> Option<Arc<CachedObject>> {
-        if let Some(obj) = self.hot.get(key).await {
-            return Some(obj);
-        }
-        if let Some(warm) = &self.warm
-            && let Some(obj) = warm.get(&key.0, &key.1).await
-        {
-            self.hot.insert(key.clone(), obj.clone()).await;
-            return Some(obj);
-        }
-        None
+    /// Look up a whole cached object: hot, then warm disk (a disk hit promotes to hot).
+    pub(crate) async fn get(&self, key: &CacheKey) -> Option<Arc<CachedObject>> {
+        self.core.lookup(key).await
     }
 
-    /// Store into hot and (inclusively) the warm disk tier.
-    pub(crate) async fn insert(&self, key: (String, String), obj: Arc<CachedObject>) {
-        if let Some(warm) = &self.warm {
-            warm.put(&key.0, &key.1, &obj).await;
-        }
-        self.hot.insert(key, obj).await;
+    /// Store into hot and (inclusively) the warm disk tier, best-effort.
+    pub(crate) async fn insert(&self, key: CacheKey, obj: Arc<CachedObject>) {
+        self.core.insert(key, obj).await;
     }
 
     /// Drop an object from every local tier.
-    pub(crate) async fn invalidate(&self, key: &(String, String)) {
-        self.hot.invalidate(key).await;
-        if let Some(warm) = &self.warm {
-            warm.invalidate(&key.0, &key.1).await;
-        }
+    pub(crate) async fn invalidate(&self, key: &CacheKey) {
+        self.core.invalidate(key).await;
     }
 
-    /// Get `key`, or run `origin` to fetch it and populate the tiers. The fetch is
-    /// singleflighted (moka's `try_get_with`), so concurrent callers share one origin
-    /// round-trip; a disk hit short-circuits the fetch entirely.
+    /// Get `key`, or run `origin` to fetch it and populate the tiers. Probe-then-gate
+    /// singleflight: hot hits never touch the gate; concurrent misses for one key share a
+    /// single origin round-trip (followers re-probe under the gate and reuse the leader's
+    /// fill). Errors are not cached.
     pub(crate) async fn get_or_fetch<Fut>(
         &self,
-        key: &(String, String),
+        key: &CacheKey,
         origin: Fut,
     ) -> Result<Arc<CachedObject>, String>
     where
         Fut: Future<Output = Result<Arc<CachedObject>, String>> + Send,
     {
-        let load = async {
-            if let Some(warm) = &self.warm
-                && let Some(obj) = warm.get(&key.0, &key.1).await
-            {
-                return Ok(obj);
-            }
-            let obj = origin.await?;
-            if let Some(warm) = &self.warm {
-                warm.put(&key.0, &key.1, &obj).await;
-            }
-            Ok(obj)
-        };
-        self.hot.try_get_with(key.clone(), load).await.map_err(|e: Arc<String>| e.to_string())
+        if let Some(obj) = self.core.lookup(key).await {
+            return Ok(obj);
+        }
+        let gate = self.core.fills.acquire(key.clone()).await;
+        if let Some(obj) = self.core.lookup(key).await {
+            drop(gate);
+            return Ok(obj);
+        }
+        let result = origin.await;
+        if let Ok(obj) = &result {
+            self.core.insert(key.clone(), obj.clone()).await;
+        }
+        drop(gate);
+        result
+    }
+}
+
+/// A cloneable handle to this node's local tiers for the commit-log consumer to
+/// invalidate on a peer's write.
+#[derive(Clone)]
+pub(crate) struct LocalCache {
+    core: Arc<Core>,
+}
+
+impl LocalCache {
+    /// Drop a key from every node-local tier so a peer's overwrite is never read stale.
+    pub(crate) async fn invalidate(&self, key: &CacheKey) {
+        self.core.invalidate(key).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_body, CachedObject, DiskCache};
+    use super::{buffer_body, open_warm, CachedObject, TieredCache};
     use crate::metrics::Metrics;
     use bytes::Bytes;
     use s3s::dto::{ETag, GetObjectOutput, Timestamp};
@@ -387,6 +342,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
+    use tierstore::{TierRead, TierWrite};
 
     static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -405,6 +361,10 @@ mod tests {
             ..Default::default()
         };
         CachedObject::from_get(&out, Bytes::from_static(b"hello"))
+    }
+
+    fn ck(bucket: &str, key: &str) -> super::CacheKey {
+        (bucket.to_owned(), key.to_owned())
     }
 
     #[test]
@@ -429,24 +389,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disk_cache_roundtrip_and_restart_recovery() {
+    async fn warm_tier_roundtrip_and_restart_recovery() {
         let dir = temp_dir();
         let _ = std::fs::remove_dir_all(&dir);
-        let m = Arc::new(Metrics::default());
         let cap = 10 * 1024 * 1024;
 
-        let disk = DiskCache::open(dir.clone(), cap, 8 * 1024 * 1024, m.clone()).await.unwrap();
-        let obj = sample();
-        disk.put("b", "k", &obj).await;
-        assert_eq!(disk.get("b", "k").await.expect("hit").body, obj.body);
-        assert!(disk.get("b", "missing").await.is_none());
+        let warm = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
+        let obj = Arc::new(sample());
+        warm.put(ck("b", "k"), obj.clone()).await.unwrap();
+        assert_eq!(warm.get(&ck("b", "k")).await.unwrap().expect("hit").body, obj.body);
+        assert!(warm.get(&ck("b", "missing")).await.unwrap().is_none());
 
-        // A fresh cache over the same dir re-indexes the file — survives a restart.
-        let disk2 = DiskCache::open(dir.clone(), cap, 8 * 1024 * 1024, m).await.unwrap();
-        assert!(disk2.get("b", "k").await.is_some(), "disk cache survives restart");
+        // A fresh tier over the same dir re-indexes the file — survives a restart.
+        let warm2 = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
+        assert!(warm2.get(&ck("b", "k")).await.unwrap().is_some(), "warm tier survives restart");
 
-        disk2.invalidate("b", "k").await;
-        assert!(disk2.get("b", "k").await.is_none(), "invalidate deletes the entry");
+        warm2.delete(&ck("b", "k")).await.unwrap();
+        assert!(warm2.get(&ck("b", "k")).await.unwrap().is_none(), "invalidate deletes the entry");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn layered_cache_fills_and_invalidates() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let warm = open_warm(dir.clone(), 10 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let cache = TieredCache::new(1024 * 1024, Some(warm), Arc::new(Metrics::default()));
+
+        let key = ck("b", "k");
+        let obj = Arc::new(sample());
+        cache.insert(key.clone(), obj.clone()).await;
+        assert_eq!(cache.get(&key).await.expect("hit").body, obj.body);
+
+        // Origin is only consulted once per key; the second get_or_fetch hits locally.
+        let fetched = cache
+            .get_or_fetch(&ck("b", "k2"), async { Ok(Arc::new(sample())) })
+            .await
+            .expect("fetch");
+        assert_eq!(fetched.body, obj.body);
+        let served = cache
+            .get_or_fetch(&ck("b", "k2"), async { Err("origin must not be called".to_owned()) })
+            .await
+            .expect("served from cache");
+        assert_eq!(served.body, obj.body);
+
+        cache.invalidate(&key).await;
+        assert!(cache.get(&key).await.is_none(), "invalidate drops all local copies");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

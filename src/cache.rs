@@ -24,7 +24,7 @@ use tracing::info;
 use crate::coherence::IndexLog;
 use crate::index::{list_objects_v2_from_index, sync_bucket_into, BucketState, ObjEntry};
 use crate::metrics::Metrics;
-use crate::tier::{self, CachedObject, DiskCache, TieredCache};
+use crate::tier::{self, CachedObject, TieredCache, WarmTier};
 
 /// Sizing for the object cache, passed to [`CachingProxy::new`].
 #[derive(Clone, Copy)]
@@ -62,7 +62,7 @@ impl CachingProxy {
         inner: s3s_aws::Proxy,
         client: aws_sdk_s3::Client,
         cfg: CacheConfig,
-        disk: Option<DiskCache>,
+        warm: Option<WarmTier>,
         index_log: Option<IndexLog>,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -70,7 +70,7 @@ impl CachingProxy {
             inner,
             client,
             state: Arc::new(RwLock::new(HashMap::new())),
-            obj_cache: TieredCache::new(cfg.cache_bytes, disk),
+            obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),
             max_obj_bytes: cfg.max_obj_bytes,
             index_log,
             metrics,

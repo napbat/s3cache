@@ -11,7 +11,7 @@ use openraft::{BasicNode, Config, Raft};
 use s3s::dto::GetObjectOutput;
 
 use super::{IndexWrite, LogStore, Loopback, NodeId, StateMachineStore, TypeConfig};
-use crate::tier::{CachedObject, HotCache, LocalCache};
+use crate::tier::{CachedObject, TieredCache};
 
 /// One cluster node: its id, its `Raft` handle, and its state machine (to read the index).
 type Node = (NodeId, Raft<TypeConfig>, Arc<StateMachineStore>);
@@ -156,18 +156,18 @@ async fn applied_write_invalidates_local_object_cache() {
     // anti-stale-read guarantee the old Valkey-log consumer provided, now driven by apply.
     let nodes = cluster(1).await;
 
-    let hot: HotCache = moka::future::Cache::builder().max_capacity(1024).build();
+    let hot = TieredCache::new(1024 * 1024, None, Arc::new(crate::metrics::Metrics::default()));
     let ck = ("b".to_owned(), "k".to_owned());
     let stale = Arc::new(CachedObject::from_get(&GetObjectOutput::default(), Bytes::from_static(b"stale")));
     hot.insert(ck.clone(), stale).await;
-    assert!(hot.contains_key(&ck), "seeded a stale hot copy");
-    nodes[0].2.set_local(LocalCache::new(hot.clone(), None));
+    assert!(hot.get(&ck).await.is_some(), "seeded a stale hot copy");
+    nodes[0].2.set_local(hot.local());
 
     propose(&nodes, &put("b", "k", 5, 1)).await;
 
     let mut gone = false;
     for _ in 0..100 {
-        if !hot.contains_key(&ck) {
+        if hot.get(&ck).await.is_none() {
             gone = true;
             break;
         }

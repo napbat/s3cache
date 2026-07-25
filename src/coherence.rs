@@ -312,7 +312,7 @@ mod tests {
     use super::{apply_log_event, connect_valkey, connect_valkey_client, parse_stream_id, IndexLog};
     use crate::index::BucketState;
     use crate::metrics::Metrics;
-    use crate::tier::{CachedObject, HotCache, LocalCache};
+    use crate::tier::{CachedObject, TieredCache};
     use fred::prelude::*;
     use s3s::dto::GetObjectOutput;
     use std::collections::HashMap;
@@ -372,8 +372,8 @@ mod tests {
         cond()
     }
 
-    fn hot_cache() -> HotCache {
-        moka::future::Cache::builder().max_capacity(1024).build()
+    fn hot_cache() -> TieredCache {
+        TieredCache::new(1024 * 1024, None, Arc::new(Metrics::default()))
     }
 
     fn cached(body: &'static [u8]) -> Arc<CachedObject> {
@@ -468,13 +468,21 @@ mod tests {
         let hot = hot_cache();
         let ck = ("bkt".to_owned(), "obj".to_owned());
         hot.insert(ck.clone(), cached(b"stale")).await;
-        assert!(hot.contains_key(&ck));
+        assert!(hot.get(&ck).await.is_some());
 
         let state: Index = Arc::new(RwLock::new(HashMap::new()));
-        b.spawn_consumer(b.tail_id().await, state, Some(LocalCache::new(hot.clone(), None)));
+        b.spawn_consumer(b.tail_id().await, state, Some(hot.local()));
 
         a.append_put("bkt", "obj", 5).await;
-        assert!(wait_until(|| !hot.contains_key(&ck)).await, "peer write must drop the local hot copy");
+        let mut gone = false;
+        for _ in 0..60 {
+            if hot.get(&ck).await.is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(gone, "peer write must drop the local hot copy");
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }
