@@ -977,7 +977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1197,7 +1197,7 @@ dependencies = [
 [[package]]
 name = "groupnet"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#4bee2a8122ee1502785f62ce054ac2afa65c6cd1"
+source = "git+https://github.com/napbat/groupnet?branch=main#e3bf1e4ca80ba40d781f7fb0b1134483e9a4a74b"
 dependencies = [
  "groupnet-consistency",
  "groupnet-core",
@@ -1210,7 +1210,7 @@ dependencies = [
 [[package]]
 name = "groupnet-consistency"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#4bee2a8122ee1502785f62ce054ac2afa65c6cd1"
+source = "git+https://github.com/napbat/groupnet?branch=main#e3bf1e4ca80ba40d781f7fb0b1134483e9a4a74b"
 dependencies = [
  "groupnet-core",
  "groupnet-runtime",
@@ -1220,12 +1220,12 @@ dependencies = [
 [[package]]
 name = "groupnet-core"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#4bee2a8122ee1502785f62ce054ac2afa65c6cd1"
+source = "git+https://github.com/napbat/groupnet?branch=main#e3bf1e4ca80ba40d781f7fb0b1134483e9a4a74b"
 
 [[package]]
 name = "groupnet-runtime"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#4bee2a8122ee1502785f62ce054ac2afa65c6cd1"
+source = "git+https://github.com/napbat/groupnet?branch=main#e3bf1e4ca80ba40d781f7fb0b1134483e9a4a74b"
 dependencies = [
  "groupnet-core",
  "groupnet-transport",
@@ -1235,7 +1235,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#4bee2a8122ee1502785f62ce054ac2afa65c6cd1"
+source = "git+https://github.com/napbat/groupnet?branch=main#e3bf1e4ca80ba40d781f7fb0b1134483e9a4a74b"
 dependencies = [
  "groupnet-core",
 ]
@@ -1243,7 +1243,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport-mem"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#4bee2a8122ee1502785f62ce054ac2afa65c6cd1"
+source = "git+https://github.com/napbat/groupnet?branch=main#e3bf1e4ca80ba40d781f7fb0b1134483e9a4a74b"
 dependencies = [
  "groupnet-core",
  "groupnet-transport",
@@ -1253,7 +1253,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport-udp"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#4bee2a8122ee1502785f62ce054ac2afa65c6cd1"
+source = "git+https://github.com/napbat/groupnet?branch=main#e3bf1e4ca80ba40d781f7fb0b1134483e9a4a74b"
 dependencies = [
  "groupnet-core",
  "groupnet-transport",
