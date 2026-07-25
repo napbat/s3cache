@@ -95,8 +95,10 @@ bounded** rather than falsely absolute:
   `x-s3cache-write-token: <writer>:<epoch>:<seq>`. A client that echoes it on a later
   read as `x-s3cache-read-token` makes that read barrier on *that specific write*
   having been applied locally — strict cross-node read-after-write regardless of
-  propagation timing, bounded by the same 1s degrade. Standard SDKs ignore the headers;
-  smart clients opt in (boto3: an event hook injecting the request header).
+  propagation timing. If the token cannot be verified within 1s (partition, dead
+  apply loop), the read is served **from the origin instead of local state**: slower,
+  never stale — a token read is never silently downgraded. Standard SDKs ignore the
+  headers; smart clients opt in (boto3: an event hook injecting the request header).
 Requests the cache cannot reproduce faithfully — a specific `versionId`,
 `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
 

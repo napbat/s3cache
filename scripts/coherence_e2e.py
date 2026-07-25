@@ -100,6 +100,15 @@ def main():
         write(b, "k2", b"from-b")
         check("PUT via B -> LIST via A sees k2 (token barrier, no poll)", "k2" in keys(a))
 
+        # An unsatisfiable token must route the read to the origin: slower
+        # (barrier timeout) but correct — a token read is never downgraded.
+        TOKEN["v"] = "ghost:999:999"
+        t0 = time.time()
+        check("forged token: GET still returns correct bytes (origin fallback)",
+              body(a, "k2") == b"from-b")
+        check("forged token: bounded latency (< 4s)", time.time() - t0 < 4)
+        TOKEN["v"] = None
+
         # With the disk (warm) tier on, a peer's overwrite must invalidate the *disk* copy
         # too, not just hot — else a hot-evicted-but-disk-cached object goes stale.
         dc, dd_dir = f"/tmp/s3cache-diskC-{os.getpid()}", f"/tmp/s3cache-diskD-{os.getpid()}"

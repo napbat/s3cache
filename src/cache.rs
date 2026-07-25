@@ -45,6 +45,16 @@ pub(crate) struct CacheConfig {
     pub(crate) max_obj_bytes: usize,
 }
 
+/// Where a read may be served after the barrier: node-local state, or the
+/// origin — when a client-presented session token could not be verified in
+/// time, strictness is honoured at origin cost instead of silently dropped
+/// (the origin is never stale).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadRoute {
+    Local,
+    Origin,
+}
+
 /// How long a strict read waits for the freshness barrier before serving
 /// current state anyway (degrading to eventual rather than hanging).
 const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -133,18 +143,24 @@ impl CachingProxy {
     /// head has been applied locally, so a peer's just-completed write is not read stale.
     /// Freshness is bounded by one push/gossip hop (see [`crate::sync`]); degrades to
     /// serving current state on timeout. No-op without gossip (single-node is strict).
-    async fn read_barrier(&self, headers: &HeaderMap) {
-        let Some(sync) = &self.sync else { return };
+    async fn read_barrier(&self, headers: &HeaderMap) -> ReadRoute {
+        let Some(sync) = &self.sync else {
+            return ReadRoute::Local; // single node: the sole writer is strict
+        };
         if !sync.await_fresh(READ_BARRIER_TIMEOUT).await {
             tracing::debug!("freshness barrier timed out; serving current state");
         }
         // A client-echoed write token upgrades the read to strict
         // read-after-write for that write, independent of propagation timing.
+        // Unverifiable-in-time tokens route the read to the origin: slower,
+        // never stale — the client asked for strict and gets it.
         if let Some(token) = headers.get(READ_TOKEN_HEADER).and_then(|v| v.to_str().ok())
             && !sync.reached_token(token, READ_BARRIER_TIMEOUT).await
         {
-            tracing::debug!("read-token barrier timed out; serving current state");
+            tracing::debug!("read token not satisfied in time; serving via origin");
+            return ReadRoute::Origin;
         }
+        ReadRoute::Local
     }
 
     /// Attach a write's session token to a response, when coherence is on.
@@ -347,8 +363,9 @@ impl s3s::S3 for CachingProxy {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        if self.is_synced(req.input.bucket.as_str()) {
-            self.read_barrier(&req.headers).await; // index is node-local -> barrier when strict
+        if self.is_synced(req.input.bucket.as_str())
+            && self.read_barrier(&req.headers).await == ReadRoute::Local
+        {
             self.metrics.list_from_index.fetch_add(1, Ordering::Relaxed);
             let out = self.list_from_index(&req.input);
             return Ok(S3Response::new(out));
@@ -469,13 +486,17 @@ impl s3s::S3 for CachingProxy {
             _ => None,
         };
         // Before any read served from a node-local hot copy, barrier so a peer's
-        // overwrite is never read stale (strong consistency); misses go to the origin.
-        if cacheable || int_range.is_some() {
-            self.read_barrier(&req.headers).await;
-        }
+        // overwrite is never read stale; a token-carrying read that cannot be
+        // verified in time skips every local copy and streams from the origin.
+        let local_ok = if cacheable || int_range.is_some() {
+            self.read_barrier(&req.headers).await == ReadRoute::Local
+        } else {
+            true
+        };
         if let Some((first, last)) = int_range {
             // Cached whole object → serve the slice locally.
-            if let Some(obj) = self.obj_cache.get(&ckey).await
+            if local_ok
+                && let Some(obj) = self.obj_cache.get(&ckey).await
                 && let Some(out) = obj.to_get_range(first, last)
             {
                 self.metrics.range_hit.fetch_add(1, Ordering::Relaxed);
@@ -488,14 +509,20 @@ impl s3s::S3 for CachingProxy {
             let small = self.index_size(&ckey.0, &ckey.1).is_some_and(|sz| {
                 sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes
             });
-            if small && let Some(resp) = self.promote_range(&ckey, &req, first, last).await {
+            if local_ok
+                && small
+                && let Some(resp) = self.promote_range(&ckey, &req, first, last).await
+            {
                 return resp;
             }
-            // Big, not-yet-indexed, or a failed promote: stream the range through.
+            // Big, not-yet-indexed, unverified-token, or a failed promote: stream through.
             self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);
             return self.inner.get_object(req).await;
         }
-        if cacheable && let Some(obj) = self.obj_cache.get(&ckey).await {
+        if local_ok
+            && cacheable
+            && let Some(obj) = self.obj_cache.get(&ckey).await
+        {
             self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
             return Ok(S3Response::new(obj.to_get()));
         }
@@ -544,8 +571,7 @@ impl s3s::S3 for CachingProxy {
             && req.input.version_id.is_none()
             && req.input.checksum_mode.is_none()
             && req.input.sse_customer_key.is_none();
-        if cache_eligible {
-            self.read_barrier(&req.headers).await; // strong consistency for a hot-served HEAD
+        if cache_eligible && self.read_barrier(&req.headers).await == ReadRoute::Local {
             let ckey = (req.input.bucket.clone(), req.input.key.clone());
             if let Some(obj) = self.obj_cache.get(&ckey).await {
                 self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);

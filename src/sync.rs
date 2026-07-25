@@ -195,7 +195,9 @@ impl WriteSync {
     /// Waits (bounded) until one specific write — a [`WRITE_TOKEN_HEADER`]
     /// value echoed by a client — has been applied locally. Tokens this node
     /// issued are trivially satisfied (its own writes are already local);
-    /// garbled tokens are ignored (the freshness barrier still ran).
+    /// garbled tokens are ignored (the freshness barrier still ran); a
+    /// foreign token that cannot be verified in time returns `false`, and the
+    /// caller serves from the origin instead of local state.
     pub(crate) async fn reached_token(&self, header: &str, timeout: Duration) -> bool {
         let Some((writer, epoch, seq)) = parse_token(header) else {
             return true;
@@ -204,7 +206,7 @@ impl WriteSync {
             return true;
         }
         let Some(view) = self.view.get() else {
-            return true;
+            return false; // no apply loop: a foreign token is unverifiable
         };
         let write = WriteToken { epoch, seq };
         tokio::time::timeout(timeout, view.reached(&NodeId::new(writer), write))
@@ -517,6 +519,18 @@ mod tests {
                 .reached_token("not-a-token", Duration::from_millis(10))
                 .await,
             "garbage tokens never block"
+        );
+        assert!(
+            !sync_b
+                .reached_token("ghost:9:9", Duration::from_millis(200))
+                .await,
+            "an unsatisfiable foreign token must fail closed"
+        );
+        assert!(
+            !sync_a
+                .reached_token("ghost:1:1", Duration::from_millis(10))
+                .await,
+            "without an apply loop a foreign token is unverifiable"
         );
     }
 
