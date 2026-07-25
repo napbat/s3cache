@@ -1,6 +1,7 @@
 //! Layered object-body cache: **hot** (node-local heap) in front of **warm** (a node-local
 //! on-disk cache) in front of **cold** (the S3 origin). Always layered — there is no mode
-//! to pick. Built on `tierstore`: the hot tier is a byte-budgeted in-memory LRU, the warm
+//! to pick. Built on `tierstore`: the hot tier is a byte-weighted moka cache (sharded,
+//! `TinyLFU` admission, via `tierstore-moka`), the warm
 //! tier is a byte-budgeted, restart-surviving mmap-disk store (values served as
 //! kernel-evictable mapped bytes) reached through a codec (bincode of `(key, object)`)
 //! and a blocking-I/O offload pool. Warm is inclusive (fills write hot *and* disk) and
@@ -19,8 +20,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use s3s::dto::{ETag, GetObjectOutput, HeadObjectOutput, Metadata, StreamingBlob, Timestamp};
 use serde::{Deserialize, Serialize};
-use tierstore::{CodecTier, Eviction, KeyStatus, MemoryTier, OffloadTier, SingleFlight};
+use tierstore::{CodecTier, KeyStatus, OffloadTier, SingleFlight};
 use tierstore_mmap::MmapDiskTier;
+use tierstore_moka::MokaTier;
 
 use crate::metrics::Metrics;
 
@@ -245,12 +247,9 @@ impl TieredCache {
     /// the tierstore-level gate is disabled.
     #[must_use]
     pub(crate) fn new(cache_bytes: u64, warm: Option<WarmTier>, metrics: Arc<Metrics>) -> Self {
-        let capacity = NonZeroUsize::new(usize::try_from(cache_bytes).unwrap_or(usize::MAX).max(1))
-            .unwrap_or(NonZeroUsize::MIN);
-        let hot = MemoryTier::bounded_bytes(capacity, |_key: &CacheKey, obj: &Arc<CachedObject>| {
-            obj.body.len()
-        })
-        .with_eviction(Eviction::Lru);
+        let hot = MokaTier::bounded_weighted(cache_bytes, |_key: &CacheKey, obj: &Arc<CachedObject>| {
+            u32::try_from(obj.body.len()).unwrap_or(u32::MAX)
+        });
         let has_warm = warm.is_some();
         let builder = tierstore::TieredCache::builder().tier(hot).single_flight(false);
         let cache = match warm {
