@@ -98,8 +98,12 @@ pub(crate) fn list_objects_v2_from_index(
         continuation_token: inp.continuation_token.clone(),
         next_continuation_token: next_token,
         contents: (!contents.is_empty()).then_some(contents),
-        common_prefixes: (!common.is_empty())
-            .then(|| common.into_iter().map(|p| CommonPrefix { prefix: Some(p) }).collect()),
+        common_prefixes: (!common.is_empty()).then(|| {
+            common
+                .into_iter()
+                .map(|p| CommonPrefix { prefix: Some(p) })
+                .collect()
+        }),
         delimiter: delim,
         start_after: inp.start_after.clone(),
         ..Default::default()
@@ -129,9 +133,15 @@ pub(crate) async fn sync_bucket_into(
                     .last_modified()
                     .and_then(|d| u64::try_from(d.secs()).ok())
                     .map_or_else(SystemTime::now, |s| UNIX_EPOCH + Duration::from_secs(s));
-                let entry = ObjEntry { size: obj.size().unwrap_or(0), last_modified };
+                let entry = ObjEntry {
+                    size: obj.size().unwrap_or(0),
+                    last_modified,
+                };
                 let mut g = state.write().unwrap();
-                g.entry(bucket.to_owned()).or_default().keys.insert(key.to_owned(), entry);
+                g.entry(bucket.to_owned())
+                    .or_default()
+                    .keys
+                    .insert(key.to_owned(), entry);
                 found += 1;
             }
         }
@@ -144,23 +154,44 @@ pub(crate) async fn sync_bucket_into(
             break;
         }
     }
-    state.write().unwrap().entry(bucket.to_owned()).or_default().synced = true;
+    state
+        .write()
+        .unwrap()
+        .entry(bucket.to_owned())
+        .or_default()
+        .synced = true;
     info!("synced bucket `{bucket}` into index: {found} keys");
     Ok(found)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{list_objects_v2_from_index, ObjEntry};
+    use super::{ObjEntry, list_objects_v2_from_index};
     use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
 
     fn index(keys: &[&str]) -> BTreeMap<String, ObjEntry> {
-        keys.iter().map(|k| ((*k).to_owned(), ObjEntry { size: 1, last_modified: UNIX_EPOCH })).collect()
+        keys.iter()
+            .map(|k| {
+                (
+                    (*k).to_owned(),
+                    ObjEntry {
+                        size: 1,
+                        last_modified: UNIX_EPOCH,
+                    },
+                )
+            })
+            .collect()
     }
 
-    fn list_input(max: i32, token: Option<&str>, prefix: &str, delim: Option<&str>, start_after: Option<&str>) -> ListObjectsV2Input {
+    fn list_input(
+        max: i32,
+        token: Option<&str>,
+        prefix: &str,
+        delim: Option<&str>,
+        start_after: Option<&str>,
+    ) -> ListObjectsV2Input {
         ListObjectsV2Input {
             bucket: "b".to_owned(),
             max_keys: Some(max),
@@ -173,14 +204,27 @@ mod tests {
     }
 
     fn page_keys(out: &ListObjectsV2Output) -> Vec<String> {
-        out.contents.iter().flatten().filter_map(|o| o.key.clone()).collect()
+        out.contents
+            .iter()
+            .flatten()
+            .filter_map(|o| o.key.clone())
+            .collect()
     }
     fn page_prefixes(out: &ListObjectsV2Output) -> Vec<String> {
-        out.common_prefixes.iter().flatten().filter_map(|c| c.prefix.clone()).collect()
+        out.common_prefixes
+            .iter()
+            .flatten()
+            .filter_map(|c| c.prefix.clone())
+            .collect()
     }
 
     /// Follow the continuation tokens like a real client and collect every key + prefix.
-    fn walk_pages(idx: &BTreeMap<String, ObjEntry>, max: i32, prefix: &str, delim: Option<&str>) -> (Vec<String>, Vec<String>) {
+    fn walk_pages(
+        idx: &BTreeMap<String, ObjEntry>,
+        max: i32,
+        prefix: &str,
+        delim: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
         let (mut keys, mut prefixes) = (Vec::new(), Vec::new());
         let mut token: Option<String> = None;
         for _ in 0..10_000 {
@@ -209,9 +253,11 @@ mod tests {
     #[test]
     fn list_prefix_and_delimiter() {
         let idx = index(&["p/a/1", "p/a/2", "p/b/1", "p/top"]);
-        let out = list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "p/a/", None, None));
+        let out =
+            list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "p/a/", None, None));
         assert_eq!(page_keys(&out), ["p/a/1", "p/a/2"]);
-        let out = list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "p/", Some("/"), None));
+        let out =
+            list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "p/", Some("/"), None));
         assert_eq!(page_prefixes(&out), ["p/a/", "p/b/"]);
         assert_eq!(page_keys(&out), ["p/top"]);
     }
@@ -228,7 +274,8 @@ mod tests {
     #[test]
     fn list_start_after_is_exclusive() {
         let idx = index(&["a", "b", "c", "d"]);
-        let out = list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "", None, Some("b")));
+        let out =
+            list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "", None, Some("b")));
         assert_eq!(page_keys(&out), ["c", "d"]);
     }
 

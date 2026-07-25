@@ -77,7 +77,14 @@ impl IndexLog {
     /// Wrap a connected Valkey pool (appends) plus a dedicated read connection (the
     /// blocking consumer) as the index commit log.
     #[must_use]
-    pub(crate) fn new(pool: Pool, read_client: Client, stream: String, maxlen: u64, node: String, metrics: Arc<Metrics>) -> Self {
+    pub(crate) fn new(
+        pool: Pool,
+        read_client: Client,
+        stream: String,
+        maxlen: u64,
+        node: String,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             pool,
             read_client,
@@ -120,7 +127,10 @@ impl IndexLog {
         let fetch = self.pool.xrevrange(&self.stream, "+", "-", Some(1));
         let res: FredResult<Vec<(String, HashMap<String, String>)>> =
             tokio::time::timeout(LOG_OP_TIMEOUT, fetch).await.ok()?;
-        res.ok()?.into_iter().next().map(|(id, _)| parse_stream_id(&id))
+        res.ok()?
+            .into_iter()
+            .next()
+            .map(|(id, _)| parse_stream_id(&id))
     }
 
     /// Append a write event, capped with approximate `MAXLEN` trimming. Best-effort with
@@ -134,7 +144,9 @@ impl IndexLog {
             self.metrics.log_error();
             return;
         }
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
         let fields: Vec<(&str, String)> = vec![
             ("op", op.to_owned()),
             ("bucket", bucket.to_owned()),
@@ -143,9 +155,13 @@ impl IndexLog {
             ("node", self.node.clone()),
             ("ts", ts.to_string()),
         ];
-        let add = self
-            .pool
-            .xadd::<String, _, _, _, _>(&self.stream, false, ("MAXLEN", "~", self.maxlen), "*", fields);
+        let add = self.pool.xadd::<String, _, _, _, _>(
+            &self.stream,
+            false,
+            ("MAXLEN", "~", self.maxlen),
+            "*",
+            fields,
+        );
         match tokio::time::timeout(LOG_OP_TIMEOUT, add).await {
             Ok(Ok(_)) => self.metrics.log_appended(),
             Ok(Err(e)) => {
@@ -181,7 +197,10 @@ impl IndexLog {
                 Err(_) => return "0".to_owned(),
             };
         match res {
-            Ok(entries) => entries.into_iter().next().map_or_else(|| "0".to_owned(), |(id, _)| id),
+            Ok(entries) => entries
+                .into_iter()
+                .next()
+                .map_or_else(|| "0".to_owned(), |(id, _)| id),
             Err(_) => "0".to_owned(),
         }
     }
@@ -204,7 +223,15 @@ impl IndexLog {
         // The consumer starts at start_id, so the local index reflects everything up to it.
         *applied.write().unwrap() = parse_stream_id(&start_id);
         tokio::spawn(async move {
-            let cx = ConsumerCtx { read: &read, stream: &stream, node: &node, state: &state, local: local.as_ref(), applied: &applied, metrics: &metrics };
+            let cx = ConsumerCtx {
+                read: &read,
+                stream: &stream,
+                node: &node,
+                state: &state,
+                local: local.as_ref(),
+                applied: &applied,
+                metrics: &metrics,
+            };
             consume_index_log(&cx, start_id).await;
         });
     }
@@ -235,7 +262,10 @@ async fn consume_index_log(cx: &ConsumerCtx<'_>, mut last_id: String) {
         // Raw `xread` + manual conversion: a BLOCK that times out with no new entries
         // returns nil, which `xread_map` would reject as a decode error — treat nil as
         // "nothing yet". `into_xread_response` then normalizes the RESP2/RESP3 encoding.
-        let reply: FredResult<Value> = cx.read.xread(Some(500), Some(5000), cx.stream, &last_id).await;
+        let reply: FredResult<Value> = cx
+            .read
+            .xread(Some(500), Some(5000), cx.stream, &last_id)
+            .await;
         let map = match reply {
             Ok(v) if v.is_null() => continue, // BLOCK timed out with no new entries
             Ok(v) => match v.into_xread_response::<String, String, String, String>() {
@@ -254,7 +284,9 @@ async fn consume_index_log(cx: &ConsumerCtx<'_>, mut last_id: String) {
                 continue;
             }
         };
-        let Some(entries) = map.get(cx.stream) else { continue };
+        let Some(entries) = map.get(cx.stream) else {
+            continue;
+        };
         for (id, fields) in entries {
             apply_log_event(cx.node, cx.state, cx.local, fields).await;
             last_id.clone_from(id);
@@ -277,12 +309,17 @@ pub(crate) async fn apply_log_event(
     if fields.get("node").map(String::as_str) == Some(node) {
         return;
     }
-    let (Some(op), Some(bucket), Some(key)) = (fields.get("op"), fields.get("bucket"), fields.get("key")) else {
+    let (Some(op), Some(bucket), Some(key)) =
+        (fields.get("op"), fields.get("bucket"), fields.get("key"))
+    else {
         return;
     };
     match op.as_str() {
         "put" => {
-            let size = fields.get("size").and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
+            let size = fields
+                .get("size")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(-1);
             let last_modified = fields
                 .get("ts")
                 .and_then(|s| s.parse::<u64>().ok())
@@ -293,7 +330,13 @@ pub(crate) async fn apply_log_event(
                 .entry(bucket.clone())
                 .or_default()
                 .keys
-                .insert(key.clone(), ObjEntry { size, last_modified });
+                .insert(
+                    key.clone(),
+                    ObjEntry {
+                        size,
+                        last_modified,
+                    },
+                );
         }
         "del" => {
             if let Some(b) = state.write().unwrap().get_mut(bucket) {
@@ -309,7 +352,9 @@ pub(crate) async fn apply_log_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_log_event, connect_valkey, connect_valkey_client, parse_stream_id, IndexLog};
+    use super::{
+        IndexLog, apply_log_event, connect_valkey, connect_valkey_client, parse_stream_id,
+    };
     use crate::index::BucketState;
     use crate::metrics::Metrics;
     use crate::tier::{CachedObject, TieredCache};
@@ -326,7 +371,11 @@ mod tests {
 
     /// A unique stream key per test so the (parallel) tests never interfere.
     fn unique_stream() -> String {
-        format!("s3cache:test:{}:{}", std::process::id(), STREAM_SEQ.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "s3cache:test:{}:{}",
+            std::process::id(),
+            STREAM_SEQ.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     /// Connect a Valkey pool, or `None` (test skips) when `S3CACHE_TEST_VALKEY_URL` is unset.
@@ -343,7 +392,14 @@ mod tests {
     }
 
     fn log(pool: &Pool, stream: &str, node: &str) -> IndexLog {
-        IndexLog::new(pool.clone(), read_client(), stream.to_owned(), 10_000, node.to_owned(), Arc::new(Metrics::default()))
+        IndexLog::new(
+            pool.clone(),
+            read_client(),
+            stream.to_owned(),
+            10_000,
+            node.to_owned(),
+            Arc::new(Metrics::default()),
+        )
     }
 
     fn event(op: &str, bucket: &str, key: &str, size: &str, node: &str) -> HashMap<String, String> {
@@ -358,7 +414,12 @@ mod tests {
     }
 
     fn indexed_size(state: &Index, bucket: &str, key: &str) -> Option<i64> {
-        state.read().unwrap().get(bucket).and_then(|b| b.keys.get(key)).map(|e| e.size)
+        state
+            .read()
+            .unwrap()
+            .get(bucket)
+            .and_then(|b| b.keys.get(key))
+            .map(|e| e.size)
     }
 
     /// Poll `cond` for up to ~3s (the consumer applies within a few ms in practice).
@@ -377,7 +438,10 @@ mod tests {
     }
 
     fn cached(body: &'static [u8]) -> Arc<CachedObject> {
-        Arc::new(CachedObject::from_get(&GetObjectOutput::default(), bytes::Bytes::from_static(body)))
+        Arc::new(CachedObject::from_get(
+            &GetObjectOutput::default(),
+            bytes::Bytes::from_static(body),
+        ))
     }
 
     #[tokio::test]
@@ -392,7 +456,13 @@ mod tests {
         let mut no_key = event("put", "b", "k2", "1", "peer");
         no_key.remove("key");
         apply_log_event("me", &state, None, &no_key).await;
-        apply_log_event("me", &state, None, &event("frobnicate", "b", "k", "1", "peer")).await;
+        apply_log_event(
+            "me",
+            &state,
+            None,
+            &event("frobnicate", "b", "k", "1", "peer"),
+        )
+        .await;
         assert_eq!(indexed_size(&state, "b", "k2"), None);
         assert_eq!(indexed_size(&state, "b", "k"), Some(7));
         // A peer's delete applies.
@@ -430,10 +500,16 @@ mod tests {
         b.spawn_consumer(b.tail_id().await, state.clone(), None);
 
         a.append_put("bkt", "obj1", 42).await;
-        assert!(wait_until(|| indexed_size(&state, "bkt", "obj1") == Some(42)).await, "B should see A's put");
+        assert!(
+            wait_until(|| indexed_size(&state, "bkt", "obj1") == Some(42)).await,
+            "B should see A's put"
+        );
 
         a.append_del("bkt", "obj1").await;
-        assert!(wait_until(|| indexed_size(&state, "bkt", "obj1").is_none()).await, "B should see A's delete");
+        assert!(
+            wait_until(|| indexed_size(&state, "bkt", "obj1").is_none()).await,
+            "B should see A's delete"
+        );
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }
@@ -450,11 +526,16 @@ mod tests {
             a.append_put("b1", &format!("k{i}"), i).await;
             a.append_put("b2", &format!("k{i}"), i + 1000).await;
         }
-        let all = |st: &Index| (0..25).all(|i| {
-            indexed_size(st, "b1", &format!("k{i}")) == Some(i)
-                && indexed_size(st, "b2", &format!("k{i}")) == Some(i + 1000)
-        });
-        assert!(wait_until(|| all(&state)).await, "B should converge on all keys in both buckets");
+        let all = |st: &Index| {
+            (0..25).all(|i| {
+                indexed_size(st, "b1", &format!("k{i}")) == Some(i)
+                    && indexed_size(st, "b2", &format!("k{i}")) == Some(i + 1000)
+            })
+        };
+        assert!(
+            wait_until(|| all(&state)).await,
+            "B should converge on all keys in both buckets"
+        );
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }
@@ -499,8 +580,15 @@ mod tests {
         b.spawn_consumer(start, state.clone(), None);
 
         a.append_put("b", "after", 2).await;
-        assert!(wait_until(|| indexed_size(&state, "b", "after") == Some(2)).await, "sees events after the start");
-        assert_eq!(indexed_size(&state, "b", "before"), None, "does not replay events before the start");
+        assert!(
+            wait_until(|| indexed_size(&state, "b", "after") == Some(2)).await,
+            "sees events after the start"
+        );
+        assert_eq!(
+            indexed_size(&state, "b", "before"),
+            None,
+            "does not replay events before the start"
+        );
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }
@@ -519,7 +607,9 @@ mod tests {
         b.spawn_consumer(start, state.clone(), None);
 
         assert!(
-            wait_until(|| indexed_size(&state, "b", "during1") == Some(1) && indexed_size(&state, "b", "during2") == Some(2)).await,
+            wait_until(|| indexed_size(&state, "b", "during1") == Some(1)
+                && indexed_size(&state, "b", "during2") == Some(2))
+            .await,
             "replay from the pre-bootstrap tail must not miss writes"
         );
 
@@ -536,11 +626,17 @@ mod tests {
 
         a.append_put("b", "x", 5).await;
         a.append_del("b", "x").await;
-        assert!(wait_until(|| indexed_size(&state, "b", "x").is_none()).await, "put then del => absent");
+        assert!(
+            wait_until(|| indexed_size(&state, "b", "x").is_none()).await,
+            "put then del => absent"
+        );
 
         a.append_del("b", "y").await;
         a.append_put("b", "y", 9).await;
-        assert!(wait_until(|| indexed_size(&state, "b", "y") == Some(9)).await, "del then put => present");
+        assert!(
+            wait_until(|| indexed_size(&state, "b", "y") == Some(9)).await,
+            "del then put => present"
+        );
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }
@@ -549,12 +645,22 @@ mod tests {
     async fn maxlen_bounds_the_stream() {
         let pool = valkey_or_skip!();
         let stream = unique_stream();
-        let small = IndexLog::new(pool.clone(), read_client(), stream.clone(), 20, "A".to_owned(), Arc::new(Metrics::default()));
+        let small = IndexLog::new(
+            pool.clone(),
+            read_client(),
+            stream.clone(),
+            20,
+            "A".to_owned(),
+            Arc::new(Metrics::default()),
+        );
         for i in 0..200 {
             small.append_put("b", &format!("k{i}"), i).await;
         }
         let len: i64 = pool.xlen(stream.as_str()).await.unwrap();
-        assert!((20..150).contains(&len), "MAXLEN ~20 should bound the stream (got {len})");
+        assert!(
+            (20..150).contains(&len),
+            "MAXLEN ~20 should bound the stream (got {len})"
+        );
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }
@@ -564,15 +670,28 @@ mod tests {
         let pool = valkey_or_skip!();
         let stream = unique_stream();
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
-        let lg = IndexLog::new(pool.clone(), read_client(), stream.clone(), 10_000, "n".to_owned(), Arc::new(Metrics::default()));
+        let lg = IndexLog::new(
+            pool.clone(),
+            read_client(),
+            stream.clone(),
+            10_000,
+            "n".to_owned(),
+            Arc::new(Metrics::default()),
+        );
 
         assert!(lg.await_fresh().await, "empty stream: nothing to wait for");
 
         lg.append_put("b", "k", 1).await; // tail advances; applied is still (0,0)
-        assert!(!lg.await_fresh().await, "must NOT release while behind the tail (times out)");
+        assert!(
+            !lg.await_fresh().await,
+            "must NOT release while behind the tail (times out)"
+        );
 
         *lg.applied.write().unwrap() = lg.latest_id().await.unwrap(); // simulate catch-up
-        assert!(lg.await_fresh().await, "releases once caught up to the tail");
+        assert!(
+            lg.await_fresh().await,
+            "releases once caught up to the tail"
+        );
 
         let _: FredResult<i64> = pool.del(stream.as_str()).await;
     }

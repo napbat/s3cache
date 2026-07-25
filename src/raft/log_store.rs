@@ -41,7 +41,11 @@ impl RaftLogReader<TypeConfig> for LogStore {
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.log.range(range).map(|(_, entry)| entry.clone()).collect())
+        Ok(inner
+            .log
+            .range(range)
+            .map(|(_, entry)| entry.clone())
+            .collect())
     }
 }
 
@@ -51,8 +55,15 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
         let inner = self.inner.lock().unwrap();
         // The last log id is the last present entry, or the purge boundary if the log is empty.
-        let last_log_id = inner.log.values().next_back().map_or(inner.last_purged, |e| Some(e.log_id));
-        Ok(LogState { last_purged_log_id: inner.last_purged, last_log_id })
+        let last_log_id = inner
+            .log
+            .values()
+            .next_back()
+            .map_or(inner.last_purged, |e| Some(e.log_id));
+        Ok(LogState {
+            last_purged_log_id: inner.last_purged,
+            last_log_id,
+        })
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -68,7 +79,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         Ok(self.inner.lock().unwrap().vote)
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId<NodeId>>) -> Result<(), StorageError<NodeId>> {
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogId<NodeId>>,
+    ) -> Result<(), StorageError<NodeId>> {
         self.inner.lock().unwrap().committed = committed;
         Ok(())
     }
@@ -77,7 +91,11 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         Ok(self.inner.lock().unwrap().committed)
     }
 
-    async fn append<I>(&mut self, entries: I, callback: LogFlushed<TypeConfig>) -> Result<(), StorageError<NodeId>>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<TypeConfig>,
+    ) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,

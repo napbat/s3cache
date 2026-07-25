@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot};
-use openraft::{BasicNode, Entry, EntryPayload, LogId, SnapshotMeta, StorageError, StorageIOError, StoredMembership};
+use openraft::{
+    BasicNode, Entry, EntryPayload, LogId, SnapshotMeta, StorageError, StorageIOError,
+    StoredMembership,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{BucketState, ObjEntry};
@@ -86,13 +89,20 @@ impl StateMachineStore {
 /// and the cache invalidation, so this stays trivially testable.
 fn apply_write(index: &mut HashMap<String, BucketState>, write: &IndexWrite) {
     match write {
-        IndexWrite::Put { bucket, key, size, ts_ms } => {
+        IndexWrite::Put {
+            bucket,
+            key,
+            size,
+            ts_ms,
+        } => {
             let last_modified = UNIX_EPOCH + Duration::from_millis(*ts_ms);
-            index
-                .entry(bucket.clone())
-                .or_default()
-                .keys
-                .insert(key.clone(), ObjEntry { size: *size, last_modified });
+            index.entry(bucket.clone()).or_default().keys.insert(
+                key.clone(),
+                ObjEntry {
+                    size: *size,
+                    last_modified,
+                },
+            );
         }
         IndexWrite::Del { bucket, key } => {
             if let Some(b) = index.get_mut(bucket) {
@@ -113,7 +123,8 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
                 last_membership: meta.last_membership.clone(),
                 index: index.clone(),
             };
-            let data = serde_json::to_vec(&view).map_err(|e| StorageIOError::read_state_machine(&e))?;
+            let data =
+                serde_json::to_vec(&view).map_err(|e| StorageIOError::read_state_machine(&e))?;
             (meta.last_applied, meta.last_membership.clone(), data)
         };
 
@@ -123,9 +134,19 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             |last| format!("{}-{}-{}", last.leader_id, last.index, snapshot_idx),
         );
 
-        let meta = SnapshotMeta { last_log_id, last_membership, snapshot_id };
-        *self.current_snapshot.lock().unwrap() = Some(StoredSnapshot { meta: meta.clone(), data: data.clone() });
-        Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(data)) })
+        let meta = SnapshotMeta {
+            last_log_id,
+            last_membership,
+            snapshot_id,
+        };
+        *self.current_snapshot.lock().unwrap() = Some(StoredSnapshot {
+            meta: meta.clone(),
+            data: data.clone(),
+        });
+        Ok(Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(data)),
+        })
     }
 }
 
@@ -134,12 +155,16 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>> {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
+    {
         let meta = self.meta.lock().unwrap();
         Ok((meta.last_applied, meta.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<IndexWriteResponse>, StorageError<NodeId>>
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<IndexWriteResponse>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + openraft::OptionalSend,
         I::IntoIter: openraft::OptionalSend,
@@ -155,11 +180,13 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                     EntryPayload::Blank => {}
                     EntryPayload::Normal(ref write) => {
                         apply_write(&mut index, write);
-                        let (IndexWrite::Put { bucket, key, .. } | IndexWrite::Del { bucket, key }) = write;
+                        let (IndexWrite::Put { bucket, key, .. } | IndexWrite::Del { bucket, key }) =
+                            write;
                         invalidate.push((bucket.clone(), key.clone()));
                     }
                     EntryPayload::Membership(ref mem) => {
-                        meta.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                        meta.last_membership =
+                            StoredMembership::new(Some(entry.log_id), mem.clone());
                     }
                 }
                 responses.push(IndexWriteResponse);
@@ -180,7 +207,9 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -190,21 +219,29 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let view: SnapshotView =
-            serde_json::from_slice(&bytes).map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let view: SnapshotView = serde_json::from_slice(&bytes)
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         {
             let mut m = self.meta.lock().unwrap();
             m.last_applied = view.last_applied;
             m.last_membership = view.last_membership;
             *self.index.write().unwrap() = view.index;
         }
-        *self.current_snapshot.lock().unwrap() = Some(StoredSnapshot { meta: meta.clone(), data: bytes });
+        *self.current_snapshot.lock().unwrap() = Some(StoredSnapshot {
+            meta: meta.clone(),
+            data: bytes,
+        });
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
         match &*self.current_snapshot.lock().unwrap() {
-            Some(s) => Ok(Some(Snapshot { meta: s.meta.clone(), snapshot: Box::new(Cursor::new(s.data.clone())) })),
+            Some(s) => Ok(Some(Snapshot {
+                meta: s.meta.clone(),
+                snapshot: Box::new(Cursor::new(s.data.clone())),
+            })),
             None => Ok(None),
         }
     }

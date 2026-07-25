@@ -13,6 +13,7 @@ mod metrics;
 // but is fully compiled, clippy-checked (`--all-targets`), and exercised by its own tests.
 #[cfg(test)]
 mod raft;
+mod sync;
 mod tier;
 
 use std::error::Error;
@@ -52,8 +53,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let proxy = s3s_aws::Proxy::from(client.clone());
     // Object-cache sizing: total capacity + per-object cap (bigger objects, e.g. segment
     // blobs, stream straight through and aren't cached).
-    let cache_bytes: u64 = env_or("S3CACHE_CACHE_BYTES", "268435456").parse().unwrap_or(268_435_456);
-    let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608").parse().unwrap_or(8_388_608);
+    let cache_bytes: u64 = env_or("S3CACHE_CACHE_BYTES", "268435456")
+        .parse()
+        .unwrap_or(268_435_456);
+    let max_obj_bytes: usize = env_or("S3CACHE_MAX_OBJECT_BYTES", "8388608")
+        .parse()
+        .unwrap_or(8_388_608);
 
     // Object-body cache: hot (node-local heap) in front of an optional node-local disk
     // tier (warm), in front of the S3 origin (cold). Always layered — no mode to pick.
@@ -66,37 +71,80 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let disk = if disk_path.is_empty() {
         None
     } else {
-        let disk_bytes: u64 = env_or("S3CACHE_DISK_CACHE_BYTES", "10737418240").parse().unwrap_or(10_737_418_240);
+        let disk_bytes: u64 = env_or("S3CACHE_DISK_CACHE_BYTES", "10737418240")
+            .parse()
+            .unwrap_or(10_737_418_240);
         info!("disk (warm) tier at `{disk_path}`, up to {disk_bytes} bytes");
-        Some(tier::open_warm(std::path::PathBuf::from(&disk_path), disk_bytes, max_obj_bytes)?)
+        Some(tier::open_warm(
+            std::path::PathBuf::from(&disk_path),
+            disk_bytes,
+            max_obj_bytes,
+        )?)
     };
 
     // Cross-node coherence via a Valkey Streams commit log (the only Valkey use). With it
     // on, reads from node-local state barrier on the log so a peer's just-completed write
     // is never read stale — always strongly consistent, not optional. Single-node without
     // the log is already strict (sole writer).
-    let index_log_on = matches!(env_or("S3CACHE_INDEX_LOG", "false").trim().to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
+    let node_name = env_or("HOSTNAME", "s3cache");
+
+    // Optional gossip write feed: fast cross-node body-cache invalidation at network
+    // latency, alongside (not instead of) the commit log. Set S3CACHE_GOSSIP_BIND (and
+    // S3CACHE_GOSSIP_SEEDS as comma-separated id=host:port pairs) to enable.
+    let write_sync = sync::from_env(&node_name).await.map(Arc::new);
+    info!("gossip coherence (write feed): {}", write_sync.is_some());
+
+    let index_log_on = matches!(
+        env_or("S3CACHE_INDEX_LOG", "false")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "true" | "1" | "on" | "yes"
+    );
     let index_log = if index_log_on {
-        let url = std::env::var("S3CACHE_VALKEY_URL").expect("S3CACHE_VALKEY_URL is required when the index log is enabled");
+        let url = std::env::var("S3CACHE_VALKEY_URL")
+            .expect("S3CACHE_VALKEY_URL is required when the index log is enabled");
         let pool_size: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
         let pool = coherence::connect_valkey(&url, pool_size)?;
         let read = coherence::connect_valkey_client(&url)?;
         let stream = env_or("S3CACHE_INDEX_LOG_STREAM", "s3cache:index:log");
-        let maxlen: u64 = env_or("S3CACHE_INDEX_LOG_MAXLEN", "1000000").parse().unwrap_or(1_000_000);
-        let node = env_or("HOSTNAME", "s3cache");
-        info!("index log enabled: stream `{stream}` maxlen ~{maxlen} node `{node}`");
-        Some(coherence::IndexLog::new(pool, read, stream, maxlen, node, metrics.clone()))
+        let maxlen: u64 = env_or("S3CACHE_INDEX_LOG_MAXLEN", "1000000")
+            .parse()
+            .unwrap_or(1_000_000);
+        info!("index log enabled: stream `{stream}` maxlen ~{maxlen} node `{node_name}`");
+        Some(coherence::IndexLog::new(
+            pool,
+            read,
+            stream,
+            maxlen,
+            node_name.clone(),
+            metrics.clone(),
+        ))
     } else {
         None
     };
 
     info!("index log (cross-node coherence): {index_log_on}");
-    let cfg = cache::CacheConfig { cache_bytes, max_obj_bytes };
-    let cp = cache::CachingProxy::new(proxy, client, cfg, disk, index_log, metrics.clone());
+    let cfg = cache::CacheConfig {
+        cache_bytes,
+        max_obj_bytes,
+    };
+    let cp = cache::CachingProxy::new(
+        proxy,
+        client,
+        cfg,
+        disk,
+        index_log,
+        write_sync.clone(),
+        metrics.clone(),
+    );
 
     // Start tailing the shared commit log BEFORE the bootstrap LIST, so the replay window
     // begins at-or-before the LIST's snapshot and no peer write slips through the gap.
     cp.start_index_log().await;
+    if let Some(write_sync) = &write_sync {
+        write_sync.start_apply(cp.local_cache());
+    }
 
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the

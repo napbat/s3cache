@@ -1491,6 +1491,72 @@ dependencies = [
 ]
 
 [[package]]
+name = "groupnet"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#cb3f706f580363b71864660c01f31215a2ff6a4c"
+dependencies = [
+ "groupnet-consistency",
+ "groupnet-core",
+ "groupnet-runtime",
+ "groupnet-transport",
+ "groupnet-transport-mem",
+ "groupnet-transport-udp",
+]
+
+[[package]]
+name = "groupnet-consistency"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#cb3f706f580363b71864660c01f31215a2ff6a4c"
+dependencies = [
+ "groupnet-core",
+ "groupnet-runtime",
+ "tokio",
+]
+
+[[package]]
+name = "groupnet-core"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#cb3f706f580363b71864660c01f31215a2ff6a4c"
+
+[[package]]
+name = "groupnet-runtime"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#cb3f706f580363b71864660c01f31215a2ff6a4c"
+dependencies = [
+ "groupnet-core",
+ "groupnet-transport",
+ "tokio",
+]
+
+[[package]]
+name = "groupnet-transport"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#cb3f706f580363b71864660c01f31215a2ff6a4c"
+dependencies = [
+ "groupnet-core",
+]
+
+[[package]]
+name = "groupnet-transport-mem"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#cb3f706f580363b71864660c01f31215a2ff6a4c"
+dependencies = [
+ "groupnet-core",
+ "groupnet-transport",
+ "tokio",
+]
+
+[[package]]
+name = "groupnet-transport-udp"
+version = "0.1.0"
+source = "git+https://github.com/napbat/groupnet?branch=main#cb3f706f580363b71864660c01f31215a2ff6a4c"
+dependencies = [
+ "groupnet-core",
+ "groupnet-transport",
+ "tokio",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2695,6 +2761,7 @@ dependencies = [
  "bytes",
  "fred",
  "futures",
+ "groupnet",
  "hyper-util",
  "openraft",
  "rlimit",
@@ -3186,7 +3253,7 @@ dependencies = [
 [[package]]
 name = "tierstore"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
 dependencies = [
  "tierstore-core",
 ]
@@ -3194,12 +3261,12 @@ dependencies = [
 [[package]]
 name = "tierstore-core"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
 
 [[package]]
 name = "tierstore-mmap"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
 dependencies = [
  "bytes",
  "memmap2",
@@ -3209,7 +3276,7 @@ dependencies = [
 [[package]]
 name = "tierstore-moka"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#4b283b44323a0b4300af7402f193ac46d60f4ebc"
 dependencies = [
  "moka",
  "tierstore-core",

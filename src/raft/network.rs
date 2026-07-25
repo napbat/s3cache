@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest,
-    VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
 use openraft::{BasicNode, Raft, RaftNetwork, RaftNetworkFactory};
 
@@ -50,8 +50,10 @@ impl LoopbackConn {
     /// `RPCError<_, _, E>`, which keeps this reusable across the different RPC error types.
     fn handle(&self) -> Result<Raft<TypeConfig>, Unreachable> {
         self.reg.peer(self.target).ok_or_else(|| {
-            let io =
-                std::io::Error::new(std::io::ErrorKind::NotConnected, format!("peer {} not registered", self.target));
+            let io = std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("peer {} not registered", self.target),
+            );
             Unreachable::new(&io)
         })
     }
@@ -61,7 +63,10 @@ impl RaftNetworkFactory<TypeConfig> for Loopback {
     type Network = LoopbackConn;
 
     async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
-        LoopbackConn { reg: self.clone(), target }
+        LoopbackConn {
+            reg: self.clone(),
+            target,
+        }
     }
 }
 
@@ -72,7 +77,9 @@ impl RaftNetwork<TypeConfig> for LoopbackConn {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let raft = self.handle().map_err(RPCError::Unreachable)?;
-        raft.append_entries(rpc).await.map_err(|e| RemoteError::new(self.target, e).into())
+        raft.append_entries(rpc)
+            .await
+            .map_err(|e| RemoteError::new(self.target, e).into())
     }
 
     async fn vote(
@@ -81,16 +88,22 @@ impl RaftNetwork<TypeConfig> for LoopbackConn {
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let raft = self.handle().map_err(RPCError::Unreachable)?;
-        raft.vote(rpc).await.map_err(|e| RemoteError::new(self.target, e).into())
+        raft.vote(rpc)
+            .await
+            .map_err(|e| RemoteError::new(self.target, e).into())
     }
 
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>>
-    {
+    ) -> Result<
+        InstallSnapshotResponse<NodeId>,
+        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+    > {
         let raft = self.handle().map_err(RPCError::Unreachable)?;
-        raft.install_snapshot(rpc).await.map_err(|e| RemoteError::new(self.target, e).into())
+        raft.install_snapshot(rpc)
+            .await
+            .map_err(|e| RemoteError::new(self.target, e).into())
     }
 }

@@ -66,7 +66,9 @@ impl CachedObject {
 
     fn body_blob(&self) -> StreamingBlob {
         let b = self.body.clone();
-        StreamingBlob::wrap(futures::stream::once(async move { Ok::<Bytes, std::io::Error>(b) }))
+        StreamingBlob::wrap(futures::stream::once(async move {
+            Ok::<Bytes, std::io::Error>(b)
+        }))
     }
 
     /// Reconstruct a full-body GET response from the cached copy.
@@ -95,10 +97,14 @@ impl CachedObject {
             return None;
         }
         let last_incl = last.map_or(total - 1, |l| l.min(total - 1));
-        let slice = self.body.slice(usize::try_from(first).ok()?..=usize::try_from(last_incl).ok()?);
+        let slice = self
+            .body
+            .slice(usize::try_from(first).ok()?..=usize::try_from(last_incl).ok()?);
         let len = slice.len();
         Some(GetObjectOutput {
-            body: Some(StreamingBlob::wrap(futures::stream::once(async move { Ok::<Bytes, std::io::Error>(slice) }))),
+            body: Some(StreamingBlob::wrap(futures::stream::once(async move {
+                Ok::<Bytes, std::io::Error>(slice)
+            }))),
             content_length: Some(i64::try_from(len).unwrap_or(i64::MAX)),
             content_range: Some(format!("bytes {first}-{last_incl}/{total}")),
             content_type: self.content_type.clone(),
@@ -158,7 +164,11 @@ fn warm_key(bucket: &str, key: &str) -> String {
 /// The warm tier: typed objects over a byte-budgeted, restart-surviving mmap-disk store,
 /// with the blocking file I/O on a dedicated worker pool. The codec embeds the cache key
 /// in the encoding, so entries the disk tier evicts decode back fully typed.
-pub(crate) type WarmTier = OffloadTier<CodecTier<MmapDiskTier, CacheKey, Arc<CachedObject>>>;
+pub(crate) type WarmTier = OffloadTier<CodecTier<Arc<MmapDiskTier>, CacheKey, Arc<CachedObject>>>;
+
+/// A warm tier plus a maintenance handle to its underlying disk store (for
+/// [`LocalCache::flush`] — the tier stack has no whole-cache clear).
+pub(crate) type WarmPair = (WarmTier, Arc<MmapDiskTier>);
 
 /// Worker threads for the warm tier's blocking file I/O.
 const WARM_IO_THREADS: usize = 4;
@@ -167,14 +177,19 @@ const WARM_IO_THREADS: usize = 4;
 /// files already present are re-indexed so the cache survives restarts. Objects whose
 /// encoding exceeds `max_obj_bytes` are rejected by the codec — under the cache's
 /// best-effort write policy that skips the disk fill without failing the hot one.
-pub(crate) fn open_warm(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize) -> anyhow::Result<WarmTier> {
+pub(crate) fn open_warm(
+    dir: PathBuf,
+    disk_bytes: u64,
+    max_obj_bytes: usize,
+) -> anyhow::Result<WarmPair> {
     let budget = NonZeroU64::new(disk_bytes.max(1)).unwrap_or(NonZeroU64::MIN);
-    let disk = MmapDiskTier::open_bounded(dir, budget)?;
+    let disk = Arc::new(MmapDiskTier::open_bounded(dir, budget)?);
     let codec = CodecTier::new(
-        disk,
+        Arc::clone(&disk),
         |key: &CacheKey| warm_key(&key.0, &key.1),
         move |key: &CacheKey, obj: &Arc<CachedObject>| {
-            let bytes = bincode::serialize(&(key, obj.as_ref())).map_err(tierstore::BoxError::from)?;
+            let bytes =
+                bincode::serialize(&(key, obj.as_ref())).map_err(tierstore::BoxError::from)?;
             if bytes.len() > max_obj_bytes {
                 return Err("encoded object exceeds S3CACHE_MAX_OBJECT_BYTES".into());
             }
@@ -186,12 +201,20 @@ pub(crate) fn open_warm(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize) -> 
             Ok((key, Arc::new(obj)))
         },
     );
-    Ok(OffloadTier::new(codec, NonZeroUsize::new(WARM_IO_THREADS).unwrap_or(NonZeroUsize::MIN)))
+    let warm = OffloadTier::new(
+        codec,
+        NonZeroUsize::new(WARM_IO_THREADS).unwrap_or(NonZeroUsize::MIN),
+    );
+    Ok((warm, disk))
 }
 
 /// The shared cache core: the tierstore hierarchy plus fill gates and metrics.
 struct Core {
     cache: tierstore::TieredCache<CacheKey, Arc<CachedObject>>,
+    /// The hot tier, kept for whole-cache flushes (moka's `invalidate_all`).
+    hot: Arc<MokaTier<CacheKey, Arc<CachedObject>>>,
+    /// The warm disk store, kept for whole-cache flushes (`clear`).
+    warm_disk: Option<Arc<MmapDiskTier>>,
     fills: SingleFlight<CacheKey>,
     metrics: Arc<Metrics>,
     has_warm: bool,
@@ -234,6 +257,20 @@ impl Core {
             self.metrics.warm_error();
         }
     }
+
+    /// Drop EVERY local copy — the coarse remediation when an unknown set of
+    /// entries may be stale (a write-feed gap): the hot tier empties
+    /// immediately, the disk store unlinks its files on a blocking worker.
+    async fn flush(&self) {
+        self.hot.inner().invalidate_all();
+        if let Some(disk) = &self.warm_disk {
+            let disk = Arc::clone(disk);
+            let cleared = tokio::task::spawn_blocking(move || disk.clear()).await;
+            if !matches!(cleared, Ok(Ok(()))) {
+                self.metrics.warm_error();
+            }
+        }
+    }
 }
 
 /// The layered object-body cache handle held by the proxy.
@@ -246,13 +283,22 @@ impl TieredCache {
     /// optional warm disk tier. Fill singleflight is handled here (probe-then-gate), so
     /// the tierstore-level gate is disabled.
     #[must_use]
-    pub(crate) fn new(cache_bytes: u64, warm: Option<WarmTier>, metrics: Arc<Metrics>) -> Self {
-        let hot = MokaTier::bounded_weighted(cache_bytes, |_key: &CacheKey, obj: &Arc<CachedObject>| {
-            u32::try_from(obj.body.len()).unwrap_or(u32::MAX)
-        });
+    pub(crate) fn new(cache_bytes: u64, warm: Option<WarmPair>, metrics: Arc<Metrics>) -> Self {
+        let hot = Arc::new(MokaTier::bounded_weighted(
+            cache_bytes,
+            |_key: &CacheKey, obj: &Arc<CachedObject>| {
+                u32::try_from(obj.body.len()).unwrap_or(u32::MAX)
+            },
+        ));
         let has_warm = warm.is_some();
-        let builder = tierstore::TieredCache::builder().tier(hot).single_flight(false);
-        let cache = match warm {
+        let (warm_tier, warm_disk) = match warm {
+            Some((tier, disk)) => (Some(tier), Some(disk)),
+            None => (None, None),
+        };
+        let builder = tierstore::TieredCache::builder()
+            .tier(Arc::clone(&hot))
+            .single_flight(false);
+        let cache = match warm_tier {
             Some(warm) => builder.tier(warm),
             None => builder,
         }
@@ -260,6 +306,8 @@ impl TieredCache {
         Self {
             core: Arc::new(Core {
                 cache,
+                hot,
+                warm_disk,
                 fills: SingleFlight::new(),
                 metrics,
                 has_warm,
@@ -270,7 +318,9 @@ impl TieredCache {
     /// A handle the commit-log consumer uses to invalidate this node's local copies.
     #[must_use]
     pub(crate) fn local(&self) -> LocalCache {
-        LocalCache { core: Arc::clone(&self.core) }
+        LocalCache {
+            core: Arc::clone(&self.core),
+        }
     }
 
     /// Look up a whole cached object: hot, then warm disk (a disk hit promotes to hot).
@@ -331,17 +381,23 @@ impl LocalCache {
     pub(crate) async fn invalidate(&self, key: &CacheKey) {
         self.core.invalidate(key).await;
     }
+
+    /// Drop every node-local copy (see [`Core::flush`]) — used when peers'
+    /// writes were provably missed and the stale subset is unknowable.
+    pub(crate) async fn flush(&self) {
+        self.core.flush().await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer_body, open_warm, CachedObject, TieredCache};
+    use super::{CachedObject, TieredCache, buffer_body, open_warm};
     use crate::metrics::Metrics;
     use bytes::Bytes;
     use s3s::dto::{ETag, GetObjectOutput, Timestamp};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, UNIX_EPOCH};
     use tierstore::{TierRead, TierWrite};
 
@@ -357,7 +413,9 @@ mod tests {
             content_length: Some(5),
             content_type: Some("text/plain".to_owned()),
             e_tag: Some(ETag::Strong("\"deadbeef\"".to_owned())),
-            last_modified: Some(Timestamp::from(UNIX_EPOCH + Duration::from_secs(1_700_000_000))),
+            last_modified: Some(Timestamp::from(
+                UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            )),
             metadata: Some(HashMap::from([("k".to_owned(), "v".to_owned())])),
             ..Default::default()
         };
@@ -395,18 +453,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cap = 10 * 1024 * 1024;
 
-        let warm = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
+        let (warm, _disk) = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
         let obj = Arc::new(sample());
         warm.put(ck("b", "k"), obj.clone()).await.unwrap();
-        assert_eq!(warm.get(&ck("b", "k")).await.unwrap().expect("hit").body, obj.body);
+        assert_eq!(
+            warm.get(&ck("b", "k")).await.unwrap().expect("hit").body,
+            obj.body
+        );
         assert!(warm.get(&ck("b", "missing")).await.unwrap().is_none());
 
         // A fresh tier over the same dir re-indexes the file — survives a restart.
-        let warm2 = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
-        assert!(warm2.get(&ck("b", "k")).await.unwrap().is_some(), "warm tier survives restart");
+        let (warm2, _disk2) = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
+        assert!(
+            warm2.get(&ck("b", "k")).await.unwrap().is_some(),
+            "warm tier survives restart"
+        );
 
         warm2.delete(&ck("b", "k")).await.unwrap();
-        assert!(warm2.get(&ck("b", "k")).await.unwrap().is_none(), "invalidate deletes the entry");
+        assert!(
+            warm2.get(&ck("b", "k")).await.unwrap().is_none(),
+            "invalidate deletes the entry"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -430,13 +497,18 @@ mod tests {
             .expect("fetch");
         assert_eq!(fetched.body, obj.body);
         let served = cache
-            .get_or_fetch(&ck("b", "k2"), async { Err("origin must not be called".to_owned()) })
+            .get_or_fetch(&ck("b", "k2"), async {
+                Err("origin must not be called".to_owned())
+            })
             .await
             .expect("served from cache");
         assert_eq!(served.body, obj.body);
 
         cache.invalidate(&key).await;
-        assert!(cache.get(&key).await.is_none(), "invalidate drops all local copies");
+        assert!(
+            cache.get(&key).await.is_none(),
+            "invalidate drops all local copies"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -47,7 +47,12 @@ openraft::declare_raft_types!(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum IndexWrite {
     /// A key was written (or overwritten): insert/update it in the index.
-    Put { bucket: String, key: String, size: i64, ts_ms: u64 },
+    Put {
+        bucket: String,
+        key: String,
+        size: i64,
+        ts_ms: u64,
+    },
     /// A key was deleted: drop it from the index.
     Del { bucket: String, key: String },
 }

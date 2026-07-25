@@ -17,14 +17,20 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, StreamingBlob};
+use s3s::dto::{
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput,
+    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, GetObjectInput,
+    GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output,
+    PutObjectInput, PutObjectOutput, StreamingBlob,
+};
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
 use crate::coherence::IndexLog;
-use crate::index::{list_objects_v2_from_index, sync_bucket_into, BucketState, ObjEntry};
+use crate::index::{BucketState, ObjEntry, list_objects_v2_from_index, sync_bucket_into};
 use crate::metrics::Metrics;
-use crate::tier::{self, CachedObject, TieredCache, WarmTier};
+use crate::sync::WriteSync;
+use crate::tier::{self, CachedObject, TieredCache, WarmPair};
 
 /// Sizing for the object cache, passed to [`CachingProxy::new`].
 #[derive(Clone, Copy)]
@@ -51,6 +57,9 @@ pub(crate) struct CachingProxy {
     max_obj_bytes: usize,
     /// Shared commit log for cross-node index coherence, when configured.
     index_log: Option<IndexLog>,
+    /// Gossip write feed for fast cross-node body-cache invalidation, when
+    /// configured (see [`crate::sync`]).
+    sync: Option<Arc<WriteSync>>,
     metrics: Arc<Metrics>,
 }
 
@@ -62,8 +71,9 @@ impl CachingProxy {
         inner: s3s_aws::Proxy,
         client: aws_sdk_s3::Client,
         cfg: CacheConfig,
-        warm: Option<WarmTier>,
+        warm: Option<WarmPair>,
         index_log: Option<IndexLog>,
+        sync: Option<Arc<WriteSync>>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -73,8 +83,14 @@ impl CachingProxy {
             obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),
             max_obj_bytes: cfg.max_obj_bytes,
             index_log,
+            sync,
             metrics,
         }
+    }
+
+    /// A handle to this node's local tiers, for the gossip apply loop.
+    pub(crate) fn local_cache(&self) -> crate::tier::LocalCache {
+        self.obj_cache.local()
     }
 
     /// Strong-consistency read barrier: before serving a read from node-local state (the
@@ -105,16 +121,24 @@ impl CachingProxy {
         }
     }
 
-    /// Append a write to the shared commit log, if configured. No-op otherwise.
+    /// Advertise a durable write everywhere it matters: the shared commit log
+    /// (index coherence + read barrier) and the gossip write feed (fast
+    /// body-cache invalidation). Both are optional and idempotent.
     async fn log_put(&self, bucket: &str, key: &str, size: i64) {
         if let Some(log) = &self.index_log {
             log.append_put(bucket, key, size).await;
+        }
+        if let Some(sync) = &self.sync {
+            sync.publish(bucket, key).await;
         }
     }
 
     async fn log_del(&self, bucket: &str, key: &str) {
         if let Some(log) = &self.index_log {
             log.append_del(bucket, key).await;
+        }
+        if let Some(sync) = &self.sync {
+            sync.publish(bucket, key).await;
         }
     }
 
@@ -129,7 +153,9 @@ impl CachingProxy {
                 match sync_bucket_into(&client, &state, &bucket).await {
                     Ok(n) => info!("warmed LIST index for `{bucket}`: {n} keys"),
                     Err(e) => {
-                        tracing::warn!("background sync of `{bucket}` failed (staying passthrough): {e}");
+                        tracing::warn!(
+                            "background sync of `{bucket}` failed (staying passthrough): {e}"
+                        );
                     }
                 }
             }
@@ -138,10 +164,13 @@ impl CachingProxy {
 
     fn index_insert(&self, bucket: &str, key: &str, size: i64) {
         let mut g = self.state.write().unwrap();
-        g.entry(bucket.to_owned())
-            .or_default()
-            .keys
-            .insert(key.to_owned(), ObjEntry { size, last_modified: SystemTime::now() });
+        g.entry(bucket.to_owned()).or_default().keys.insert(
+            key.to_owned(),
+            ObjEntry {
+                size,
+                last_modified: SystemTime::now(),
+            },
+        );
         self.metrics.writes_indexed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -154,14 +183,26 @@ impl CachingProxy {
     /// The indexed size of a key, if this proxy has seen it (write-through or
     /// LIST warm-up). Drives the range-promotion decision without a HEAD.
     fn index_size(&self, bucket: &str, key: &str) -> Option<i64> {
-        self.state.read().unwrap().get(bucket).and_then(|b| b.keys.get(key)).map(|e| e.size)
+        self.state
+            .read()
+            .unwrap()
+            .get(bucket)
+            .and_then(|b| b.keys.get(key))
+            .map(|e| e.size)
     }
 
     /// The upstream's actual size of a key (one HEAD via the direct client).
     /// Used where the write path doesn't carry the size (multipart complete,
     /// copy) — indexing those at a placeholder poisons range promotion.
     async fn upstream_size(&self, bucket: &str, key: &str) -> Option<i64> {
-        self.client.head_object().bucket(bucket).key(key).send().await.ok()?.content_length()
+        self.client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .ok()?
+            .content_length()
     }
 
     /// Serve an int-range GET by promoting the whole object into the tiered cache (one
@@ -179,7 +220,11 @@ impl CachingProxy {
         last: Option<u64>,
     ) -> Option<S3Result<S3Response<GetObjectOutput>>> {
         let whole = S3Request {
-            input: { let mut i = req.input.clone(); i.range = None; i },
+            input: {
+                let mut i = req.input.clone();
+                i.range = None;
+                i
+            },
             method: req.method.clone(),
             uri: req.uri.clone(),
             headers: req.headers.clone(),
@@ -212,27 +257,45 @@ impl CachingProxy {
             Ok(obj) => {
                 self.metrics.range_promote.fetch_add(1, Ordering::Relaxed);
                 Some(obj.to_get_range(first, last).map_or_else(
-                    || Err(s3s::s3_error!(InvalidRange, "range start past end of object")),
+                    || {
+                        Err(s3s::s3_error!(
+                            InvalidRange,
+                            "range start past end of object"
+                        ))
+                    },
                     |out| Ok(S3Response::new(out)),
                 ))
             }
             Err(e) => {
                 // Self-heal a lying index entry so this object stops
                 // re-attempting promotion, then let the caller serve upstream.
-                if let Some(sz) = e.strip_prefix("oversize ").and_then(|r| r.split(' ').next()).and_then(|n| n.parse::<i64>().ok())
+                if let Some(sz) = e
+                    .strip_prefix("oversize ")
+                    .and_then(|r| r.split(' ').next())
+                    .and_then(|n| n.parse::<i64>().ok())
                     && sz >= 0
                 {
                     self.index_insert(&ckey.0, &ckey.1, sz);
                 }
-                self.metrics.range_promote_reject.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("range promote of {}/{} failed ({e}); falling back to passthrough", ckey.0, ckey.1);
+                self.metrics
+                    .range_promote_reject
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "range promote of {}/{} failed ({e}); falling back to passthrough",
+                    ckey.0,
+                    ckey.1
+                );
                 None
             }
         }
     }
 
     fn is_synced(&self, bucket: &str) -> bool {
-        self.state.read().unwrap().get(bucket).is_some_and(|b| b.synced)
+        self.state
+            .read()
+            .unwrap()
+            .get(bucket)
+            .is_some_and(|b| b.synced)
     }
 
     /// Build a `ListObjectsV2` response from this bucket's index. See
@@ -242,7 +305,6 @@ impl CachingProxy {
         list_objects_v2_from_index(g.get(inp.bucket.as_str()).map(|b| &b.keys), inp)
     }
 }
-
 
 #[async_trait]
 impl s3s::S3 for CachingProxy {
@@ -257,7 +319,9 @@ impl s3s::S3 for CachingProxy {
             let out = self.list_from_index(&req.input);
             return Ok(S3Response::new(out));
         }
-        self.metrics.list_passthrough.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .list_passthrough
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.list_objects_v2(req).await
     }
 
@@ -294,7 +358,13 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let bucket = req.input.bucket.clone();
-        let keys: Vec<String> = req.input.delete.objects.iter().map(|o| o.key.clone()).collect();
+        let keys: Vec<String> = req
+            .input
+            .delete
+            .objects
+            .iter()
+            .map(|o| o.key.clone())
+            .collect();
         let resp = self.inner.delete_objects(req).await?;
         for k in keys {
             self.index_remove(&bucket, &k);
@@ -378,41 +448,47 @@ impl s3s::S3 for CachingProxy {
             // upstream GET (deduped across concurrent ranges when hot is active), then
             // every range — this one included — is a slice. A refused/failed promote
             // degrades to the passthrough below, never an error.
-            let small = self
-                .index_size(&ckey.0, &ckey.1)
-                .is_some_and(|sz| sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes);
-            if small
-                && let Some(resp) = self.promote_range(&ckey, &req, first, last).await
-            {
+            let small = self.index_size(&ckey.0, &ckey.1).is_some_and(|sz| {
+                sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) <= self.max_obj_bytes
+            });
+            if small && let Some(resp) = self.promote_range(&ckey, &req, first, last).await {
                 return resp;
             }
             // Big, not-yet-indexed, or a failed promote: stream the range through.
             self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);
             return self.inner.get_object(req).await;
         }
-        if cacheable
-            && let Some(obj) = self.obj_cache.get(&ckey).await
-        {
+        if cacheable && let Some(obj) = self.obj_cache.get(&ckey).await {
             self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);
             return Ok(S3Response::new(obj.to_get()));
         }
         let mut resp = self.inner.get_object(req).await?;
         let len = resp.output.content_length.unwrap_or(-1);
         let small = len >= 0 && usize::try_from(len).unwrap_or(usize::MAX) <= self.max_obj_bytes;
-        if cacheable && small
+        if cacheable
+            && small
             && let Some(body) = resp.output.body.take()
         {
             match tier::buffer_body(body, self.max_obj_bytes).await {
                 Some(bytes) => {
                     self.obj_cache
-                        .insert(ckey, Arc::new(CachedObject::from_get(&resp.output, bytes.clone())))
+                        .insert(
+                            ckey,
+                            Arc::new(CachedObject::from_get(&resp.output, bytes.clone())),
+                        )
                         .await;
                     self.metrics.get_miss.fetch_add(1, Ordering::Relaxed);
-                    resp.output.body = Some(StreamingBlob::wrap(futures::stream::once(
-                        async move { Ok::<Bytes, std::io::Error>(bytes) },
-                    )));
+                    resp.output.body =
+                        Some(StreamingBlob::wrap(futures::stream::once(async move {
+                            Ok::<Bytes, std::io::Error>(bytes)
+                        })));
                 }
-                None => return Err(s3s::s3_error!(InternalError, "s3cache: failed to buffer body")),
+                None => {
+                    return Err(s3s::s3_error!(
+                        InternalError,
+                        "s3cache: failed to buffer body"
+                    ));
+                }
             }
         } else {
             self.metrics.get_bypass.fetch_add(1, Ordering::Relaxed);
@@ -444,274 +520,558 @@ impl s3s::S3 for CachingProxy {
 
     // Full S3 passthrough: every other op forwards to the upstream so any S3
     // client works, not just the cached read/write paths. Generated from the s3s S3 trait.
-    async fn abort_multipart_upload(&self, req: S3Request<s3s::dto::AbortMultipartUploadInput>) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::AbortMultipartUploadOutput>> {
         self.inner.abort_multipart_upload(req).await
     }
-    async fn create_bucket(&self, req: S3Request<s3s::dto::CreateBucketInput>) -> S3Result<S3Response<s3s::dto::CreateBucketOutput>> {
+    async fn create_bucket(
+        &self,
+        req: S3Request<s3s::dto::CreateBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateBucketOutput>> {
         self.inner.create_bucket(req).await
     }
-    async fn create_bucket_metadata_table_configuration(&self, req: S3Request<s3s::dto::CreateBucketMetadataTableConfigurationInput>) -> S3Result<S3Response<s3s::dto::CreateBucketMetadataTableConfigurationOutput>> {
-        self.inner.create_bucket_metadata_table_configuration(req).await
+    async fn create_bucket_metadata_table_configuration(
+        &self,
+        req: S3Request<s3s::dto::CreateBucketMetadataTableConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateBucketMetadataTableConfigurationOutput>> {
+        self.inner
+            .create_bucket_metadata_table_configuration(req)
+            .await
     }
-    async fn create_multipart_upload(&self, req: S3Request<s3s::dto::CreateMultipartUploadInput>) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<s3s::dto::CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateMultipartUploadOutput>> {
         self.inner.create_multipart_upload(req).await
     }
-    async fn create_session(&self, req: S3Request<s3s::dto::CreateSessionInput>) -> S3Result<S3Response<s3s::dto::CreateSessionOutput>> {
+    async fn create_session(
+        &self,
+        req: S3Request<s3s::dto::CreateSessionInput>,
+    ) -> S3Result<S3Response<s3s::dto::CreateSessionOutput>> {
         self.inner.create_session(req).await
     }
-    async fn delete_bucket(&self, req: S3Request<s3s::dto::DeleteBucketInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
+    async fn delete_bucket(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
         self.inner.delete_bucket(req).await
     }
-    async fn delete_bucket_analytics_configuration(&self, req: S3Request<s3s::dto::DeleteBucketAnalyticsConfigurationInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketAnalyticsConfigurationOutput>> {
+    async fn delete_bucket_analytics_configuration(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketAnalyticsConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketAnalyticsConfigurationOutput>> {
         self.inner.delete_bucket_analytics_configuration(req).await
     }
-    async fn delete_bucket_cors(&self, req: S3Request<s3s::dto::DeleteBucketCorsInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketCorsOutput>> {
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketCorsOutput>> {
         self.inner.delete_bucket_cors(req).await
     }
-    async fn delete_bucket_encryption(&self, req: S3Request<s3s::dto::DeleteBucketEncryptionInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketEncryptionOutput>> {
+    async fn delete_bucket_encryption(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketEncryptionInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketEncryptionOutput>> {
         self.inner.delete_bucket_encryption(req).await
     }
-    async fn delete_bucket_intelligent_tiering_configuration(&self, req: S3Request<s3s::dto::DeleteBucketIntelligentTieringConfigurationInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketIntelligentTieringConfigurationOutput>> {
-        self.inner.delete_bucket_intelligent_tiering_configuration(req).await
+    async fn delete_bucket_intelligent_tiering_configuration(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketIntelligentTieringConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketIntelligentTieringConfigurationOutput>> {
+        self.inner
+            .delete_bucket_intelligent_tiering_configuration(req)
+            .await
     }
-    async fn delete_bucket_inventory_configuration(&self, req: S3Request<s3s::dto::DeleteBucketInventoryConfigurationInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketInventoryConfigurationOutput>> {
+    async fn delete_bucket_inventory_configuration(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketInventoryConfigurationOutput>> {
         self.inner.delete_bucket_inventory_configuration(req).await
     }
-    async fn delete_bucket_lifecycle(&self, req: S3Request<s3s::dto::DeleteBucketLifecycleInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketLifecycleOutput>> {
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketLifecycleOutput>> {
         self.inner.delete_bucket_lifecycle(req).await
     }
-    async fn delete_bucket_metadata_table_configuration(&self, req: S3Request<s3s::dto::DeleteBucketMetadataTableConfigurationInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketMetadataTableConfigurationOutput>> {
-        self.inner.delete_bucket_metadata_table_configuration(req).await
+    async fn delete_bucket_metadata_table_configuration(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketMetadataTableConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketMetadataTableConfigurationOutput>> {
+        self.inner
+            .delete_bucket_metadata_table_configuration(req)
+            .await
     }
-    async fn delete_bucket_metrics_configuration(&self, req: S3Request<s3s::dto::DeleteBucketMetricsConfigurationInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketMetricsConfigurationOutput>> {
+    async fn delete_bucket_metrics_configuration(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketMetricsConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketMetricsConfigurationOutput>> {
         self.inner.delete_bucket_metrics_configuration(req).await
     }
-    async fn delete_bucket_ownership_controls(&self, req: S3Request<s3s::dto::DeleteBucketOwnershipControlsInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketOwnershipControlsOutput>> {
+    async fn delete_bucket_ownership_controls(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketOwnershipControlsInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketOwnershipControlsOutput>> {
         self.inner.delete_bucket_ownership_controls(req).await
     }
-    async fn delete_bucket_policy(&self, req: S3Request<s3s::dto::DeleteBucketPolicyInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketPolicyOutput>> {
+    async fn delete_bucket_policy(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketPolicyInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketPolicyOutput>> {
         self.inner.delete_bucket_policy(req).await
     }
-    async fn delete_bucket_replication(&self, req: S3Request<s3s::dto::DeleteBucketReplicationInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketReplicationOutput>> {
+    async fn delete_bucket_replication(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketReplicationOutput>> {
         self.inner.delete_bucket_replication(req).await
     }
-    async fn delete_bucket_tagging(&self, req: S3Request<s3s::dto::DeleteBucketTaggingInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketTaggingOutput>> {
+    async fn delete_bucket_tagging(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketTaggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketTaggingOutput>> {
         self.inner.delete_bucket_tagging(req).await
     }
-    async fn delete_bucket_website(&self, req: S3Request<s3s::dto::DeleteBucketWebsiteInput>) -> S3Result<S3Response<s3s::dto::DeleteBucketWebsiteOutput>> {
+    async fn delete_bucket_website(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketWebsiteInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketWebsiteOutput>> {
         self.inner.delete_bucket_website(req).await
     }
-    async fn delete_object_tagging(&self, req: S3Request<s3s::dto::DeleteObjectTaggingInput>) -> S3Result<S3Response<s3s::dto::DeleteObjectTaggingOutput>> {
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<s3s::dto::DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteObjectTaggingOutput>> {
         self.inner.delete_object_tagging(req).await
     }
-    async fn delete_public_access_block(&self, req: S3Request<s3s::dto::DeletePublicAccessBlockInput>) -> S3Result<S3Response<s3s::dto::DeletePublicAccessBlockOutput>> {
+    async fn delete_public_access_block(
+        &self,
+        req: S3Request<s3s::dto::DeletePublicAccessBlockInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeletePublicAccessBlockOutput>> {
         self.inner.delete_public_access_block(req).await
     }
-    async fn get_bucket_accelerate_configuration(&self, req: S3Request<s3s::dto::GetBucketAccelerateConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketAccelerateConfigurationOutput>> {
+    async fn get_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketAccelerateConfigurationOutput>> {
         self.inner.get_bucket_accelerate_configuration(req).await
     }
-    async fn get_bucket_acl(&self, req: S3Request<s3s::dto::GetBucketAclInput>) -> S3Result<S3Response<s3s::dto::GetBucketAclOutput>> {
+    async fn get_bucket_acl(
+        &self,
+        req: S3Request<s3s::dto::GetBucketAclInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketAclOutput>> {
         self.inner.get_bucket_acl(req).await
     }
-    async fn get_bucket_analytics_configuration(&self, req: S3Request<s3s::dto::GetBucketAnalyticsConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketAnalyticsConfigurationOutput>> {
+    async fn get_bucket_analytics_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketAnalyticsConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketAnalyticsConfigurationOutput>> {
         self.inner.get_bucket_analytics_configuration(req).await
     }
-    async fn get_bucket_cors(&self, req: S3Request<s3s::dto::GetBucketCorsInput>) -> S3Result<S3Response<s3s::dto::GetBucketCorsOutput>> {
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<s3s::dto::GetBucketCorsInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketCorsOutput>> {
         self.inner.get_bucket_cors(req).await
     }
-    async fn get_bucket_encryption(&self, req: S3Request<s3s::dto::GetBucketEncryptionInput>) -> S3Result<S3Response<s3s::dto::GetBucketEncryptionOutput>> {
+    async fn get_bucket_encryption(
+        &self,
+        req: S3Request<s3s::dto::GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketEncryptionOutput>> {
         self.inner.get_bucket_encryption(req).await
     }
-    async fn get_bucket_intelligent_tiering_configuration(&self, req: S3Request<s3s::dto::GetBucketIntelligentTieringConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketIntelligentTieringConfigurationOutput>> {
-        self.inner.get_bucket_intelligent_tiering_configuration(req).await
+    async fn get_bucket_intelligent_tiering_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketIntelligentTieringConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketIntelligentTieringConfigurationOutput>> {
+        self.inner
+            .get_bucket_intelligent_tiering_configuration(req)
+            .await
     }
-    async fn get_bucket_inventory_configuration(&self, req: S3Request<s3s::dto::GetBucketInventoryConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketInventoryConfigurationOutput>> {
+    async fn get_bucket_inventory_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketInventoryConfigurationOutput>> {
         self.inner.get_bucket_inventory_configuration(req).await
     }
-    async fn get_bucket_lifecycle_configuration(&self, req: S3Request<s3s::dto::GetBucketLifecycleConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketLifecycleConfigurationOutput>> {
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketLifecycleConfigurationOutput>> {
         self.inner.get_bucket_lifecycle_configuration(req).await
     }
-    async fn get_bucket_location(&self, req: S3Request<s3s::dto::GetBucketLocationInput>) -> S3Result<S3Response<s3s::dto::GetBucketLocationOutput>> {
+    async fn get_bucket_location(
+        &self,
+        req: S3Request<s3s::dto::GetBucketLocationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketLocationOutput>> {
         self.inner.get_bucket_location(req).await
     }
-    async fn get_bucket_logging(&self, req: S3Request<s3s::dto::GetBucketLoggingInput>) -> S3Result<S3Response<s3s::dto::GetBucketLoggingOutput>> {
+    async fn get_bucket_logging(
+        &self,
+        req: S3Request<s3s::dto::GetBucketLoggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketLoggingOutput>> {
         self.inner.get_bucket_logging(req).await
     }
-    async fn get_bucket_metadata_table_configuration(&self, req: S3Request<s3s::dto::GetBucketMetadataTableConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketMetadataTableConfigurationOutput>> {
-        self.inner.get_bucket_metadata_table_configuration(req).await
+    async fn get_bucket_metadata_table_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketMetadataTableConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketMetadataTableConfigurationOutput>> {
+        self.inner
+            .get_bucket_metadata_table_configuration(req)
+            .await
     }
-    async fn get_bucket_metrics_configuration(&self, req: S3Request<s3s::dto::GetBucketMetricsConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketMetricsConfigurationOutput>> {
+    async fn get_bucket_metrics_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketMetricsConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketMetricsConfigurationOutput>> {
         self.inner.get_bucket_metrics_configuration(req).await
     }
-    async fn get_bucket_notification_configuration(&self, req: S3Request<s3s::dto::GetBucketNotificationConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetBucketNotificationConfigurationOutput>> {
+    async fn get_bucket_notification_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketNotificationConfigurationOutput>> {
         self.inner.get_bucket_notification_configuration(req).await
     }
-    async fn get_bucket_ownership_controls(&self, req: S3Request<s3s::dto::GetBucketOwnershipControlsInput>) -> S3Result<S3Response<s3s::dto::GetBucketOwnershipControlsOutput>> {
+    async fn get_bucket_ownership_controls(
+        &self,
+        req: S3Request<s3s::dto::GetBucketOwnershipControlsInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketOwnershipControlsOutput>> {
         self.inner.get_bucket_ownership_controls(req).await
     }
-    async fn get_bucket_policy(&self, req: S3Request<s3s::dto::GetBucketPolicyInput>) -> S3Result<S3Response<s3s::dto::GetBucketPolicyOutput>> {
+    async fn get_bucket_policy(
+        &self,
+        req: S3Request<s3s::dto::GetBucketPolicyInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketPolicyOutput>> {
         self.inner.get_bucket_policy(req).await
     }
-    async fn get_bucket_policy_status(&self, req: S3Request<s3s::dto::GetBucketPolicyStatusInput>) -> S3Result<S3Response<s3s::dto::GetBucketPolicyStatusOutput>> {
+    async fn get_bucket_policy_status(
+        &self,
+        req: S3Request<s3s::dto::GetBucketPolicyStatusInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketPolicyStatusOutput>> {
         self.inner.get_bucket_policy_status(req).await
     }
-    async fn get_bucket_replication(&self, req: S3Request<s3s::dto::GetBucketReplicationInput>) -> S3Result<S3Response<s3s::dto::GetBucketReplicationOutput>> {
+    async fn get_bucket_replication(
+        &self,
+        req: S3Request<s3s::dto::GetBucketReplicationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketReplicationOutput>> {
         self.inner.get_bucket_replication(req).await
     }
-    async fn get_bucket_request_payment(&self, req: S3Request<s3s::dto::GetBucketRequestPaymentInput>) -> S3Result<S3Response<s3s::dto::GetBucketRequestPaymentOutput>> {
+    async fn get_bucket_request_payment(
+        &self,
+        req: S3Request<s3s::dto::GetBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketRequestPaymentOutput>> {
         self.inner.get_bucket_request_payment(req).await
     }
-    async fn get_bucket_tagging(&self, req: S3Request<s3s::dto::GetBucketTaggingInput>) -> S3Result<S3Response<s3s::dto::GetBucketTaggingOutput>> {
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<s3s::dto::GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketTaggingOutput>> {
         self.inner.get_bucket_tagging(req).await
     }
-    async fn get_bucket_versioning(&self, req: S3Request<s3s::dto::GetBucketVersioningInput>) -> S3Result<S3Response<s3s::dto::GetBucketVersioningOutput>> {
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<s3s::dto::GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketVersioningOutput>> {
         self.inner.get_bucket_versioning(req).await
     }
-    async fn get_bucket_website(&self, req: S3Request<s3s::dto::GetBucketWebsiteInput>) -> S3Result<S3Response<s3s::dto::GetBucketWebsiteOutput>> {
+    async fn get_bucket_website(
+        &self,
+        req: S3Request<s3s::dto::GetBucketWebsiteInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetBucketWebsiteOutput>> {
         self.inner.get_bucket_website(req).await
     }
-    async fn get_object_acl(&self, req: S3Request<s3s::dto::GetObjectAclInput>) -> S3Result<S3Response<s3s::dto::GetObjectAclOutput>> {
+    async fn get_object_acl(
+        &self,
+        req: S3Request<s3s::dto::GetObjectAclInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetObjectAclOutput>> {
         self.inner.get_object_acl(req).await
     }
-    async fn get_object_attributes(&self, req: S3Request<s3s::dto::GetObjectAttributesInput>) -> S3Result<S3Response<s3s::dto::GetObjectAttributesOutput>> {
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<s3s::dto::GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetObjectAttributesOutput>> {
         self.inner.get_object_attributes(req).await
     }
-    async fn get_object_legal_hold(&self, req: S3Request<s3s::dto::GetObjectLegalHoldInput>) -> S3Result<S3Response<s3s::dto::GetObjectLegalHoldOutput>> {
+    async fn get_object_legal_hold(
+        &self,
+        req: S3Request<s3s::dto::GetObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetObjectLegalHoldOutput>> {
         self.inner.get_object_legal_hold(req).await
     }
-    async fn get_object_lock_configuration(&self, req: S3Request<s3s::dto::GetObjectLockConfigurationInput>) -> S3Result<S3Response<s3s::dto::GetObjectLockConfigurationOutput>> {
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<s3s::dto::GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetObjectLockConfigurationOutput>> {
         self.inner.get_object_lock_configuration(req).await
     }
-    async fn get_object_retention(&self, req: S3Request<s3s::dto::GetObjectRetentionInput>) -> S3Result<S3Response<s3s::dto::GetObjectRetentionOutput>> {
+    async fn get_object_retention(
+        &self,
+        req: S3Request<s3s::dto::GetObjectRetentionInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetObjectRetentionOutput>> {
         self.inner.get_object_retention(req).await
     }
-    async fn get_object_tagging(&self, req: S3Request<s3s::dto::GetObjectTaggingInput>) -> S3Result<S3Response<s3s::dto::GetObjectTaggingOutput>> {
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<s3s::dto::GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetObjectTaggingOutput>> {
         self.inner.get_object_tagging(req).await
     }
-    async fn get_object_torrent(&self, req: S3Request<s3s::dto::GetObjectTorrentInput>) -> S3Result<S3Response<s3s::dto::GetObjectTorrentOutput>> {
+    async fn get_object_torrent(
+        &self,
+        req: S3Request<s3s::dto::GetObjectTorrentInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetObjectTorrentOutput>> {
         self.inner.get_object_torrent(req).await
     }
-    async fn get_public_access_block(&self, req: S3Request<s3s::dto::GetPublicAccessBlockInput>) -> S3Result<S3Response<s3s::dto::GetPublicAccessBlockOutput>> {
+    async fn get_public_access_block(
+        &self,
+        req: S3Request<s3s::dto::GetPublicAccessBlockInput>,
+    ) -> S3Result<S3Response<s3s::dto::GetPublicAccessBlockOutput>> {
         self.inner.get_public_access_block(req).await
     }
-    async fn head_bucket(&self, req: S3Request<s3s::dto::HeadBucketInput>) -> S3Result<S3Response<s3s::dto::HeadBucketOutput>> {
+    async fn head_bucket(
+        &self,
+        req: S3Request<s3s::dto::HeadBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::HeadBucketOutput>> {
         self.inner.head_bucket(req).await
     }
-    async fn list_bucket_analytics_configurations(&self, req: S3Request<s3s::dto::ListBucketAnalyticsConfigurationsInput>) -> S3Result<S3Response<s3s::dto::ListBucketAnalyticsConfigurationsOutput>> {
+    async fn list_bucket_analytics_configurations(
+        &self,
+        req: S3Request<s3s::dto::ListBucketAnalyticsConfigurationsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListBucketAnalyticsConfigurationsOutput>> {
         self.inner.list_bucket_analytics_configurations(req).await
     }
-    async fn list_bucket_intelligent_tiering_configurations(&self, req: S3Request<s3s::dto::ListBucketIntelligentTieringConfigurationsInput>) -> S3Result<S3Response<s3s::dto::ListBucketIntelligentTieringConfigurationsOutput>> {
-        self.inner.list_bucket_intelligent_tiering_configurations(req).await
+    async fn list_bucket_intelligent_tiering_configurations(
+        &self,
+        req: S3Request<s3s::dto::ListBucketIntelligentTieringConfigurationsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListBucketIntelligentTieringConfigurationsOutput>> {
+        self.inner
+            .list_bucket_intelligent_tiering_configurations(req)
+            .await
     }
-    async fn list_bucket_inventory_configurations(&self, req: S3Request<s3s::dto::ListBucketInventoryConfigurationsInput>) -> S3Result<S3Response<s3s::dto::ListBucketInventoryConfigurationsOutput>> {
+    async fn list_bucket_inventory_configurations(
+        &self,
+        req: S3Request<s3s::dto::ListBucketInventoryConfigurationsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListBucketInventoryConfigurationsOutput>> {
         self.inner.list_bucket_inventory_configurations(req).await
     }
-    async fn list_bucket_metrics_configurations(&self, req: S3Request<s3s::dto::ListBucketMetricsConfigurationsInput>) -> S3Result<S3Response<s3s::dto::ListBucketMetricsConfigurationsOutput>> {
+    async fn list_bucket_metrics_configurations(
+        &self,
+        req: S3Request<s3s::dto::ListBucketMetricsConfigurationsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListBucketMetricsConfigurationsOutput>> {
         self.inner.list_bucket_metrics_configurations(req).await
     }
-    async fn list_buckets(&self, req: S3Request<s3s::dto::ListBucketsInput>) -> S3Result<S3Response<s3s::dto::ListBucketsOutput>> {
+    async fn list_buckets(
+        &self,
+        req: S3Request<s3s::dto::ListBucketsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListBucketsOutput>> {
         self.inner.list_buckets(req).await
     }
-    async fn list_directory_buckets(&self, req: S3Request<s3s::dto::ListDirectoryBucketsInput>) -> S3Result<S3Response<s3s::dto::ListDirectoryBucketsOutput>> {
+    async fn list_directory_buckets(
+        &self,
+        req: S3Request<s3s::dto::ListDirectoryBucketsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListDirectoryBucketsOutput>> {
         self.inner.list_directory_buckets(req).await
     }
-    async fn list_multipart_uploads(&self, req: S3Request<s3s::dto::ListMultipartUploadsInput>) -> S3Result<S3Response<s3s::dto::ListMultipartUploadsOutput>> {
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<s3s::dto::ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListMultipartUploadsOutput>> {
         self.inner.list_multipart_uploads(req).await
     }
-    async fn list_object_versions(&self, req: S3Request<s3s::dto::ListObjectVersionsInput>) -> S3Result<S3Response<s3s::dto::ListObjectVersionsOutput>> {
+    async fn list_object_versions(
+        &self,
+        req: S3Request<s3s::dto::ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListObjectVersionsOutput>> {
         self.inner.list_object_versions(req).await
     }
-    async fn list_objects(&self, req: S3Request<s3s::dto::ListObjectsInput>) -> S3Result<S3Response<s3s::dto::ListObjectsOutput>> {
+    async fn list_objects(
+        &self,
+        req: S3Request<s3s::dto::ListObjectsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListObjectsOutput>> {
         self.inner.list_objects(req).await
     }
-    async fn list_parts(&self, req: S3Request<s3s::dto::ListPartsInput>) -> S3Result<S3Response<s3s::dto::ListPartsOutput>> {
+    async fn list_parts(
+        &self,
+        req: S3Request<s3s::dto::ListPartsInput>,
+    ) -> S3Result<S3Response<s3s::dto::ListPartsOutput>> {
         self.inner.list_parts(req).await
     }
-    async fn put_bucket_accelerate_configuration(&self, req: S3Request<s3s::dto::PutBucketAccelerateConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutBucketAccelerateConfigurationOutput>> {
+    async fn put_bucket_accelerate_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutBucketAccelerateConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketAccelerateConfigurationOutput>> {
         self.inner.put_bucket_accelerate_configuration(req).await
     }
-    async fn put_bucket_acl(&self, req: S3Request<s3s::dto::PutBucketAclInput>) -> S3Result<S3Response<s3s::dto::PutBucketAclOutput>> {
+    async fn put_bucket_acl(
+        &self,
+        req: S3Request<s3s::dto::PutBucketAclInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketAclOutput>> {
         self.inner.put_bucket_acl(req).await
     }
-    async fn put_bucket_analytics_configuration(&self, req: S3Request<s3s::dto::PutBucketAnalyticsConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutBucketAnalyticsConfigurationOutput>> {
+    async fn put_bucket_analytics_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutBucketAnalyticsConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketAnalyticsConfigurationOutput>> {
         self.inner.put_bucket_analytics_configuration(req).await
     }
-    async fn put_bucket_cors(&self, req: S3Request<s3s::dto::PutBucketCorsInput>) -> S3Result<S3Response<s3s::dto::PutBucketCorsOutput>> {
+    async fn put_bucket_cors(
+        &self,
+        req: S3Request<s3s::dto::PutBucketCorsInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketCorsOutput>> {
         self.inner.put_bucket_cors(req).await
     }
-    async fn put_bucket_encryption(&self, req: S3Request<s3s::dto::PutBucketEncryptionInput>) -> S3Result<S3Response<s3s::dto::PutBucketEncryptionOutput>> {
+    async fn put_bucket_encryption(
+        &self,
+        req: S3Request<s3s::dto::PutBucketEncryptionInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketEncryptionOutput>> {
         self.inner.put_bucket_encryption(req).await
     }
-    async fn put_bucket_intelligent_tiering_configuration(&self, req: S3Request<s3s::dto::PutBucketIntelligentTieringConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutBucketIntelligentTieringConfigurationOutput>> {
-        self.inner.put_bucket_intelligent_tiering_configuration(req).await
+    async fn put_bucket_intelligent_tiering_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutBucketIntelligentTieringConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketIntelligentTieringConfigurationOutput>> {
+        self.inner
+            .put_bucket_intelligent_tiering_configuration(req)
+            .await
     }
-    async fn put_bucket_inventory_configuration(&self, req: S3Request<s3s::dto::PutBucketInventoryConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutBucketInventoryConfigurationOutput>> {
+    async fn put_bucket_inventory_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutBucketInventoryConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketInventoryConfigurationOutput>> {
         self.inner.put_bucket_inventory_configuration(req).await
     }
-    async fn put_bucket_lifecycle_configuration(&self, req: S3Request<s3s::dto::PutBucketLifecycleConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutBucketLifecycleConfigurationOutput>> {
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketLifecycleConfigurationOutput>> {
         self.inner.put_bucket_lifecycle_configuration(req).await
     }
-    async fn put_bucket_logging(&self, req: S3Request<s3s::dto::PutBucketLoggingInput>) -> S3Result<S3Response<s3s::dto::PutBucketLoggingOutput>> {
+    async fn put_bucket_logging(
+        &self,
+        req: S3Request<s3s::dto::PutBucketLoggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketLoggingOutput>> {
         self.inner.put_bucket_logging(req).await
     }
-    async fn put_bucket_metrics_configuration(&self, req: S3Request<s3s::dto::PutBucketMetricsConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutBucketMetricsConfigurationOutput>> {
+    async fn put_bucket_metrics_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutBucketMetricsConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketMetricsConfigurationOutput>> {
         self.inner.put_bucket_metrics_configuration(req).await
     }
-    async fn put_bucket_notification_configuration(&self, req: S3Request<s3s::dto::PutBucketNotificationConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutBucketNotificationConfigurationOutput>> {
+    async fn put_bucket_notification_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutBucketNotificationConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketNotificationConfigurationOutput>> {
         self.inner.put_bucket_notification_configuration(req).await
     }
-    async fn put_bucket_ownership_controls(&self, req: S3Request<s3s::dto::PutBucketOwnershipControlsInput>) -> S3Result<S3Response<s3s::dto::PutBucketOwnershipControlsOutput>> {
+    async fn put_bucket_ownership_controls(
+        &self,
+        req: S3Request<s3s::dto::PutBucketOwnershipControlsInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketOwnershipControlsOutput>> {
         self.inner.put_bucket_ownership_controls(req).await
     }
-    async fn put_bucket_policy(&self, req: S3Request<s3s::dto::PutBucketPolicyInput>) -> S3Result<S3Response<s3s::dto::PutBucketPolicyOutput>> {
+    async fn put_bucket_policy(
+        &self,
+        req: S3Request<s3s::dto::PutBucketPolicyInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketPolicyOutput>> {
         self.inner.put_bucket_policy(req).await
     }
-    async fn put_bucket_replication(&self, req: S3Request<s3s::dto::PutBucketReplicationInput>) -> S3Result<S3Response<s3s::dto::PutBucketReplicationOutput>> {
+    async fn put_bucket_replication(
+        &self,
+        req: S3Request<s3s::dto::PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketReplicationOutput>> {
         self.inner.put_bucket_replication(req).await
     }
-    async fn put_bucket_request_payment(&self, req: S3Request<s3s::dto::PutBucketRequestPaymentInput>) -> S3Result<S3Response<s3s::dto::PutBucketRequestPaymentOutput>> {
+    async fn put_bucket_request_payment(
+        &self,
+        req: S3Request<s3s::dto::PutBucketRequestPaymentInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketRequestPaymentOutput>> {
         self.inner.put_bucket_request_payment(req).await
     }
-    async fn put_bucket_tagging(&self, req: S3Request<s3s::dto::PutBucketTaggingInput>) -> S3Result<S3Response<s3s::dto::PutBucketTaggingOutput>> {
+    async fn put_bucket_tagging(
+        &self,
+        req: S3Request<s3s::dto::PutBucketTaggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketTaggingOutput>> {
         self.inner.put_bucket_tagging(req).await
     }
-    async fn put_bucket_versioning(&self, req: S3Request<s3s::dto::PutBucketVersioningInput>) -> S3Result<S3Response<s3s::dto::PutBucketVersioningOutput>> {
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<s3s::dto::PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketVersioningOutput>> {
         self.inner.put_bucket_versioning(req).await
     }
-    async fn put_bucket_website(&self, req: S3Request<s3s::dto::PutBucketWebsiteInput>) -> S3Result<S3Response<s3s::dto::PutBucketWebsiteOutput>> {
+    async fn put_bucket_website(
+        &self,
+        req: S3Request<s3s::dto::PutBucketWebsiteInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutBucketWebsiteOutput>> {
         self.inner.put_bucket_website(req).await
     }
-    async fn put_object_acl(&self, req: S3Request<s3s::dto::PutObjectAclInput>) -> S3Result<S3Response<s3s::dto::PutObjectAclOutput>> {
+    async fn put_object_acl(
+        &self,
+        req: S3Request<s3s::dto::PutObjectAclInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectAclOutput>> {
         self.inner.put_object_acl(req).await
     }
-    async fn put_object_legal_hold(&self, req: S3Request<s3s::dto::PutObjectLegalHoldInput>) -> S3Result<S3Response<s3s::dto::PutObjectLegalHoldOutput>> {
+    async fn put_object_legal_hold(
+        &self,
+        req: S3Request<s3s::dto::PutObjectLegalHoldInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectLegalHoldOutput>> {
         self.inner.put_object_legal_hold(req).await
     }
-    async fn put_object_lock_configuration(&self, req: S3Request<s3s::dto::PutObjectLockConfigurationInput>) -> S3Result<S3Response<s3s::dto::PutObjectLockConfigurationOutput>> {
+    async fn put_object_lock_configuration(
+        &self,
+        req: S3Request<s3s::dto::PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectLockConfigurationOutput>> {
         self.inner.put_object_lock_configuration(req).await
     }
-    async fn put_object_retention(&self, req: S3Request<s3s::dto::PutObjectRetentionInput>) -> S3Result<S3Response<s3s::dto::PutObjectRetentionOutput>> {
+    async fn put_object_retention(
+        &self,
+        req: S3Request<s3s::dto::PutObjectRetentionInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectRetentionOutput>> {
         self.inner.put_object_retention(req).await
     }
-    async fn put_object_tagging(&self, req: S3Request<s3s::dto::PutObjectTaggingInput>) -> S3Result<S3Response<s3s::dto::PutObjectTaggingOutput>> {
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<s3s::dto::PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutObjectTaggingOutput>> {
         self.inner.put_object_tagging(req).await
     }
-    async fn put_public_access_block(&self, req: S3Request<s3s::dto::PutPublicAccessBlockInput>) -> S3Result<S3Response<s3s::dto::PutPublicAccessBlockOutput>> {
+    async fn put_public_access_block(
+        &self,
+        req: S3Request<s3s::dto::PutPublicAccessBlockInput>,
+    ) -> S3Result<S3Response<s3s::dto::PutPublicAccessBlockOutput>> {
         self.inner.put_public_access_block(req).await
     }
-    async fn restore_object(&self, req: S3Request<s3s::dto::RestoreObjectInput>) -> S3Result<S3Response<s3s::dto::RestoreObjectOutput>> {
+    async fn restore_object(
+        &self,
+        req: S3Request<s3s::dto::RestoreObjectInput>,
+    ) -> S3Result<S3Response<s3s::dto::RestoreObjectOutput>> {
         self.inner.restore_object(req).await
     }
-    async fn select_object_content(&self, req: S3Request<s3s::dto::SelectObjectContentInput>) -> S3Result<S3Response<s3s::dto::SelectObjectContentOutput>> {
+    async fn select_object_content(
+        &self,
+        req: S3Request<s3s::dto::SelectObjectContentInput>,
+    ) -> S3Result<S3Response<s3s::dto::SelectObjectContentOutput>> {
         self.inner.select_object_content(req).await
     }
-    async fn upload_part(&self, req: S3Request<s3s::dto::UploadPartInput>) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
+    async fn upload_part(
+        &self,
+        req: S3Request<s3s::dto::UploadPartInput>,
+    ) -> S3Result<S3Response<s3s::dto::UploadPartOutput>> {
         self.inner.upload_part(req).await
     }
-    async fn upload_part_copy(&self, req: S3Request<s3s::dto::UploadPartCopyInput>) -> S3Result<S3Response<s3s::dto::UploadPartCopyOutput>> {
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<s3s::dto::UploadPartCopyInput>,
+    ) -> S3Result<S3Response<s3s::dto::UploadPartCopyOutput>> {
         self.inner.upload_part_copy(req).await
     }
-    async fn write_get_object_response(&self, req: S3Request<s3s::dto::WriteGetObjectResponseInput>) -> S3Result<S3Response<s3s::dto::WriteGetObjectResponseOutput>> {
+    async fn write_get_object_response(
+        &self,
+        req: S3Request<s3s::dto::WriteGetObjectResponseInput>,
+    ) -> S3Result<S3Response<s3s::dto::WriteGetObjectResponseOutput>> {
         self.inner.write_get_object_response(req).await
     }
 }

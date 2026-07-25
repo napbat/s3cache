@@ -34,21 +34,39 @@ async fn cluster(n: NodeId) -> Vec<Node> {
     let mut rafts = Vec::new();
     for id in 1..=n {
         let sm = Arc::new(StateMachineStore::default());
-        let raft = Raft::new(id, test_config(), net.clone(), LogStore::default(), sm.clone()).await.unwrap();
+        let raft = Raft::new(
+            id,
+            test_config(),
+            net.clone(),
+            LogStore::default(),
+            sm.clone(),
+        )
+        .await
+        .unwrap();
         // Register before initialize: uninitialized nodes send no RPCs, so every peer is
         // present by the time the cluster forms — no election race.
         net.register(id, raft.clone());
         sms.push(sm);
         rafts.push((id, raft));
     }
-    let members: BTreeMap<NodeId, BasicNode> = (1..=n).map(|id| (id, BasicNode::default())).collect();
+    let members: BTreeMap<NodeId, BasicNode> =
+        (1..=n).map(|id| (id, BasicNode::default())).collect();
     rafts[0].1.initialize(members).await.unwrap();
-    rafts.into_iter().zip(sms).map(|((id, raft), sm)| (id, raft, sm)).collect()
+    rafts
+        .into_iter()
+        .zip(sms)
+        .map(|((id, raft), sm)| (id, raft, sm))
+        .collect()
 }
 
 /// This node's currently-indexed size for `bucket/key`, or `None` if absent.
 fn indexed(sm: &StateMachineStore, bucket: &str, key: &str) -> Option<i64> {
-    sm.index().read().unwrap().get(bucket).and_then(|b| b.keys.get(key)).map(|e| e.size)
+    sm.index()
+        .read()
+        .unwrap()
+        .get(bucket)
+        .and_then(|b| b.keys.get(key))
+        .map(|e| e.size)
 }
 
 /// Propose a write, retrying across nodes until the current leader accepts it (a follower
@@ -68,7 +86,10 @@ async fn propose(nodes: &[Node], write: &IndexWrite) {
 /// Wait until every node's index agrees on `bucket/key == expect`.
 async fn converged(nodes: &[Node], bucket: &str, key: &str, expect: Option<i64>) -> bool {
     for _ in 0..100 {
-        if nodes.iter().all(|(_, _, sm)| indexed(sm, bucket, key) == expect) {
+        if nodes
+            .iter()
+            .all(|(_, _, sm)| indexed(sm, bucket, key) == expect)
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -83,11 +104,19 @@ async fn shutdown(nodes: Vec<Node>) {
 }
 
 fn put(bucket: &str, key: &str, size: i64, ts_ms: u64) -> IndexWrite {
-    IndexWrite::Put { bucket: bucket.to_owned(), key: key.to_owned(), size, ts_ms }
+    IndexWrite::Put {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        size,
+        ts_ms,
+    }
 }
 
 fn del(bucket: &str, key: &str) -> IndexWrite {
-    IndexWrite::Del { bucket: bucket.to_owned(), key: key.to_owned() }
+    IndexWrite::Del {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+    }
 }
 
 #[tokio::test]
@@ -95,20 +124,33 @@ async fn cluster_replicates_writes_to_every_node() {
     let nodes = cluster(3).await;
 
     propose(&nodes, &put("b", "k1", 42, 1)).await;
-    assert!(converged(&nodes, "b", "k1", Some(42)).await, "a put on the leader reaches every node");
+    assert!(
+        converged(&nodes, "b", "k1", Some(42)).await,
+        "a put on the leader reaches every node"
+    );
 
     propose(&nodes, &put("b", "k1", 7, 2)).await;
-    assert!(converged(&nodes, "b", "k1", Some(7)).await, "an overwrite converges everywhere");
+    assert!(
+        converged(&nodes, "b", "k1", Some(7)).await,
+        "an overwrite converges everywhere"
+    );
 
     propose(&nodes, &del("b", "k1")).await;
-    assert!(converged(&nodes, "b", "k1", None).await, "a delete converges everywhere");
+    assert!(
+        converged(&nodes, "b", "k1", None).await,
+        "a delete converges everywhere"
+    );
 
     // A burst of distinct keys must all replicate (ordering + throughput, not just one key).
     for i in 0..20_i64 {
         propose(&nodes, &put("b", &format!("m{i}"), i, 1)).await;
     }
     let all_present = |nodes: &[Node]| {
-        (0..20_i64).all(|i| nodes.iter().all(|(_, _, sm)| indexed(sm, "b", &format!("m{i}")) == Some(i)))
+        (0..20_i64).all(|i| {
+            nodes
+                .iter()
+                .all(|(_, _, sm)| indexed(sm, "b", &format!("m{i}")) == Some(i))
+        })
     };
     let mut ok = false;
     for _ in 0..100 {
@@ -145,7 +187,11 @@ async fn linearizable_read_sees_the_latest_write() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(observed, Some(5), "a linearizable read must observe the just-committed write");
+    assert_eq!(
+        observed,
+        Some(5),
+        "a linearizable read must observe the just-committed write"
+    );
 
     shutdown(nodes).await;
 }
@@ -156,9 +202,16 @@ async fn applied_write_invalidates_local_object_cache() {
     // anti-stale-read guarantee the old Valkey-log consumer provided, now driven by apply.
     let nodes = cluster(1).await;
 
-    let hot = TieredCache::new(1024 * 1024, None, Arc::new(crate::metrics::Metrics::default()));
+    let hot = TieredCache::new(
+        1024 * 1024,
+        None,
+        Arc::new(crate::metrics::Metrics::default()),
+    );
     let ck = ("b".to_owned(), "k".to_owned());
-    let stale = Arc::new(CachedObject::from_get(&GetObjectOutput::default(), Bytes::from_static(b"stale")));
+    let stale = Arc::new(CachedObject::from_get(
+        &GetObjectOutput::default(),
+        Bytes::from_static(b"stale"),
+    ));
     hot.insert(ck.clone(), stale).await;
     assert!(hot.get(&ck).await.is_some(), "seeded a stale hot copy");
     nodes[0].2.set_local(hot.local());
@@ -173,7 +226,10 @@ async fn applied_write_invalidates_local_object_cache() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(gone, "an applied write must invalidate the node-local hot cache");
+    assert!(
+        gone,
+        "an applied write must invalidate the node-local hot cache"
+    );
 
     shutdown(nodes).await;
 }
