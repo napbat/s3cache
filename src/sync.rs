@@ -430,11 +430,10 @@ pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
                         group.add_peer(NodeId::new(id.as_str()));
                         registered = Some(sock);
                     }
-                    Some(_) => {}
                     None if registered.is_none() => {
                         warn!("gossip seed `{id}={addr}` not resolving yet; will keep trying");
                     }
-                    None => {}
+                    Some(_) | None => {}
                 }
                 tokio::time::sleep(SEED_REFRESH).await;
             }
