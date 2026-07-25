@@ -49,76 +49,73 @@ hot (in-memory, small)  ->  warm (node-local disk, large, optional)  ->  cold (S
 - **cold** — the S3 origin.
 
 Both tiers are node-local; cross-node coherence is handled separately (below): a peer's
-write invalidates the local hot *and* disk copies, and reads barrier on the commit log.
+write invalidates the local hot *and* disk copies, and strict reads barrier on feed heads.
 
-## Cross-node coherence (index commit log)
+## Cross-node coherence (gossip write feed)
 
 By default each replica keeps its own LIST index, so running more than one would let
-their indexes drift. Setting **`S3CACHE_INDEX_LOG=true`** (with `S3CACHE_VALKEY_URL`)
-turns on a shared, ordered **commit log** — a Valkey Stream — that fixes this:
+their indexes drift. Setting **`S3CACHE_GOSSIP_BIND`** (with `S3CACHE_GOSSIP_SEEDS` as
+comma-separated `id=host:port` pairs) turns on the **gossip write feed** — groupnet's
+consistency layer, no broker, no consensus service, no extra infrastructure:
 
-- every write appends one compact event (`put`/`del` + bucket/key/size) to the stream;
-- every replica runs a background consumer that tails the stream and applies peers'
-  events to its own local index and drops the key from its local hot cache.
+- every durable write publishes one compact event (`put`/`del` + bucket/key/size/ts)
+  into this node's feed, pushed to live peers at network latency;
+- every replica runs an apply loop that folds peers' events into its own LIST index
+  (per-key last-writer-wins; deletes win timestamp ties via tombstones) and drops the
+  key from its local hot *and* disk copies.
 
-So the fast path stays in local memory (LIST is still served from RAM, no per-request
-Valkey round-trip) while writes on any node reach all nodes. The log is **replayable** —
-each node tracks its position and resumes after a reconnect, so it can't miss an event
-the way fire-and-forget pub/sub can. On startup a node captures the stream tail, does its
-one full LIST bootstrap, then replays from that point (re-applying is idempotent), so no
-write slips through the gap. The stream is capped (`S3CACHE_INDEX_LOG_MAXLEN`, approximate
-`MAXLEN` trimming). Appends are best-effort with a timeout: if Valkey is down a write
-still succeeds and peers re-converge on their next restart/bootstrap.
+The fast path stays in local memory (LIST is served from RAM; nothing remote is on the
+read path). Loss is **detected, never silent**: a peer that falls behind the feed's ring,
+or a peer restart, surfaces as a *gap* — the node flushes its local tiers and resyncs its
+index from the origin, which is the authority the index caches. Only seeds need static
+addressing; every other peer resolves through gossiped advertisements.
 
-With the index log on, **multiple replicas are safe** — this is the mechanism that lifts
-the historical single-replica constraint. It works with any body-cache mode (e.g. `hot`
-bodies + a coherent shared index).
-
-Roadmap: **OCC** (atomic read-modify-write) on top of the log — the stream is already the
-linearization order, so a conditional write becomes "append if the version is unchanged."
-The same log is the durability journal for future write-back coalescing.
+With the feed on, **multiple replicas are safe** — this lifts the historical
+single-replica constraint with zero extra services.
 
 ## Consistency
 
-s3cache is **always strongly consistent** — indistinguishable from talking to S3
-directly, including across nodes. There is no eventual/relaxed mode: an object store that
-can return stale reads is a footgun, so it isn't offered.
+Single-node s3cache is **strongly consistent** — the proxy is the sole path to the
+bucket, so its index and cache observe every write. Multi-node coherence is **honestly
+bounded** rather than falsely absolute:
 
-- **Read-after-write, same node and across nodes.** A read served from node-local state —
-  a `LIST` from the index, or a `GET`/`HEAD` of a hot body copy — first *barriers* on the
-  commit log: it reads the stream tail and waits for this node's consumer to catch up
-  before answering, so a peer's just-completed write is never read stale. A write completes
-  only after its log event is appended, so any write ordered before the read is waited for.
-  The shared `warm` tier is synchronously invalidated on write and is never stale, so it
-  needs no barrier. Cost: one `XREVRANGE` + a usually-zero wait per cache-served read;
-  Valkey stays off the query path (the index/body stay local, only the fence is remote).
-  The barrier no-ops if Valkey is unreachable (see [resilience](#testing-coherence-and-parity)).
-- **Conditional writes / OCC** are correct by construction — the origin is the authority,
-  so a conditional `If-Match`/`If-None-Match` write is arbitrated at the origin and can
-  never lose an update. Requests the cache cannot reproduce faithfully — a specific
-  `versionId`, `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
-
-Single-node deployments (and any without the index log) are strongly consistent inherently
-— the proxy is the sole writer.
+- **Freshness barrier.** A read served from node-local state — a `LIST` from the index,
+  or a `GET`/`HEAD` of a hot body copy — first waits until every peer's
+  *currently-advertised* feed head has been applied locally. Staleness is bounded by one
+  push/gossip hop (typically ~1 RTT with eager delta push): a write completes on its node
+  and reaches peers' barriers as soon as its feed head propagates. The barrier degrades
+  to serving current state after 1s rather than hanging the request.
+- **Per-writer ordering, cross-writer LWW.** One node's writes apply everywhere in its
+  order. Concurrent writes to the *same key through different nodes* resolve by
+  timestamp (deletes win ties) — and the **origin arbitrates real conflicts**:
+  conditional `If-Match`/`If-None-Match` writes pass through and are decided at the
+  origin (OCC), which can never lose an update. The index is a cache of origin state and
+  heals from it (gap resync, startup bootstrap).
+- **Roadmap.** The feed already returns read-your-writes session tokens
+  (`(writer, epoch, seq)`); surfacing them in API responses would give clients strict
+  read-after-write across nodes regardless of propagation timing.
+Requests the cache cannot reproduce faithfully — a specific `versionId`,
+`ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
 
 ### Testing coherence and parity
 
-- **Unit / protocol tests** (`cargo test`): the coherence tests against a live Valkey run
-  only when `S3CACHE_TEST_VALKEY_URL` is set, e.g.
-  `S3CACHE_TEST_VALKEY_URL=redis://127.0.0.1:6379 cargo test`. They cover peer-write hot
-  invalidation, the startup bootstrap/replay window, resume-from-position, ordering,
-  multi-bucket convergence, and `MAXLEN` trimming.
-- **End-to-end** (`scripts/coherence-e2e.sh`): spins up MinIO + Valkey and runs two boto3
-  harnesses against **real s3cache nodes**. Needs podman/docker and `python3` + `boto3`.
+- **Unit / protocol tests** (`cargo test`): fully in-process — real groupnet nodes over
+  an in-memory transport, no external services. They cover peer-write index folding +
+  hot invalidation, out-of-order LWW convergence (tombstones, delete-wins-ties,
+  no-resurrection), the freshness barrier, and the flush path.
+- **End-to-end** (`scripts/coherence-e2e.sh`): spins up MinIO and runs boto3
+  harnesses against **real s3cache nodes** gossiping over loopback UDP. Needs
+  podman/docker and `python3` + `boto3`.
   - `parity_e2e.py` — **differential parity**: every operation through the cache returns
     the same as talking to S3 directly (GET bytes/headers/metadata, HEAD, ranged GET, LIST
     with prefix/delimiter/pagination/`StartAfter`, conditional PUT & GET / OCC, DELETE,
     multipart, copy), plus cross-node reads.
   - `coherence_e2e.py` — a write on one node is seen by another (LIST, no-stale GET,
     DELETE, both directions).
-  - `resilience_e2e.py` — a **Valkey outage is not a data-plane outage**: with Valkey
-    down, PUT/GET/LIST stay correct and fast (served from the origin, no timeout stalls),
-    and cross-node coherence resumes once Valkey recovers.
+  - `resilience_e2e.py` — a **peer outage is not a data-plane outage**: with its peer
+    down, a node's PUT/GET/LIST stay correct and fast (the barrier never waits on a dead
+    peer), and coherence resumes both ways after the peer restarts — including the
+    fresh-epoch gap path (flush + origin resync), exercised end to end.
 
 ## Config (env)
 
@@ -131,11 +128,9 @@ Single-node deployments (and any without the index log) are strongly consistent 
 | `S3CACHE_MAX_OBJECT_BYTES` | `8388608` (8 MB) | Per-object cache cap; bigger objects stream through |
 | `S3CACHE_DISK_CACHE` | (empty) | Directory for the warm disk tier; unset = no disk tier |
 | `S3CACHE_DISK_CACHE_BYTES` | `10737418240` (10 GB) | Warm disk tier capacity (bytes) |
-| `S3CACHE_VALKEY_URL` | (required for log) | Valkey/Redis URL for the index commit log, e.g. `redis://valkey:6379` |
-| `S3CACHE_VALKEY_POOL` | `4` | Valkey connections per replica |
-| `S3CACHE_INDEX_LOG` | `false` | Share the LIST index across replicas via a Valkey commit log (see [above](#cross-node-coherence-index-commit-log)) |
-| `S3CACHE_INDEX_LOG_MAXLEN` | `1000000` | Approximate max entries kept in the log stream |
-| `S3CACHE_INDEX_LOG_STREAM` | `s3cache:index:log` | Valkey stream key for the commit log |
+| `S3CACHE_GOSSIP_BIND` | (empty) | UDP bind for the gossip write feed (e.g. `0.0.0.0:7946`); unset = single-node, no coherence layer |
+| `S3CACHE_GOSSIP_SEEDS` | (empty) | Comma-separated seed peers as `id=host:port`; only seeds need static addressing |
+| `S3CACHE_GOSSIP_ADVERTISE` | bind addr | Address peers should dial back (set under NAT/container networking) |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval (seconds) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Upstream creds (R2: region `auto`) |
 

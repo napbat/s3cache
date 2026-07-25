@@ -1,7 +1,8 @@
 """Shared helpers for the s3cache end-to-end tests.
 
-Config from env, boto3 S3 clients, and launching real s3cache nodes in front of a shared
-MinIO (the S3 origin) and Valkey. Imported by coherence_e2e.py and parity_e2e.py.
+Config from env, boto3 S3 clients, and launching real s3cache nodes in front of a
+shared MinIO (the S3 origin), coherent over the gossip write feed. Imported by
+coherence_e2e.py and parity_e2e.py.
 """
 import os
 import socket
@@ -14,7 +15,6 @@ from botocore.exceptions import ClientError
 
 BIN = os.environ.get("S3CACHE_BIN", "target/release/s3cache")
 MINIO = os.environ.get("MINIO_ENDPOINT", "http://127.0.0.1:9000")
-VALKEY = os.environ.get("VALKEY_URL", "redis://127.0.0.1:6379")
 KEY = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
 SECRET = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
@@ -44,16 +44,20 @@ def wait_port(port, timeout=15):
     return False
 
 
-def start_node(name, port, bucket, index_log=True, extra=None):
+def start_node(name, port, bucket, gossip_port=None, seeds="", extra=None):
+    """Launch one s3cache node. `gossip_port` binds the write feed (UDP);
+    `seeds` is the comma-separated `id=host:port` peer list."""
     env = dict(os.environ,
                S3CACHE_LISTEN=f"127.0.0.1:{port}",
                S3CACHE_UPSTREAM_ENDPOINT=MINIO,
-               S3CACHE_VALKEY_URL=VALKEY,
-               S3CACHE_INDEX_LOG="true" if index_log else "false",
                S3CACHE_BUCKETS=bucket,
                S3CACHE_STATS_SECS="3600",
                AWS_ACCESS_KEY_ID=KEY, AWS_SECRET_ACCESS_KEY=SECRET, AWS_REGION=REGION,
                HOSTNAME=name, RUST_LOG="warn")
+    if gossip_port:
+        env.update(S3CACHE_GOSSIP_BIND=f"127.0.0.1:{gossip_port}",
+                   S3CACHE_GOSSIP_ADVERTISE=f"127.0.0.1:{gossip_port}",
+                   S3CACHE_GOSSIP_SEEDS=seeds)
     if extra:
         env.update(extra)
     logf = open(f"/tmp/s3cache-{name}.log", "w")

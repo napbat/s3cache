@@ -2,17 +2,12 @@
 //! S3 (e.g. R2), and layers LIST-from-index + a hot/warm/cold body cache on top. This is
 //! the entry point: it wires config, the upstream client, the cache tiers, and the HTTP
 //! server. The proxy lives in `cache`, with the LIST index in `index`, the object-body
-//! tiers in `tier`, the cross-node commit log in `coherence`, and counters in `metrics`.
+//! tiers in `tier`, cross-node coherence (the gossip write feed) in `sync`, and counters
+//! in `metrics`.
 
 mod cache;
-mod coherence;
 mod index;
 mod metrics;
-// The embedded Raft index-coherence substrate (replacing the Valkey commit log). Test-gated
-// until it is wired into the proxy's read/write paths, so it adds nothing to the binary yet
-// but is fully compiled, clippy-checked (`--all-targets`), and exercised by its own tests.
-#[cfg(test)]
-mod raft;
 mod sync;
 mod tier;
 
@@ -29,6 +24,24 @@ use tracing::info;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+/// Wire the gossip apply loop into the proxy: peers' events fold into the
+/// LIST index and invalidate local copies; a gap flushes and resyncs.
+fn start_coherence(
+    cp: &cache::CachingProxy,
+    write_sync: Option<&Arc<sync::WriteSync>>,
+    buckets: &[String],
+    metrics: &Arc<metrics::Metrics>,
+) {
+    if let Some(write_sync) = write_sync {
+        write_sync.start_apply(
+            cp.local_cache(),
+            cp.index_state(),
+            cp.gap_resync_handle(buckets.to_vec()),
+            metrics.clone(),
+        );
+    }
 }
 
 #[tokio::main]
@@ -82,49 +95,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         )?)
     };
 
-    // Cross-node coherence via a Valkey Streams commit log (the only Valkey use). With it
-    // on, reads from node-local state barrier on the log so a peer's just-completed write
-    // is never read stale — always strongly consistent, not optional. Single-node without
-    // the log is already strict (sole writer).
     let node_name = env_or("HOSTNAME", "s3cache");
 
-    // Optional gossip write feed: fast cross-node body-cache invalidation at network
-    // latency, alongside (not instead of) the commit log. Set S3CACHE_GOSSIP_BIND (and
-    // S3CACHE_GOSSIP_SEEDS as comma-separated id=host:port pairs) to enable.
+    // Cross-node coherence: the gossip write feed (see `sync`). Peers' writes fold into
+    // the LIST index and invalidate local body copies at network latency; strict reads
+    // barrier on feed heads. Set S3CACHE_GOSSIP_BIND (and S3CACHE_GOSSIP_SEEDS as
+    // comma-separated id=host:port pairs) to enable; single-node needs none of it.
     let write_sync = sync::from_env(&node_name).await.map(Arc::new);
     info!("gossip coherence (write feed): {}", write_sync.is_some());
 
-    let index_log_on = matches!(
-        env_or("S3CACHE_INDEX_LOG", "false")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "true" | "1" | "on" | "yes"
-    );
-    let index_log = if index_log_on {
-        let url = std::env::var("S3CACHE_VALKEY_URL")
-            .expect("S3CACHE_VALKEY_URL is required when the index log is enabled");
-        let pool_size: usize = env_or("S3CACHE_VALKEY_POOL", "4").parse().unwrap_or(4);
-        let pool = coherence::connect_valkey(&url, pool_size)?;
-        let read = coherence::connect_valkey_client(&url)?;
-        let stream = env_or("S3CACHE_INDEX_LOG_STREAM", "s3cache:index:log");
-        let maxlen: u64 = env_or("S3CACHE_INDEX_LOG_MAXLEN", "1000000")
-            .parse()
-            .unwrap_or(1_000_000);
-        info!("index log enabled: stream `{stream}` maxlen ~{maxlen} node `{node_name}`");
-        Some(coherence::IndexLog::new(
-            pool,
-            read,
-            stream,
-            maxlen,
-            node_name.clone(),
-            metrics.clone(),
-        ))
-    } else {
-        None
-    };
-
-    info!("index log (cross-node coherence): {index_log_on}");
     let cfg = cache::CacheConfig {
         cache_bytes,
         max_obj_bytes,
@@ -134,17 +113,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         client,
         cfg,
         disk,
-        index_log,
         write_sync.clone(),
         metrics.clone(),
     );
-
-    // Start tailing the shared commit log BEFORE the bootstrap LIST, so the replay window
-    // begins at-or-before the LIST's snapshot and no peer write slips through the gap.
-    cp.start_index_log().await;
-    if let Some(write_sync) = &write_sync {
-        write_sync.start_apply(cp.local_cache());
-    }
 
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the
@@ -157,6 +128,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
+    start_coherence(&cp, write_sync.as_ref(), &buckets, &metrics);
     cp.spawn_background_sync(buckets);
     let stats_secs: u64 = env_or("S3CACHE_STATS_SECS", "60").parse().unwrap_or(60);
     metrics::spawn_stats(cp.metrics(), stats_secs);

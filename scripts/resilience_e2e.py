@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Resilience test: a Valkey (cache) outage must not degrade the S3 data plane.
+"""Resilience test: a peer-node outage must not degrade the S3 data plane.
 
-With Valkey down, s3cache must keep serving PUT/GET/LIST correctly and *fast* (from the
-origin) — a cache outage is not a data-plane outage — and cross-node coherence must
-resume once Valkey recovers.
-
-Controls the Valkey container itself, so it only runs when VALKEY_CONTAINER (and RUNTIME,
-default `podman`) are set; otherwise it skips. Exits 0/1.
+With its peer down, an s3cache node must keep serving PUT/GET/LIST correctly and
+*fast* (the freshness barrier waits only on already-applied feed heads, never on a
+dead peer) — a peer outage is not a data-plane outage. When the peer comes back it
+returns in a fresh feed epoch: the survivor sees a gap, flushes, resyncs its index
+from the origin, and cross-node coherence resumes in both directions. Exits 0/1.
 """
-import os
-import subprocess
 import sys
 import time
 
@@ -17,12 +14,12 @@ import _s3cache_e2e as h
 
 BUCKET = "resilience-test"
 PORT_A, PORT_B = 18071, 18072
-RUNTIME = os.environ.get("RUNTIME", "podman")
-CONTAINER = os.environ.get("VALKEY_CONTAINER")
+GOSSIP_A, GOSSIP_B = 19071, 19072
 
 
-def valkey(action):
-    subprocess.run([RUNTIME, action, CONTAINER], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+def start_b():
+    return h.start_node("resB", PORT_B, BUCKET, gossip_port=GOSSIP_B,
+                        seeds=f"resA=127.0.0.1:{GOSSIP_A}")
 
 
 def keys(cli):
@@ -36,14 +33,11 @@ def timed(fn):
 
 
 def main():
-    if not CONTAINER:
-        print("skip resilience_e2e: set VALKEY_CONTAINER (and RUNTIME) to run")
-        return 0
-
     d = h.direct()
     h.reset_bucket(d, BUCKET)
-    a = h.start_node("resA", PORT_A, BUCKET)
-    b = h.start_node("resB", PORT_B, BUCKET)
+    a = h.start_node("resA", PORT_A, BUCKET, gossip_port=GOSSIP_A,
+                     seeds=f"resB=127.0.0.1:{GOSSIP_B}")
+    b = start_b()
     fails = []
 
     def check(name, ok, detail=""):
@@ -56,44 +50,51 @@ def main():
         time.sleep(1.5)
         pa, pb = h.s3(f"http://127.0.0.1:{PORT_A}"), h.s3(f"http://127.0.0.1:{PORT_B}")
 
-        # Baseline: coherence works while Valkey is up.
+        # Baseline: coherence works with both nodes up.
         pa.put_object(Bucket=BUCKET, Key="base", Body=b"1")
-        check("baseline: B sees A's write (Valkey up)", h.poll(lambda: "base" in keys(pb)) is not None)
+        check("baseline: B sees A's write", h.poll(lambda: "base" in keys(pb)) is not None)
 
-        # Kill Valkey; the data plane must stay correct AND fast.
-        print(">>> stopping Valkey")
-        valkey("stop")
+        # Kill the peer; A's data plane must stay correct AND fast.
+        print(">>> stopping node B")
+        h.stop_nodes(b)
         time.sleep(0.5)
 
         put_ms = timed(lambda: pa.put_object(Bucket=BUCKET, Key="down", Body=b"payload"))
         get_ms = timed(lambda: pa.get_object(Bucket=BUCKET, Key="down")["Body"].read())
         list_ms = timed(lambda: keys(pa))
 
-        check("Valkey down: GET returns correct bytes == direct",
+        check("peer down: GET returns correct bytes == direct",
               pa.get_object(Bucket=BUCKET, Key="down")["Body"].read()
               == d.get_object(Bucket=BUCKET, Key="down")["Body"].read())
-        check("Valkey down: LIST works", "down" in keys(pa))
-        check("Valkey down: PUT is fast, not the 2s timeout (< 500ms)", put_ms < 500, f"{put_ms:.0f}ms")
-        check("Valkey down: GET is fast (< 500ms)", get_ms < 500, f"{get_ms:.0f}ms")
-        check("Valkey down: LIST is fast (< 500ms)", list_ms < 500, f"{list_ms:.0f}ms")
+        check("peer down: LIST works", "down" in keys(pa))
+        check("peer down: PUT is fast (< 500ms)", put_ms < 500, f"{put_ms:.0f}ms")
+        check("peer down: GET is fast (< 500ms)", get_ms < 500, f"{get_ms:.0f}ms")
+        check("peer down: LIST is fast (< 500ms)", list_ms < 500, f"{list_ms:.0f}ms")
 
-        # Bring Valkey back; coherence must resume.
-        print(">>> starting Valkey")
-        valkey("start")
-        time.sleep(2.0)  # reconnect
+        # Bring the peer back (fresh feed epoch); coherence must resume both ways.
+        print(">>> restarting node B")
+        b = start_b()
+        assert h.wait_port(PORT_B), "restarted node did not bind"
+        time.sleep(2.0)  # rejoin gossip + bootstrap LIST
+        pb = h.s3(f"http://127.0.0.1:{PORT_B}")
+
         pa.put_object(Bucket=BUCKET, Key="recovered", Body=b"back")
-        check("after recovery: B sees A's new write again",
+        check("after restart: B sees A's new write",
               h.poll(lambda: "recovered" in keys(pb), timeout=15) is not None)
+        # B's writes arrive in a new epoch: A takes the gap (flush + origin
+        # resync) and then converges — the loud-recovery path, end to end.
+        pb.put_object(Bucket=BUCKET, Key="from-b", Body=b"epoch2")
+        check("after restart: A sees B's write (new epoch, gap-resync path)",
+              h.poll(lambda: "from-b" in keys(pa), timeout=20) is not None)
     except Exception as e:  # noqa: BLE001
         fails.append(f"harness error: {e!r}")
     finally:
         h.stop_nodes(a, b)
-        valkey("start")  # leave it running for any following steps
 
     if fails:
         print(f"\nFAILED ({len(fails)}): {fails}")
         return 1
-    print("\nALL RESILIENCE CHECKS PASSED (cache outage != data-plane outage)")
+    print("\nALL RESILIENCE CHECKS PASSED (peer outage != data-plane outage)")
     return 0
 
 

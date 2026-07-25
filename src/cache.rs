@@ -9,6 +9,8 @@
 //! index warms lazily — LISTs pass through until a bucket's background full-LIST sync
 //! completes ([`CachingProxy::is_synced`] gates the flip), then observed writes keep it
 //! current. The body cache is separately lazy: populate on miss, invalidate on write.
+//! Cross-node coherence rides the gossip write feed (see [`crate::sync`]): peers' writes
+//! fold into the index and invalidate local copies; strict reads barrier on feed heads.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -26,8 +28,9 @@ use s3s::dto::{
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
-use crate::coherence::IndexLog;
-use crate::index::{BucketState, ObjEntry, list_objects_v2_from_index, sync_bucket_into};
+use crate::index::{
+    BucketState, apply_del, apply_put, list_objects_v2_from_index, sync_bucket_into,
+};
 use crate::metrics::Metrics;
 use crate::sync::WriteSync;
 use crate::tier::{self, CachedObject, TieredCache, WarmPair};
@@ -40,6 +43,10 @@ pub(crate) struct CacheConfig {
     /// Objects larger than this are never cached.
     pub(crate) max_obj_bytes: usize,
 }
+
+/// How long a strict read waits for the freshness barrier before serving
+/// current state anyway (degrading to eventual rather than hanging).
+const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
 /// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
@@ -55,24 +62,21 @@ pub(crate) struct CachingProxy {
     obj_cache: TieredCache,
     /// Objects larger than this are never cached (segments stream straight through).
     max_obj_bytes: usize,
-    /// Shared commit log for cross-node index coherence, when configured.
-    index_log: Option<IndexLog>,
-    /// Gossip write feed for fast cross-node body-cache invalidation, when
+    /// Gossip write feed — the whole cross-node coherence layer, when
     /// configured (see [`crate::sync`]).
     sync: Option<Arc<WriteSync>>,
     metrics: Arc<Metrics>,
 }
 
 impl CachingProxy {
-    /// Wire up the proxy. `cfg` sizes the hot tier; `disk` is the optional node-local disk
-    /// (warm) tier and `index_log` the shared commit log (both built by the caller).
-    /// `metrics` is shared so the tiers, the log, and the stats task all report into it.
+    /// Wire up the proxy. `cfg` sizes the hot tier; `warm` is the optional node-local
+    /// disk tier and `sync` the gossip write feed (both built by the caller). `metrics`
+    /// is shared so the tiers, the feed, and the stats task all report into it.
     pub(crate) fn new(
         inner: s3s_aws::Proxy,
         client: aws_sdk_s3::Client,
         cfg: CacheConfig,
         warm: Option<WarmPair>,
-        index_log: Option<IndexLog>,
         sync: Option<Arc<WriteSync>>,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -82,10 +86,40 @@ impl CachingProxy {
             state: Arc::new(RwLock::new(HashMap::new())),
             obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),
             max_obj_bytes: cfg.max_obj_bytes,
-            index_log,
             sync,
             metrics,
         }
+    }
+
+    /// The shared LIST index, for the gossip apply loop.
+    pub(crate) fn index_state(&self) -> Arc<RwLock<HashMap<String, BucketState>>> {
+        self.state.clone()
+    }
+
+    /// The gap remediation for the apply loop: reset every bucket to
+    /// passthrough (unsynced LISTs are always correct) and re-warm the
+    /// configured ones from the origin — the authority the index caches.
+    pub(crate) fn gap_resync_handle(&self, buckets: Vec<String>) -> Arc<dyn Fn() + Send + Sync> {
+        let client = self.client.clone();
+        let state = self.state.clone();
+        Arc::new(move || {
+            {
+                let mut g = state.write().unwrap();
+                for bucket_state in g.values_mut() {
+                    *bucket_state = BucketState::default();
+                }
+            }
+            let (client, state, buckets) = (client.clone(), state.clone(), buckets.clone());
+            tokio::spawn(async move {
+                for bucket in buckets {
+                    if let Err(e) = sync_bucket_into(&client, &state, &bucket).await {
+                        tracing::warn!(
+                            "gap resync of `{bucket}` failed (staying passthrough): {e}"
+                        );
+                    }
+                }
+            });
+        })
     }
 
     /// A handle to this node's local tiers, for the gossip apply loop.
@@ -93,15 +127,16 @@ impl CachingProxy {
         self.obj_cache.local()
     }
 
-    /// Strong-consistency read barrier: before serving a read from node-local state (the
-    /// LIST index, or a hot/disk body copy), wait for this node's commit-log consumer to
-    /// catch up to the stream tail so a peer's just-completed write is never read stale.
-    /// No-op without the log (single-node is already strict) or when Valkey is unreachable.
+    /// Freshness barrier: before serving a read from node-local state (the LIST index,
+    /// or a hot/disk body copy), wait until every peer's currently-advertised write-feed
+    /// head has been applied locally, so a peer's just-completed write is not read stale.
+    /// Freshness is bounded by one push/gossip hop (see [`crate::sync`]); degrades to
+    /// serving current state on timeout. No-op without gossip (single-node is strict).
     async fn read_barrier(&self) {
-        if let Some(log) = &self.index_log
-            && !log.await_fresh().await
+        if let Some(sync) = &self.sync
+            && !sync.await_fresh(READ_BARRIER_TIMEOUT).await
         {
-            tracing::debug!("consistency barrier timed out; serving current state");
+            tracing::debug!("freshness barrier timed out; serving current state");
         }
     }
 
@@ -109,36 +144,24 @@ impl CachingProxy {
         self.metrics.clone()
     }
 
-    /// Start tailing the shared commit log (if configured) so this node applies peers'
-    /// writes. Captures the stream tail *before* returning, so it must be called before
-    /// [`spawn_background_sync`](Self::spawn_background_sync) to avoid a gap between the
-    /// bootstrap LIST and the replay window.
-    pub(crate) async fn start_index_log(&self) {
-        if let Some(log) = &self.index_log {
-            let start_id = log.tail_id().await;
-            info!("index log: tailing `{}` from {start_id}", log.stream);
-            log.spawn_consumer(start_id, self.state.clone(), Some(self.obj_cache.local()));
+    /// Record a durable put: fold it into the local index (LWW, same rule the
+    /// apply loop uses for peers) and advertise it over the write feed.
+    async fn record_put(&self, bucket: &str, key: &str, size: i64) {
+        let ts = SystemTime::now();
+        if apply_put(&self.state, bucket, key, size, ts) {
+            self.metrics.writes_indexed.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(sync) = &self.sync {
+            sync.publish_put(bucket, key, size, ts, &self.metrics).await;
         }
     }
 
-    /// Advertise a durable write everywhere it matters: the shared commit log
-    /// (index coherence + read barrier) and the gossip write feed (fast
-    /// body-cache invalidation). Both are optional and idempotent.
-    async fn log_put(&self, bucket: &str, key: &str, size: i64) {
-        if let Some(log) = &self.index_log {
-            log.append_put(bucket, key, size).await;
-        }
+    /// Record a durable delete: tombstone + remove locally, advertise to peers.
+    async fn record_del(&self, bucket: &str, key: &str) {
+        let ts = SystemTime::now();
+        apply_del(&self.state, bucket, key, ts);
         if let Some(sync) = &self.sync {
-            sync.publish(bucket, key).await;
-        }
-    }
-
-    async fn log_del(&self, bucket: &str, key: &str) {
-        if let Some(log) = &self.index_log {
-            log.append_del(bucket, key).await;
-        }
-        if let Some(sync) = &self.sync {
-            sync.publish(bucket, key).await;
+            sync.publish_del(bucket, key, ts, &self.metrics).await;
         }
     }
 
@@ -162,21 +185,12 @@ impl CachingProxy {
         });
     }
 
+    /// Index a size observed on the READ path (a successful origin GET): the
+    /// key provably exists at the origin now, so LWW at `now` is correct and
+    /// nothing is advertised (peers learn real writes from their writers).
     fn index_insert(&self, bucket: &str, key: &str, size: i64) {
-        let mut g = self.state.write().unwrap();
-        g.entry(bucket.to_owned()).or_default().keys.insert(
-            key.to_owned(),
-            ObjEntry {
-                size,
-                last_modified: SystemTime::now(),
-            },
-        );
-        self.metrics.writes_indexed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn index_remove(&self, bucket: &str, key: &str) {
-        if let Some(b) = self.state.write().unwrap().get_mut(bucket) {
-            b.keys.remove(key);
+        if apply_put(&self.state, bucket, key, size, SystemTime::now()) {
+            self.metrics.writes_indexed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -334,8 +348,7 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let size = req.input.content_length.unwrap_or(0);
         let resp = self.inner.put_object(req).await?;
-        self.index_insert(&bucket, &key, size);
-        self.log_put(&bucket, &key, size).await;
+        self.record_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -347,8 +360,7 @@ impl s3s::S3 for CachingProxy {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let resp = self.inner.delete_object(req).await?;
-        self.index_remove(&bucket, &key);
-        self.log_del(&bucket, &key).await;
+        self.record_del(&bucket, &key).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -367,8 +379,7 @@ impl s3s::S3 for CachingProxy {
             .collect();
         let resp = self.inner.delete_objects(req).await?;
         for k in keys {
-            self.index_remove(&bucket, &k);
-            self.log_del(&bucket, &k).await;
+            self.record_del(&bucket, &k).await;
             self.obj_cache.invalidate(&(bucket.clone(), k)).await;
         }
         Ok(resp)
@@ -385,8 +396,7 @@ impl s3s::S3 for CachingProxy {
         // placeholder size poisoned the range-promotion decision (a "0-byte"
         // entry promoted a multi-GB fetch). One HEAD learns the real size.
         let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
-        self.index_insert(&bucket, &key, size);
-        self.log_put(&bucket, &key, size).await;
+        self.record_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }
@@ -399,8 +409,7 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let resp = self.inner.copy_object(req).await?;
         let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
-        self.index_insert(&bucket, &key, size);
-        self.log_put(&bucket, &key, size).await;
+        self.record_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Ok(resp)
     }

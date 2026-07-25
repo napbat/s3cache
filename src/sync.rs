@@ -1,65 +1,94 @@
-//! Fast cross-node body-cache coherence over groupnet's consistency layer.
+//! Cross-node coherence over groupnet's consistency layer — the whole of it:
+//! no raft, no shared broker. Each node publishes its durable writes as
+//! typed [`IndexEvent`]s into a per-node [`WriteFeed`]; every peer's apply
+//! loop folds them into the LIST index (per-key last-writer-wins with
+//! delete-wins-ties tombstones — see [`crate::index`]) and drops the stale
+//! body-cache copies. Events reach live peers at network latency (the engine
+//! pushes deltas eagerly).
 //!
-//! Every durable write is published into a per-node [`WriteFeed`]; each peer's
-//! apply loop turns [`PeerWrite::Wrote`] into a local invalidation and a
-//! [`PeerWrite::Gap`] (writes provably missed — ring overflow or a peer
-//! restart) into a full local flush, since the stale subset is unknowable.
-//! Invalidation reaches live peers at network latency (the engine pushes
-//! deltas eagerly), well ahead of the Valkey commit-log tail.
+//! Honest semantics, in one paragraph: each node's events arrive in its own
+//! write order; there is no cross-writer total order, so concurrent writes to
+//! one key through different nodes resolve by timestamp (deletes win ties)
+//! and the origin — which serves conditional (OCC) writes untouched — stays
+//! the authority the index is a cache of. Provably-missed events (ring
+//! overflow, a peer restart) surface as a gap: the local tiers flush and the
+//! LIST index resyncs from the origin. The strict-LIST barrier
+//! ([`WriteSync::await_fresh`]) waits until every peer's currently-advertised
+//! feed head has been applied locally — freshness bounded by one push/gossip
+//! hop, degrading to serving current state on timeout.
 //!
-//! Division of labour with [`coherence`](crate::coherence): the commit log
-//! owns the LIST index and its read barrier (a shared, globally-ordered
-//! stream); this feed owns *body-cache* invalidation. Both invalidate
-//! idempotently, so running both is redundancy, not conflict — and a
-//! deployment without gossip (`S3CACHE_GOSSIP_BIND` unset) keeps exactly the
-//! coherence it has today.
-//!
-//! Not provided here (yet): read-your-writes tokens in API responses. The
-//! feed already returns them; surfacing them needs a header design.
+//! Read-your-writes tokens are returned by the feed but not yet surfaced in
+//! the API (needs a header design).
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use groupnet::consistency::{PeerWrite, PeerWrites, WriteFeed};
+use groupnet::consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed, advertised_head};
 use groupnet::core::NodeId;
 use groupnet::runtime::{Group, Node};
 use groupnet::transport::udp::UdpTransport;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::tier::{CacheKey, LocalCache};
+use crate::index::{BucketState, apply_del, apply_put};
+use crate::metrics::Metrics;
+use crate::tier::LocalCache;
 
 /// Ring capacity: a peer that falls further behind than this many writes
-/// gets a gap (full local flush) instead of per-key invalidations.
+/// gets a gap (flush + origin resync) instead of per-event application.
 const FEED_CAPACITY: usize = 4096;
 
-/// The publishing half of the write feed, plus what the apply loop needs.
+/// What one durable write did, as advertised to peers.
+#[derive(Serialize, Deserialize)]
+pub(crate) enum IndexOp {
+    /// The key now holds an object of `size` bytes.
+    Put {
+        /// Object size, for the LIST index.
+        size: i64,
+    },
+    /// The key was deleted.
+    Del,
+}
+
+/// One durable write: the operation, its `(bucket, key)`, and the writer's
+/// wall-clock timestamp (millis) — the cross-writer LWW tiebreak.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct IndexEvent {
+    pub(crate) op: IndexOp,
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) ts_ms: u64,
+}
+
+fn to_millis(ts: SystemTime) -> u64 {
+    ts.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn from_millis(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+fn encode_event(event: &IndexEvent) -> Vec<u8> {
+    bincode::serialize(event).unwrap_or_default()
+}
+
+fn decode_event(bytes: &[u8]) -> Option<IndexEvent> {
+    bincode::deserialize(bytes).ok()
+}
+
+/// The publishing half of the write feed, plus the barrier view.
 pub(crate) struct WriteSync {
-    feed: WriteFeed<CacheKey>,
+    feed: WriteFeed<IndexEvent>,
     group: Group,
     me: NodeId,
+    /// Set by [`start_apply`](Self::start_apply); the freshness barrier reads it.
+    view: OnceLock<groupnet::consistency::FrontierView>,
     /// Keeps the gossip node (receive loop, group actors) alive for the
     /// process lifetime. `None` when a test drives a raw group directly.
     _node: Option<Node<UdpTransport>>,
-}
-
-/// `bucket` length-prefixed, then the key — unambiguous for any bucket/key.
-fn encode_key(key: &CacheKey) -> Vec<u8> {
-    let bucket = key.0.as_bytes();
-    let mut out = Vec::with_capacity(4 + bucket.len() + key.1.len());
-    out.extend_from_slice(
-        &u32::try_from(bucket.len())
-            .unwrap_or(u32::MAX)
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(bucket);
-    out.extend_from_slice(key.1.as_bytes());
-    out
-}
-
-fn decode_key(bytes: &[u8]) -> Option<CacheKey> {
-    let len = usize::try_from(u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?)).ok()?;
-    let bucket = std::str::from_utf8(bytes.get(4..4 + len)?).ok()?;
-    let key = std::str::from_utf8(bytes.get(4 + len..)?).ok()?;
-    Some((bucket.to_owned(), key.to_owned()))
 }
 
 impl WriteSync {
@@ -67,47 +96,137 @@ impl WriteSync {
     /// [`start_apply`](Self::start_apply) once the local cache exists.
     pub(crate) fn attach(group: Group, me: NodeId, node: Option<Node<UdpTransport>>) -> Self {
         let capacity = NonZeroUsize::new(FEED_CAPACITY).unwrap_or(NonZeroUsize::MIN);
-        let feed = WriteFeed::new(group.clone(), capacity, encode_key);
+        let feed = WriteFeed::new(group.clone(), capacity, encode_event);
         Self {
             feed,
             group,
             me,
+            view: OnceLock::new(),
             _node: node,
         }
     }
 
-    /// Advertise a durable write to peers. Fire-and-forget: the returned
-    /// read-your-writes token is unused until the API surfaces one.
-    pub(crate) async fn publish(&self, bucket: &str, key: &str) {
-        let _token = self
-            .feed
-            .publish(&(bucket.to_owned(), key.to_owned()))
+    /// Advertise a durable put to peers, stamped with the local index's `ts`.
+    pub(crate) async fn publish_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        size: i64,
+        ts: SystemTime,
+        metrics: &Metrics,
+    ) {
+        self.publish(IndexOp::Put { size }, bucket, key, ts, metrics)
             .await;
     }
 
-    /// Spawn the apply loop: peers' writes drop the local copies; a gap
-    /// flushes every local tier.
-    pub(crate) fn start_apply(&self, local: LocalCache) {
-        let mut peers = PeerWrites::new(self.group.clone(), self.me.clone(), decode_key);
+    /// Advertise a durable delete to peers.
+    pub(crate) async fn publish_del(
+        &self,
+        bucket: &str,
+        key: &str,
+        ts: SystemTime,
+        metrics: &Metrics,
+    ) {
+        self.publish(IndexOp::Del, bucket, key, ts, metrics).await;
+    }
+
+    async fn publish(
+        &self,
+        op: IndexOp,
+        bucket: &str,
+        key: &str,
+        ts: SystemTime,
+        metrics: &Metrics,
+    ) {
+        let event = IndexEvent {
+            op,
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            ts_ms: to_millis(ts),
+        };
+        let _token = self.feed.publish(&event).await;
+        metrics.feed_published();
+    }
+
+    /// Spawn the apply loop: peers' events fold into the LIST index and drop
+    /// the local body copies; a gap flushes every local tier and triggers
+    /// `resync` (an origin re-LIST) since the stale subset is unknowable.
+    pub(crate) fn start_apply(
+        &self,
+        local: LocalCache,
+        state: Arc<RwLock<HashMap<String, BucketState>>>,
+        resync: Arc<dyn Fn() + Send + Sync>,
+        metrics: Arc<Metrics>,
+    ) {
+        let (frontier, view) = Frontier::new();
+        let _ = self.view.set(view);
+        let mut peers = PeerWrites::new(self.group.clone(), self.me.clone(), decode_event);
         tokio::spawn(async move {
             while let Some(event) = peers.next().await {
                 match event {
-                    PeerWrite::Wrote { key, .. } => local.invalidate(&key).await,
-                    PeerWrite::Gap { peer, .. } => {
-                        warn!("write-feed gap from `{peer}`: flushing local tiers");
+                    PeerWrite::Wrote {
+                        peer,
+                        token,
+                        key: event,
+                    } => {
+                        let ts = from_millis(event.ts_ms);
+                        match event.op {
+                            IndexOp::Put { size } => {
+                                apply_put(&state, &event.bucket, &event.key, size, ts);
+                            }
+                            IndexOp::Del => {
+                                apply_del(&state, &event.bucket, &event.key, ts);
+                            }
+                        }
+                        local.invalidate(&(event.bucket, event.key)).await;
+                        frontier.advance(&peer, token);
+                        metrics.feed_applied();
+                    }
+                    PeerWrite::Gap {
+                        peer,
+                        missed_through,
+                    } => {
+                        warn!("write-feed gap from `{peer}`: flushing tiers, resyncing index");
                         local.flush().await;
+                        resync();
+                        frontier.advance(&peer, missed_through);
+                        metrics.feed_gap();
                     }
                 }
             }
         });
     }
+
+    /// Wait (bounded by `timeout`) until every peer's currently-advertised
+    /// feed head has been applied locally. Returns whether it fully caught
+    /// up; freshness is bounded by one push/gossip hop (see module docs).
+    pub(crate) async fn await_fresh(&self, timeout: Duration) -> bool {
+        let Some(view) = self.view.get() else {
+            return true; // apply loop not started: nothing is being tracked
+        };
+        let deadline = Instant::now() + timeout;
+        for member in self.group.members() {
+            if member == self.me {
+                continue;
+            }
+            let Some(head) = advertised_head(&self.group, &member) else {
+                continue; // no feed advertised: nothing to wait for
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, view.reached(&member, head)).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return false, // apply loop gone, or out of time
+            }
+        }
+        true
+    }
 }
 
 /// Build the gossip node and write feed from `S3CACHE_GOSSIP_*`, or `None`
-/// when `S3CACHE_GOSSIP_BIND` is unset (single-node, or Valkey-only
-/// coherence). Seeds are comma-separated `id=host:port` pairs; every other
-/// peer resolves itself through gossiped advertisements, so only seeds need
-/// static addressing.
+/// when `S3CACHE_GOSSIP_BIND` is unset (single-node: the sole writer is
+/// already strict). Seeds are comma-separated `id=host:port` pairs; every
+/// other peer resolves itself through gossiped advertisements, so only seeds
+/// need static addressing.
 pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
     let bind = std::env::var("S3CACHE_GOSSIP_BIND").ok()?;
     let me = NodeId::new(node_name);
@@ -147,17 +266,21 @@ pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+    use std::time::{Duration, SystemTime};
 
     use groupnet::core::NodeId;
     use groupnet::runtime::{Group, Node};
     use groupnet::transport::mem::{MemTransport, Network};
     use s3s::dto::GetObjectOutput;
 
-    use super::{WriteSync, decode_key, encode_key};
+    use super::{IndexEvent, IndexOp, WriteSync, decode_event, encode_event};
+    use crate::index::BucketState;
     use crate::metrics::Metrics;
     use crate::tier::{CachedObject, TieredCache};
+
+    type Index = Arc<RwLock<HashMap<String, BucketState>>>;
 
     fn spawn_node(net: &Network, id: &str, peer: &str) -> (NodeId, Node<MemTransport>, Group) {
         let me = NodeId::new(id);
@@ -177,37 +300,118 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn key_codec_round_trips_and_rejects_garbage() {
-        let key = ("bucket-1".to_owned(), "a/b\0weird key".to_owned());
-        assert_eq!(decode_key(&encode_key(&key)), Some(key));
-        assert_eq!(decode_key(b"xx"), None);
-        assert_eq!(decode_key(&u32::MAX.to_le_bytes()), None);
+    fn indexed_size(state: &Index, bucket: &str, key: &str) -> Option<i64> {
+        state
+            .read()
+            .unwrap()
+            .get(bucket)
+            .and_then(|b| b.keys.get(key))
+            .map(|e| e.size)
     }
 
-    #[tokio::test]
-    async fn peer_write_invalidates_the_local_tiers() {
-        let net = Network::new();
-        let (a_id, _a_node, a_group) = spawn_node(&net, "sync-a", "sync-b");
-        let (b_id, _b_node, b_group) = spawn_node(&net, "sync-b", "sync-a");
-
-        // Node B holds a soon-stale copy and runs the apply loop.
-        let cache = TieredCache::new(1024 * 1024, None, Arc::new(Metrics::default()));
-        let key = ("bkt".to_owned(), "obj".to_owned());
-        cache.insert(key.clone(), cached(b"stale")).await;
-        assert!(cache.get(&key).await.is_some());
-        WriteSync::attach(b_group, b_id, None).start_apply(cache.local());
-
-        // Node A publishes the write; B's copy must go.
+    /// A fully-wired pair: node A publishes, node B applies into `state` and
+    /// its local cache. Returns A's publisher, B's sync, and B's state and cache.
+    fn wired_pair(net: &Network) -> (WriteSync, WriteSync, Index, TieredCache) {
+        let (a_id, _a_node, a_group) = spawn_node(net, "sync-a", "sync-b");
+        let (b_id, _b_node, b_group) = spawn_node(net, "sync-b", "sync-a");
+        let metrics = Arc::new(Metrics::default());
+        let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
+        let state: Index = Arc::new(RwLock::new(HashMap::new()));
+        let sync_b = WriteSync::attach(b_group, b_id, None);
+        sync_b.start_apply(cache.local(), state.clone(), Arc::new(|| {}), metrics);
         let sync_a = WriteSync::attach(a_group, a_id, None);
-        sync_a.publish("bkt", "obj").await;
+        (sync_a, sync_b, state, cache)
+    }
+
+    async fn eventually(mut cond: impl FnMut() -> bool, what: &str) {
         for _ in 0..300 {
-            if cache.get(&key).await.is_none() {
+            if cond() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("peer write did not invalidate the local copy");
+        panic!("timed out waiting for: {what}");
+    }
+
+    #[test]
+    fn event_codec_round_trips_and_rejects_garbage() {
+        let event = IndexEvent {
+            op: IndexOp::Put { size: 42 },
+            bucket: "bucket-1".to_owned(),
+            key: "a/b weird\0key".to_owned(),
+            ts_ms: 1_700_000_000_000,
+        };
+        let back = decode_event(&encode_event(&event)).expect("round trip");
+        assert!(matches!(back.op, IndexOp::Put { size: 42 }));
+        assert_eq!(back.bucket, event.bucket);
+        assert_eq!(back.key, event.key);
+        assert_eq!(back.ts_ms, event.ts_ms);
+        assert!(decode_event(b"\xff\xff").is_none());
+    }
+
+    /// The full coherence story on one writer: put indexes + invalidates on
+    /// the peer, delete removes — in the writer's order.
+    #[tokio::test]
+    async fn peer_events_fold_into_index_and_invalidate() {
+        let net = Network::new();
+        let (sync_a, _sync_b, state, cache) = wired_pair(&net);
+        let metrics = Metrics::default();
+
+        // B holds a soon-stale body copy.
+        let ckey = ("bkt".to_owned(), "obj".to_owned());
+        cache.insert(ckey.clone(), cached(b"stale")).await;
+
+        let now = SystemTime::now();
+        sync_a.publish_put("bkt", "obj", 42, now, &metrics).await;
+        eventually(
+            || indexed_size(&state, "bkt", "obj") == Some(42),
+            "put reaches the peer index",
+        )
+        .await;
+        let mut invalidated = false;
+        for _ in 0..300 {
+            if cache.get(&ckey).await.is_none() {
+                invalidated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(invalidated, "put invalidates the peer's body copy");
+
+        sync_a
+            .publish_del("bkt", "obj", SystemTime::now(), &metrics)
+            .await;
+        eventually(
+            || indexed_size(&state, "bkt", "obj").is_none(),
+            "delete reaches the peer index",
+        )
+        .await;
+    }
+
+    /// The strict-LIST barrier: after a publish, `await_fresh` on the peer
+    /// returns true only once the event is actually applied.
+    #[tokio::test]
+    async fn await_fresh_reflects_the_publishers_head() {
+        let net = Network::new();
+        let (sync_a, sync_b, state, _cache) = wired_pair(&net);
+        let metrics = Metrics::default();
+
+        sync_a
+            .publish_put("bkt", "fresh", 7, SystemTime::now(), &metrics)
+            .await;
+        // Wait until the peer has applied the write, then barrier: a caught-up
+        // node must pass promptly, and a passed barrier implies the applied
+        // index reflects every head the barrier saw.
+        eventually(
+            || indexed_size(&state, "bkt", "fresh") == Some(7),
+            "apply loop catches the write",
+        )
+        .await;
+        let caught_up = sync_b.await_fresh(Duration::from_secs(5)).await;
+        assert!(
+            caught_up,
+            "barrier must pass once the apply loop is caught up"
+        );
     }
 
     #[tokio::test]

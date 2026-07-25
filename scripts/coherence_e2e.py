@@ -36,8 +36,10 @@ def body(cli, key):
 def main():
     d = h.direct()
     h.reset_bucket(d, BUCKET)
-    node_a = h.start_node("nodeA", PORT_A, BUCKET)
-    node_b = h.start_node("nodeB", PORT_B, BUCKET)
+    node_a = h.start_node("nodeA", PORT_A, BUCKET, gossip_port=19031,
+                          seeds="nodeB=127.0.0.1:19032")
+    node_b = h.start_node("nodeB", PORT_B, BUCKET, gossip_port=19032,
+                          seeds="nodeA=127.0.0.1:19031")
     failures = []
     try:
         assert h.wait_port(PORT_A) and h.wait_port(PORT_B), "nodes did not bind"
@@ -70,8 +72,12 @@ def main():
         dc, dd_dir = f"/tmp/s3cache-diskC-{os.getpid()}", f"/tmp/s3cache-diskD-{os.getpid()}"
         for d in (dc, dd_dir):
             shutil.rmtree(d, ignore_errors=True)
-        c_node = h.start_node("nodeC", 18033, BUCKET, extra={"S3CACHE_DISK_CACHE": dc, "S3CACHE_DISK_CACHE_BYTES": "104857600"})
-        d_node = h.start_node("nodeD", 18034, BUCKET, extra={"S3CACHE_DISK_CACHE": dd_dir, "S3CACHE_DISK_CACHE_BYTES": "104857600"})
+        c_node = h.start_node("nodeC", 18033, BUCKET, gossip_port=19033,
+                              seeds="nodeD=127.0.0.1:19034",
+                              extra={"S3CACHE_DISK_CACHE": dc, "S3CACHE_DISK_CACHE_BYTES": "104857600"})
+        d_node = h.start_node("nodeD", 18034, BUCKET, gossip_port=19034,
+                              seeds="nodeC=127.0.0.1:19033",
+                              extra={"S3CACHE_DISK_CACHE": dd_dir, "S3CACHE_DISK_CACHE_BYTES": "104857600"})
         node_c, node_d = c_node, d_node
         try:
             assert h.wait_port(18033) and h.wait_port(18034)

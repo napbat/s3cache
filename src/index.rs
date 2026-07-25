@@ -10,18 +10,84 @@ use s3s::dto::{CommonPrefix, ListObjectsV2Input, ListObjectsV2Output, Object, Ti
 use tracing::info;
 
 /// One indexed key's LIST metadata: its size and last-modified time.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone)]
 pub(crate) struct ObjEntry {
     pub(crate) size: i64,
     pub(crate) last_modified: SystemTime,
 }
 
-/// Per-bucket LIST index: the sorted key set plus whether its warm-up sync has finished.
-/// `Clone`/`serde` so the Raft state machine can snapshot the whole index (see `raft`).
-#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+/// Per-bucket LIST index: the sorted key set, whether its warm-up sync has
+/// finished, and delete tombstones so a late-arriving cross-writer put
+/// cannot resurrect a deleted key.
+#[derive(Default)]
 pub(crate) struct BucketState {
     pub(crate) synced: bool,
     pub(crate) keys: BTreeMap<String, ObjEntry>,
+    /// Deleted keys and when: consulted by [`apply_put`], pruned amortized.
+    pub(crate) gone: BTreeMap<String, SystemTime>,
+}
+
+/// How long a delete tombstone shields its key from older, late-arriving
+/// cross-writer puts. Conflicts past this window resolve at the next origin
+/// sync — the origin stays the authority, this index is a cache of it.
+const TOMBSTONE_TTL: Duration = Duration::from_hours(1);
+
+/// Tombstones per bucket before an amortized TTL prune runs.
+const TOMBSTONE_PRUNE_LEN: usize = 65_536;
+
+/// Applies an observed put (a local write, a peer's feed event, or a read
+/// observation) by per-key last-writer-wins: a strictly newer entry or an
+/// equal-or-newer tombstone rejects it; ties between puts fall to
+/// last-applied (cross-writer same-millisecond puts are healed by the next
+/// origin sync). Returns whether the index changed.
+pub(crate) fn apply_put(
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    key: &str,
+    size: i64,
+    ts: SystemTime,
+) -> bool {
+    let mut g = state.write().unwrap();
+    let b = g.entry(bucket.to_owned()).or_default();
+    if b.gone.get(key).is_some_and(|dead| *dead >= ts) {
+        return false; // deletes win ties: never resurrect
+    }
+    if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
+        return false; // a newer put is already indexed
+    }
+    b.keys.insert(
+        key.to_owned(),
+        ObjEntry {
+            size,
+            last_modified: ts,
+        },
+    );
+    true
+}
+
+/// Applies an observed delete: removes any not-newer entry and records a
+/// tombstone (see [`apply_put`]). Returns whether a live entry was removed.
+pub(crate) fn apply_del(
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    key: &str,
+    ts: SystemTime,
+) -> bool {
+    let mut g = state.write().unwrap();
+    let b = g.entry(bucket.to_owned()).or_default();
+    if b.gone.len() > TOMBSTONE_PRUNE_LEN
+        && let Some(cutoff) = ts.checked_sub(TOMBSTONE_TTL)
+    {
+        b.gone.retain(|_, dead| *dead >= cutoff);
+    }
+    let dead = b.gone.entry(key.to_owned()).or_insert(ts);
+    if *dead < ts {
+        *dead = ts;
+    }
+    if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
+        return false; // the key was rewritten after this delete
+    }
+    b.keys.remove(key).is_some()
 }
 
 /// The `ListObjectsV2` algorithm over an already-borrowed key index — free-standing so it
@@ -166,7 +232,68 @@ pub(crate) async fn sync_bucket_into(
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjEntry, list_objects_v2_from_index};
+    use super::{ObjEntry, apply_del, apply_put, list_objects_v2_from_index};
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    use std::time::Duration;
+
+    type Index = RwLock<HashMap<String, super::BucketState>>;
+
+    fn ts(secs: u64) -> std::time::SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn size_of(state: &Index, key: &str) -> Option<i64> {
+        state
+            .read()
+            .unwrap()
+            .get("b")
+            .and_then(|b| b.keys.get(key))
+            .map(|e| e.size)
+    }
+
+    /// Cross-writer events arrive in any order; per-key LWW must converge:
+    /// older puts lose, deletes win ties, and a delete's tombstone blocks a
+    /// late older put from resurrecting the key.
+    #[test]
+    fn lww_applies_out_of_order_events_convergently() {
+        let state: Index = RwLock::new(HashMap::new());
+        assert!(apply_put(&state, "b", "k", 1, ts(10)));
+        assert!(!apply_put(&state, "b", "k", 9, ts(5)), "older put loses");
+        assert_eq!(size_of(&state, "k"), Some(1));
+        assert!(apply_put(&state, "b", "k", 2, ts(20)), "newer put wins");
+        assert_eq!(size_of(&state, "k"), Some(2));
+
+        // Delete at t=30; an older put (t=25) must NOT resurrect the key.
+        assert!(apply_del(&state, "b", "k", ts(30)));
+        assert!(!apply_put(&state, "b", "k", 3, ts(25)), "tombstoned");
+        assert_eq!(size_of(&state, "k"), None);
+        // Deletes win timestamp ties, in either arrival order.
+        assert!(apply_put(&state, "b", "tie", 1, ts(40)));
+        apply_del(&state, "b", "tie", ts(40));
+        assert_eq!(size_of(&state, "tie"), None, "delete wins the tie");
+        assert!(
+            !apply_put(&state, "b", "tie", 2, ts(40)),
+            "still tombstoned"
+        );
+
+        // A genuinely newer put after a delete brings the key back.
+        assert!(apply_put(&state, "b", "k", 4, ts(35)));
+        assert_eq!(size_of(&state, "k"), Some(4));
+    }
+
+    /// A delete observed before its key's put (cross-writer reorder) still
+    /// suppresses the older put.
+    #[test]
+    fn delete_first_reorder_suppresses_the_put() {
+        let state: Index = RwLock::new(HashMap::new());
+        assert!(!apply_del(&state, "b", "k", ts(50)), "nothing live yet");
+        assert!(
+            !apply_put(&state, "b", "k", 1, ts(45)),
+            "arrives late, loses"
+        );
+        assert_eq!(size_of(&state, "k"), None);
+    }
     use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;

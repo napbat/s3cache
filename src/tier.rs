@@ -8,8 +8,8 @@
 //! best-effort by policy: a disk error or oversize rejection never blocks the hot fill or
 //! the data plane. Origin fetches are singleflighted probe-then-gate, so only misses
 //! contend and concurrent callers share one round-trip. Cross-node coherence is separate
-//! (see `coherence`): a peer's write invalidates the local hot *and* disk copies, and
-//! reads barrier on the log.
+//! (see `sync`): a peer's write invalidates the local hot *and* disk copies, and
+//! strict reads barrier on feed heads.
 
 use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};

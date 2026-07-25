@@ -24,12 +24,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rlimit = "0.10"
 anyhow = "1"
-fred = "10.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 bincode = "1"
 blake3 = "1.8.5"
-openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
-serde_json = "1"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

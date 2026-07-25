@@ -71,8 +71,10 @@ def list_norm(cli, **kw):
 def main():
     d = h.direct()
     h.reset_bucket(d, BUCKET)
-    p_node = h.start_node("parityP", PORT_P, BUCKET)
-    q_node = h.start_node("parityQ", PORT_Q, BUCKET)
+    p_node = h.start_node("parityP", PORT_P, BUCKET, gossip_port=19035,
+                          seeds="parityQ=127.0.0.1:19036")
+    q_node = h.start_node("parityQ", PORT_Q, BUCKET, gossip_port=19036,
+                          seeds="parityP=127.0.0.1:19035")
     c = Checks()
     try:
         assert h.wait_port(PORT_P) and h.wait_port(PORT_Q), "nodes did not bind"
