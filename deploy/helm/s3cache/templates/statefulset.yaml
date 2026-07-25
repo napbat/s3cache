@@ -63,6 +63,8 @@ spec:
               value: "$(POD_IP):{{ .Values.gossip.port }}"
             - name: S3CACHE_GOSSIP_SEEDS
               value: "s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }}"
+            - name: S3CACHE_CONSISTENCY
+              value: {{ .Values.gossip.consistency | quote }}
             {{- end }}
             - name: RUST_LOG
               value: "info"

@@ -17,7 +17,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "h
 tierstore = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
 tierstore-mmap = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
 tierstore-moka = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
-groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency", "udp"] }
+groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency-acks", "udp"] }
 bytes = { version = "1", features = ["serde"] }
 http = "1"
 futures = "0.3"

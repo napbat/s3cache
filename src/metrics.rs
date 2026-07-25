@@ -26,6 +26,8 @@ pub(crate) struct Metrics {
     feed_published: AtomicU64,
     feed_applied: AtomicU64,
     feed_gaps: AtomicU64,
+    ack_timeouts: AtomicU64,
+    unhealthy_bypasses: AtomicU64,
 }
 
 impl Metrics {
@@ -58,6 +60,17 @@ impl Metrics {
     pub(crate) fn feed_gap(&self) {
         self.feed_gaps.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Record a write held past the ack window by an unresponsive peer.
+    pub(crate) fn ack_timeout(&self) {
+        self.ack_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a cache-served read routed to the origin because this node's
+    /// membership view was not fully alive.
+    pub(crate) fn unhealthy_bypass(&self) {
+        self.unhealthy_bypasses.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Periodically log the cache-effectiveness counters (LISTs served from the index
@@ -70,7 +83,8 @@ pub(crate) fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
             info!(
                 "s3cache stats: list_from_index={} list_passthrough={} writes_indexed={} \
                  get_hit={} get_miss={} get_bypass={} range_hit={} range_promote={} range_promote_reject={} \
-                 warm_hit={} warm_miss={} warm_error={} feed_published={} feed_applied={} feed_gaps={}",
+                 warm_hit={} warm_miss={} warm_error={} feed_published={} feed_applied={} \
+                 feed_gaps={} ack_timeouts={} unhealthy_bypasses={}",
                 metrics.list_from_index.load(Ordering::Relaxed),
                 metrics.list_passthrough.load(Ordering::Relaxed),
                 metrics.writes_indexed.load(Ordering::Relaxed),
@@ -86,6 +100,8 @@ pub(crate) fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
                 metrics.feed_published.load(Ordering::Relaxed),
                 metrics.feed_applied.load(Ordering::Relaxed),
                 metrics.feed_gaps.load(Ordering::Relaxed),
+                metrics.ack_timeouts.load(Ordering::Relaxed),
+                metrics.unhealthy_bypasses.load(Ordering::Relaxed),
             );
         }
     });

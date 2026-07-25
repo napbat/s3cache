@@ -1197,7 +1197,7 @@ dependencies = [
 [[package]]
 name = "groupnet"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+source = "git+https://github.com/napbat/groupnet?branch=main#3023cfca88bc6311ad8dda5f819669d83be79038"
 dependencies = [
  "groupnet-consistency",
  "groupnet-core",
@@ -1210,7 +1210,7 @@ dependencies = [
 [[package]]
 name = "groupnet-consistency"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+source = "git+https://github.com/napbat/groupnet?branch=main#3023cfca88bc6311ad8dda5f819669d83be79038"
 dependencies = [
  "groupnet-core",
  "groupnet-runtime",
@@ -1220,12 +1220,12 @@ dependencies = [
 [[package]]
 name = "groupnet-core"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+source = "git+https://github.com/napbat/groupnet?branch=main#3023cfca88bc6311ad8dda5f819669d83be79038"
 
 [[package]]
 name = "groupnet-runtime"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+source = "git+https://github.com/napbat/groupnet?branch=main#3023cfca88bc6311ad8dda5f819669d83be79038"
 dependencies = [
  "groupnet-core",
  "groupnet-transport",
@@ -1235,7 +1235,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+source = "git+https://github.com/napbat/groupnet?branch=main#3023cfca88bc6311ad8dda5f819669d83be79038"
 dependencies = [
  "groupnet-core",
 ]
@@ -1243,7 +1243,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport-mem"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+source = "git+https://github.com/napbat/groupnet?branch=main#3023cfca88bc6311ad8dda5f819669d83be79038"
 dependencies = [
  "groupnet-core",
  "groupnet-transport",
@@ -1253,7 +1253,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport-udp"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?branch=main#33e9198754d57372f2b9c72080d2a1443d59eba3"
+source = "git+https://github.com/napbat/groupnet?branch=main#3023cfca88bc6311ad8dda5f819669d83be79038"
 dependencies = [
  "groupnet-core",
  "groupnet-transport",

@@ -12,9 +12,10 @@ seen by the other:
   3. DELETE via A -> B's LIST loses the key
   4. reverse direction: PUT via B -> A's LIST shows it
 
-Every write captures its `x-s3cache-write-token` response header and every read echoes
-it as `x-s3cache-read-token`, so the no-poll assertions are *guaranteed* strict
-read-after-write (the token barrier), not gossip-timing luck.
+The main checks use PLAIN clients — no tokens, no headers: in the default strong
+mode a write returns only after every peer applied its invalidation, so the no-poll
+assertions are guaranteed for clients that don't know s3cache exists. The forged-token
+check at the end exercises the token machinery's origin fallback.
 
 Assumes MinIO is reachable (see scripts/coherence-e2e.sh). Exits 0/1.
 """
@@ -44,18 +45,6 @@ def tokenized(endpoint):
     return cli
 
 
-def write(cli, key, data):
-    """PUT and capture the write's session token for subsequent reads."""
-    resp = cli.put_object(Bucket=BUCKET, Key=key, Body=data)
-    TOKEN["v"] = resp["ResponseMetadata"]["HTTPHeaders"].get("x-s3cache-write-token")
-    return TOKEN["v"]
-
-
-def delete(cli, key):
-    resp = cli.delete_object(Bucket=BUCKET, Key=key)
-    TOKEN["v"] = resp["ResponseMetadata"]["HTTPHeaders"].get("x-s3cache-write-token")
-
-
 def keys(cli):
     return {o["Key"] for o in cli.list_objects_v2(Bucket=BUCKET).get("Contents", [])}
 
@@ -75,7 +64,7 @@ def main():
     try:
         assert h.wait_port(PORT_A) and h.wait_port(PORT_B), "nodes did not bind"
         time.sleep(1.5)  # let each node's (empty-bucket) index sync complete
-        a, b = tokenized(f"http://127.0.0.1:{PORT_A}"), tokenized(f"http://127.0.0.1:{PORT_B}")
+        a, b = h.s3(f"http://127.0.0.1:{PORT_A}"), h.s3(f"http://127.0.0.1:{PORT_B}")
 
         def check(name, ok):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
@@ -85,27 +74,29 @@ def main():
         # Reads echo each write's session token, so every cross-node read must reflect
         # the peer's write *immediately* — asserted with NO poll (the token barrier does
         # the waiting).
-        token = write(a, "k1", b"v1")
-        check("PUT response carries a write token", bool(token))
-        check("PUT via A -> LIST via B sees k1 (token barrier, no poll)", "k1" in keys(b))
+        resp = a.put_object(Bucket=BUCKET, Key="k1", Body=b"v1")
+        check("PUT response carries a write token",
+              bool(resp["ResponseMetadata"]["HTTPHeaders"].get("x-s3cache-write-token")))
+        check("PUT via A -> LIST via B sees k1 (strong: write-ack, no poll)", "k1" in keys(b))
 
         check("GET via B returns v1", body(b, "k1") == b"v1")  # primes B's hot copy
-        write(a, "k1", b"v2-overwritten")
-        check("overwrite via A -> GET via B returns v2 (token barrier, no stale hot)",
+        a.put_object(Bucket=BUCKET, Key="k1", Body=b"v2-overwritten")
+        check("overwrite via A -> GET via B returns v2 (strong: write-ack, no stale hot)",
               body(b, "k1") == b"v2-overwritten")
 
-        delete(a, "k1")
-        check("DELETE via A -> LIST via B loses k1 (token barrier, no poll)", "k1" not in keys(b))
+        a.delete_object(Bucket=BUCKET, Key="k1")
+        check("DELETE via A -> LIST via B loses k1 (strong: write-ack, no poll)", "k1" not in keys(b))
 
-        write(b, "k2", b"from-b")
-        check("PUT via B -> LIST via A sees k2 (token barrier, no poll)", "k2" in keys(a))
+        b.put_object(Bucket=BUCKET, Key="k2", Body=b"from-b")
+        check("PUT via B -> LIST via A sees k2 (strong: write-ack, no poll)", "k2" in keys(a))
 
         # An unsatisfiable token must route the read to the origin: slower
         # (barrier timeout) but correct — a token read is never downgraded.
+        at = tokenized(f"http://127.0.0.1:{PORT_A}")
         TOKEN["v"] = "ghost:999:999"
         t0 = time.time()
         check("forged token: GET still returns correct bytes (origin fallback)",
-              body(a, "k2") == b"from-b")
+              body(at, "k2") == b"from-b")
         check("forged token: bounded latency (< 4s)", time.time() - t0 < 4)
         TOKEN["v"] = None
 
@@ -124,11 +115,11 @@ def main():
         try:
             assert h.wait_port(18033) and h.wait_port(18034)
             time.sleep(1.5)
-            c, dd = tokenized("http://127.0.0.1:18033"), tokenized("http://127.0.0.1:18034")
-            write(c, "w", b"one")
-            check("disk tier: D LIST sees C's write (token barrier, no poll)", "w" in keys(dd))
+            c, dd = h.s3("http://127.0.0.1:18033"), h.s3("http://127.0.0.1:18034")
+            c.put_object(Bucket=BUCKET, Key="w", Body=b"one")
+            check("disk tier: D LIST sees C's write (strong: write-ack, no poll)", "w" in keys(dd))
             _ = body(dd, "w")  # D reads it -> now in D's hot AND disk tiers
-            write(c, "w", b"two")  # C overwrites
+            c.put_object(Bucket=BUCKET, Key="w", Body=b"two")  # C overwrites
             check("disk tier: D GET reflects C's overwrite (hot+disk invalidated, no poll)",
                   body(dd, "w") == b"two")
         finally:

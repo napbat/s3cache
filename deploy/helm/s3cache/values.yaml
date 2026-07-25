@@ -36,6 +36,11 @@ diskCache:
 gossip:
   enabled: false
   port: 7946
+  # strong (default): writes wait for every alive peer to apply their invalidation and
+  # unhealthy nodes serve via the origin — indistinguishable from one S3 node, right for
+  # fleet-sized clusters. bounded: reads fresh within ~one gossip hop, writes return on
+  # the origin ack, no per-write cluster round — for large clusters. Set uniformly.
+  consistency: strong
 
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
 # this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).

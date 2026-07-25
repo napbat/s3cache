@@ -26,9 +26,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use groupnet::consistency::{
-    Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
+    AckLedger, Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
+    applied_cluster_wide,
 };
-use groupnet::core::NodeId;
+use groupnet::core::{NodeId, Status};
 use groupnet::runtime::{Group, Node};
 use groupnet::transport::udp::UdpTransport;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,33 @@ use crate::tier::LocalCache;
 /// Ring capacity: a peer that falls further behind than this many writes
 /// gets a gap (flush + origin resync) instead of per-event application.
 const FEED_CAPACITY: usize = 4096;
+
+/// How much coherence the cluster pays for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consistency {
+    /// Indistinguishable from a single S3 node with zero client
+    /// cooperation: writes wait for every alive peer to apply their
+    /// invalidation, and a node whose membership view is not fully alive
+    /// serves via the origin. Costs one ack round (~2 in-cluster hops,
+    /// behind the origin round-trip already paid) per write, plus one
+    /// ledger-entry republish per applied event — right for fleet-sized
+    /// clusters, wrong past the scaling envelope (run `bounded` + cells).
+    Strong,
+    /// The gossip bound only: reads are fresh within ~one push hop, session
+    /// tokens still upgrade individual reads to strict, but writes return as
+    /// soon as the origin acks and no ledger traffic flows. For large
+    /// clusters where per-write cluster acks are unaffordable. Must be set
+    /// uniformly: a bounded node never acks, so strong writers would wait
+    /// out their ack timeout on every write (loud, not stale).
+    Bounded,
+}
+
+/// A published write: the raw token (for the cluster-wide ack wait) and its
+/// header form (for the response).
+pub(crate) struct WriteReceipt {
+    pub(crate) token: WriteToken,
+    pub(crate) header: String,
+}
 
 /// Response header carrying a write's session token (`writer:epoch:seq`).
 /// A client that echoes it on later reads gets strict read-after-write for
@@ -126,6 +154,7 @@ pub(crate) struct WriteSync {
     feed: WriteFeed<IndexEvent>,
     group: Group,
     me: NodeId,
+    consistency: Consistency,
     /// Set by [`start_apply`](Self::start_apply); the freshness barrier reads it.
     view: OnceLock<groupnet::consistency::FrontierView>,
     /// Keeps the gossip node (receive loop, group actors) alive for the
@@ -136,20 +165,25 @@ pub(crate) struct WriteSync {
 impl WriteSync {
     /// Attach a feed to `group` as `me`. Start the apply loop separately with
     /// [`start_apply`](Self::start_apply) once the local cache exists.
-    pub(crate) fn attach(group: Group, me: NodeId, node: Option<Node<UdpTransport>>) -> Self {
+    pub(crate) fn attach(
+        group: Group,
+        me: NodeId,
+        consistency: Consistency,
+        node: Option<Node<UdpTransport>>,
+    ) -> Self {
         let capacity = NonZeroUsize::new(FEED_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         let feed = WriteFeed::new(group.clone(), capacity, encode_event);
         Self {
             feed,
             group,
             me,
+            consistency,
             view: OnceLock::new(),
             _node: node,
         }
     }
 
     /// Advertise a durable put to peers, stamped with the local index's `ts`.
-    /// Returns the write's session token (a [`WRITE_TOKEN_HEADER`] value).
     pub(crate) async fn publish_put(
         &self,
         bucket: &str,
@@ -157,19 +191,19 @@ impl WriteSync {
         size: i64,
         ts: SystemTime,
         metrics: &Metrics,
-    ) -> String {
+    ) -> WriteReceipt {
         self.publish(IndexOp::Put { size }, bucket, key, ts, metrics)
             .await
     }
 
-    /// Advertise a durable delete to peers. Returns the write's session token.
+    /// Advertise a durable delete to peers.
     pub(crate) async fn publish_del(
         &self,
         bucket: &str,
         key: &str,
         ts: SystemTime,
         metrics: &Metrics,
-    ) -> String {
+    ) -> WriteReceipt {
         self.publish(IndexOp::Del, bucket, key, ts, metrics).await
     }
 
@@ -180,7 +214,7 @@ impl WriteSync {
         key: &str,
         ts: SystemTime,
         metrics: &Metrics,
-    ) -> String {
+    ) -> WriteReceipt {
         let event = IndexEvent {
             op,
             bucket: bucket.to_owned(),
@@ -189,7 +223,34 @@ impl WriteSync {
         };
         let token = self.feed.publish(&event).await;
         metrics.feed_published();
-        format!("{}:{}:{}", self.me.as_str(), token.epoch, token.seq)
+        WriteReceipt {
+            token,
+            header: format!("{}:{}:{}", self.me.as_str(), token.epoch, token.seq),
+        }
+    }
+
+    /// Waits (bounded) until every currently-alive peer has applied this
+    /// node's write — the write-side half of transparent coherence: once
+    /// this resolves, no peer's cache can serve the overwritten state.
+    pub(crate) async fn wait_cluster_applied(&self, token: WriteToken, timeout: Duration) -> bool {
+        if self.consistency == Consistency::Bounded {
+            return true; // bounded mode: the origin ack is the write's end
+        }
+        applied_cluster_wide(&self.group, &self.me, token, timeout).await
+    }
+
+    /// Whether this node's membership view is fully alive. A node that sees
+    /// a suspect or dead peer may itself be the partitioned one, so its
+    /// cache-served reads route to the origin until the view heals — the
+    /// read-side half of transparent coherence.
+    pub(crate) fn cluster_healthy(&self) -> bool {
+        if self.consistency == Consistency::Bounded {
+            return true; // bounded mode: serve local, freshness is the bound
+        }
+        self.group
+            .statuses()
+            .into_iter()
+            .all(|(_, status)| status == Status::Alive)
     }
 
     /// Waits (bounded) until one specific write — a [`WRITE_TOKEN_HEADER`]
@@ -226,6 +287,9 @@ impl WriteSync {
     ) {
         let (frontier, view) = Frontier::new();
         let _ = self.view.set(view);
+        // Bounded mode publishes no acks (that is its point at scale).
+        let ledger =
+            (self.consistency == Consistency::Strong).then(|| AckLedger::new(self.group.clone()));
         let mut peers = PeerWrites::new(self.group.clone(), self.me.clone(), decode_event);
         tokio::spawn(async move {
             while let Some(event) = peers.next().await {
@@ -246,6 +310,9 @@ impl WriteSync {
                         }
                         local.invalidate(&(event.bucket, event.key)).await;
                         frontier.advance(&peer, token);
+                        if let Some(ledger) = &ledger {
+                            ledger.record(&peer, token).await;
+                        }
                         metrics.feed_applied();
                     }
                     PeerWrite::Gap {
@@ -253,9 +320,15 @@ impl WriteSync {
                         missed_through,
                     } => {
                         warn!("write-feed gap from `{peer}`: flushing tiers, resyncing index");
+                        // Flush first: with every local copy gone (and the
+                        // index bucket back to passthrough), acking the gap
+                        // is truthful even while the origin resync runs.
                         local.flush().await;
                         resync();
                         frontier.advance(&peer, missed_through);
+                        if let Some(ledger) = &ledger {
+                            ledger.record(&peer, missed_through).await;
+                        }
                         metrics.feed_gap();
                     }
                 }
@@ -295,6 +368,19 @@ impl WriteSync {
 /// need static addressing.
 pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
     let bind = std::env::var("S3CACHE_GOSSIP_BIND").ok()?;
+    let consistency = match std::env::var("S3CACHE_CONSISTENCY")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "strong" => Consistency::Strong,
+        "bounded" => Consistency::Bounded,
+        other => {
+            warn!("unknown S3CACHE_CONSISTENCY `{other}`; using strong");
+            Consistency::Strong
+        }
+    };
     let me = NodeId::new(node_name);
     let transport = match UdpTransport::bind(me.clone(), bind.as_str()).await {
         Ok(transport) => transport,
@@ -338,8 +424,13 @@ pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
             }
         });
     }
-    info!("gossip coherence bound on `{bind}` as `{node_name}`");
-    Some(WriteSync::attach(group, me, Some(node)))
+    let mode = if consistency == Consistency::Strong {
+        "strong"
+    } else {
+        "bounded"
+    };
+    info!("gossip coherence bound on `{bind}` as `{node_name}` (consistency: {mode})");
+    Some(WriteSync::attach(group, me, consistency, Some(node)))
 }
 
 #[cfg(test)]
@@ -353,7 +444,7 @@ mod tests {
     use groupnet::transport::mem::{MemTransport, Network};
     use s3s::dto::GetObjectOutput;
 
-    use super::{IndexEvent, IndexOp, WriteSync, decode_event, encode_event};
+    use super::{Consistency, IndexEvent, IndexOp, WriteSync, decode_event, encode_event};
     use crate::index::BucketState;
     use crate::metrics::Metrics;
     use crate::tier::{CachedObject, TieredCache};
@@ -395,9 +486,9 @@ mod tests {
         let metrics = Arc::new(Metrics::default());
         let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
         let state: Index = Arc::new(RwLock::new(HashMap::new()));
-        let sync_b = WriteSync::attach(b_group, b_id, None);
+        let sync_b = WriteSync::attach(b_group, b_id, Consistency::Strong, None);
         sync_b.start_apply(cache.local(), state.clone(), Arc::new(|| {}), metrics);
-        let sync_a = WriteSync::attach(a_group, a_id, None);
+        let sync_a = WriteSync::attach(a_group, a_id, Consistency::Strong, None);
         (sync_a, sync_b, state, cache)
     }
 
@@ -500,18 +591,26 @@ mod tests {
         let (sync_a, sync_b, state, _cache) = wired_pair(&net);
         let metrics = Metrics::default();
 
-        let token = sync_a
+        let receipt = sync_a
             .publish_put("bkt", "tok", 1, SystemTime::now(), &metrics)
             .await;
         assert!(
             sync_a
-                .reached_token(&token, Duration::from_millis(50))
+                .reached_token(&receipt.header, Duration::from_millis(50))
                 .await,
             "the issuer's own token is trivially satisfied"
         );
         assert!(
-            sync_b.reached_token(&token, Duration::from_secs(5)).await,
+            sync_b
+                .reached_token(&receipt.header, Duration::from_secs(5))
+                .await,
             "a peer satisfies the token once the write is applied"
+        );
+        assert!(
+            sync_a
+                .wait_cluster_applied(receipt.token, Duration::from_secs(5))
+                .await,
+            "the write-ack wait resolves once every alive peer applied"
         );
         assert_eq!(indexed_size(&state, "bkt", "tok"), Some(1));
         assert!(

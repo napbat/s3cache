@@ -75,30 +75,37 @@ single-replica constraint with zero extra services.
 
 ## Consistency
 
-Single-node s3cache is **strongly consistent** — the proxy is the sole path to the
-bucket, so its index and cache observe every write. Multi-node coherence is **honestly
-bounded** rather than falsely absolute:
+Clients should never have to know s3cache exists. In the default mode they don't:
 
-- **Freshness barrier.** A read served from node-local state — a `LIST` from the index,
-  or a `GET`/`HEAD` of a hot body copy — first waits until every peer's
-  *currently-advertised* feed head has been applied locally. Staleness is bounded by one
-  push/gossip hop (typically ~1 RTT with eager delta push): a write completes on its node
-  and reaches peers' barriers as soon as its feed head propagates. The barrier degrades
-  to serving current state after 1s rather than hanging the request.
-- **Per-writer ordering, cross-writer LWW.** One node's writes apply everywhere in its
-  order. Concurrent writes to the *same key through different nodes* resolve by
-  timestamp (deletes win ties) — and the **origin arbitrates real conflicts**:
-  conditional `If-Match`/`If-None-Match` writes pass through and are decided at the
-  origin (OCC), which can never lose an update. The index is a cache of origin state and
-  heals from it (gap resync, startup bootstrap).
-- **Session tokens (opt-in strict read-after-write).** Every write response carries
-  `x-s3cache-write-token: <writer>:<epoch>:<seq>`. A client that echoes it on a later
-  read as `x-s3cache-read-token` makes that read barrier on *that specific write*
-  having been applied locally — strict cross-node read-after-write regardless of
-  propagation timing. If the token cannot be verified within 1s (partition, dead
-  apply loop), the read is served **from the origin instead of local state**: slower,
-  never stale — a token read is never silently downgraded. Standard SDKs ignore the
-  headers; smart clients opt in (boto3: an event hook injecting the request header).
+**`strong` (default).** Indistinguishable from talking to one S3 node, for *every*
+client, no headers, no cooperation:
+
+- **Writes wait for cluster-wide invalidation.** A write returns only after the origin
+  acked it AND every currently-alive peer acknowledged applying its invalidation (an
+  in-cluster ack round, ~2 gossip hops, riding behind the origin round-trip already
+  paid). So `PUT via A; GET via B` is deterministically fresh — B applied the
+  invalidation before A's PUT even returned.
+- **Unhealthy nodes bench themselves.** A node whose membership view is not fully
+  alive may be the partitioned one — writers can't reach it — so it serves
+  cache-eligible reads via the origin until the view heals: slower, never stale. (This
+  is also what bounds the writer's ack wait: a dying peer is excluded once SWIM marks
+  it suspect.)
+- **Honesty footnote:** the residual window is an *asymmetric* partition inside the
+  SWIM probe window combined with an ack timeout (logged + counted, ~2s) — bounded and
+  loud, never silent. The absolute arbiter for conflicting writers remains the origin:
+  conditional `If-Match`/`If-None-Match` writes pass through untouched (OCC — no lost
+  updates, regardless of node), and the index heals from the origin (gap resync,
+  startup bootstrap). Cross-writer index races resolve by timestamp, deletes winning
+  ties.
+
+**`bounded` (`S3CACHE_CONSISTENCY=bounded`, set uniformly).** For clusters too large to
+pay a per-write ack round: writes return on the origin ack, reads are fresh within ~one
+push hop (the freshness barrier), and no ack-ledger traffic flows. Session tokens then
+offer per-client strictness: every write response carries
+`x-s3cache-write-token: <writer>:<epoch>:<seq>`; echoing it on a read as
+`x-s3cache-read-token` barriers on that specific write, and an unverifiable token
+routes the read to the origin — never silently downgraded. (Tokens work in `strong`
+mode too; they're just redundant there.)
 Requests the cache cannot reproduce faithfully — a specific `versionId`,
 `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
 
@@ -168,6 +175,7 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
 | `S3CACHE_GOSSIP_BIND` | (empty) | UDP bind for the gossip write feed (e.g. `0.0.0.0:7946`); unset = single-node, no coherence layer |
 | `S3CACHE_GOSSIP_SEEDS` | (empty) | Comma-separated seed peers as `id=host:port`; only seeds need static addressing |
 | `S3CACHE_GOSSIP_ADVERTISE` | bind addr | Address peers should dial back (set under NAT/container networking) |
+| `S3CACHE_CONSISTENCY` | `strong` | `strong`: writes wait for cluster-wide invalidation, unhealthy nodes serve via origin. `bounded`: ~one-hop freshness, no per-write ack round (large clusters; set uniformly) |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval (seconds) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Upstream creds (R2: region `auto`) |
 

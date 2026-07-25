@@ -55,6 +55,11 @@ enum ReadRoute {
     Origin,
 }
 
+/// How long a write response may be held waiting for every alive peer to
+/// acknowledge applying its invalidation. Generously above the SWIM suspect
+/// timeout, so a dying peer is excluded from the wait before this fires.
+const WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long a strict read waits for the freshness barrier before serving
 /// current state anyway (degrading to eventual rather than hanging).
 const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -147,6 +152,14 @@ impl CachingProxy {
         let Some(sync) = &self.sync else {
             return ReadRoute::Local; // single node: the sole writer is strict
         };
+        // The read-side half of transparent coherence: if this node's
+        // membership view is not fully alive, it may be the partitioned one —
+        // writers can't reach it with invalidations, so its cache is not
+        // trustworthy. Serve via the origin until the view heals.
+        if !sync.cluster_healthy() {
+            self.metrics.unhealthy_bypass();
+            return ReadRoute::Origin;
+        }
         if !sync.await_fresh(READ_BARRIER_TIMEOUT).await {
             tracing::debug!("freshness barrier timed out; serving current state");
         }
@@ -178,27 +191,46 @@ impl CachingProxy {
 
     /// Record a durable put: fold it into the local index (LWW, same rule the
     /// apply loop uses for peers) and advertise it over the write feed.
-    /// Returns the write's session token when coherence is on.
+    /// Returns the write's session token when coherence is on. The write
+    /// response is held until every alive peer has applied the invalidation
+    /// (a couple of in-cluster hops behind the origin round-trip already
+    /// paid), so a subsequent read via ANY node is fresh with no client
+    /// cooperation. An ack timeout is counted and logged, never an error —
+    /// the unresponsive peer is either dying (SWIM will exclude it) or
+    /// partitioned (its own health gate stops it serving cached state).
     async fn record_put(&self, bucket: &str, key: &str, size: i64) -> Option<String> {
         let ts = SystemTime::now();
         if apply_put(&self.state, bucket, key, size, ts) {
             self.metrics.writes_indexed.fetch_add(1, Ordering::Relaxed);
         }
-        match &self.sync {
-            Some(sync) => Some(sync.publish_put(bucket, key, size, ts, &self.metrics).await),
-            None => None,
+        let Some(sync) = &self.sync else { return None };
+        let receipt = sync.publish_put(bucket, key, size, ts, &self.metrics).await;
+        if !sync
+            .wait_cluster_applied(receipt.token, WRITE_ACK_TIMEOUT)
+            .await
+        {
+            tracing::warn!("write ack timed out for {bucket}/{key}; a peer may lag");
+            self.metrics.ack_timeout();
         }
+        Some(receipt.header)
     }
 
     /// Record a durable delete: tombstone + remove locally, advertise to
-    /// peers. Returns the write's session token when coherence is on.
+    /// peers and hold the response for cluster-wide application (see
+    /// [`record_put`](Self::record_put)).
     async fn record_del(&self, bucket: &str, key: &str) -> Option<String> {
         let ts = SystemTime::now();
         apply_del(&self.state, bucket, key, ts);
-        match &self.sync {
-            Some(sync) => Some(sync.publish_del(bucket, key, ts, &self.metrics).await),
-            None => None,
+        let Some(sync) = &self.sync else { return None };
+        let receipt = sync.publish_del(bucket, key, ts, &self.metrics).await;
+        if !sync
+            .wait_cluster_applied(receipt.token, WRITE_ACK_TIMEOUT)
+            .await
+        {
+            tracing::warn!("delete ack timed out for {bucket}/{key}; a peer may lag");
+            self.metrics.ack_timeout();
         }
+        Some(receipt.header)
     }
 
     /// Warm each bucket's LIST index in the background so startup stays instant and
