@@ -8,9 +8,13 @@ seen by the other:
   1. PUT via A  -> B's index-served LIST shows the key   (index coherence)
   2. GET via B caches it; overwrite via A -> GET via B returns the NEW body
      (cross-node hot-cache invalidation — the anti-stale-read guarantee; this cannot be
-     explained by origin passthrough, only by the log invalidating B's copy)
+     explained by origin passthrough, only by the feed invalidating B's copy)
   3. DELETE via A -> B's LIST loses the key
   4. reverse direction: PUT via B -> A's LIST shows it
+
+Every write captures its `x-s3cache-write-token` response header and every read echoes
+it as `x-s3cache-read-token`, so the no-poll assertions are *guaranteed* strict
+read-after-write (the token barrier), not gossip-timing luck.
 
 Assumes MinIO is reachable (see scripts/coherence-e2e.sh). Exits 0/1.
 """
@@ -23,6 +27,33 @@ import _s3cache_e2e as h
 
 BUCKET = "coherence-test"
 PORT_A, PORT_B = 18031, 18032
+
+# The most recent write's session token; tokenized clients echo it on reads.
+TOKEN = {"v": None}
+
+
+def tokenized(endpoint):
+    """An S3 client that echoes the latest write token on every request."""
+    cli = h.s3(endpoint)
+
+    def inject(request, **_kw):
+        if TOKEN["v"]:
+            request.headers["x-s3cache-read-token"] = TOKEN["v"]
+
+    cli.meta.events.register("before-send.s3", inject)
+    return cli
+
+
+def write(cli, key, data):
+    """PUT and capture the write's session token for subsequent reads."""
+    resp = cli.put_object(Bucket=BUCKET, Key=key, Body=data)
+    TOKEN["v"] = resp["ResponseMetadata"]["HTTPHeaders"].get("x-s3cache-write-token")
+    return TOKEN["v"]
+
+
+def delete(cli, key):
+    resp = cli.delete_object(Bucket=BUCKET, Key=key)
+    TOKEN["v"] = resp["ResponseMetadata"]["HTTPHeaders"].get("x-s3cache-write-token")
 
 
 def keys(cli):
@@ -44,28 +75,30 @@ def main():
     try:
         assert h.wait_port(PORT_A) and h.wait_port(PORT_B), "nodes did not bind"
         time.sleep(1.5)  # let each node's (empty-bucket) index sync complete
-        a, b = h.s3(f"http://127.0.0.1:{PORT_A}"), h.s3(f"http://127.0.0.1:{PORT_B}")
+        a, b = tokenized(f"http://127.0.0.1:{PORT_A}"), tokenized(f"http://127.0.0.1:{PORT_B}")
 
         def check(name, ok):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
             if not ok:
                 failures.append(name)
 
-        # Default consistency is `strong`, so every cross-node read must reflect the peer's
-        # write *immediately* — asserted with NO poll (the read-barrier does the waiting).
-        a.put_object(Bucket=BUCKET, Key="k1", Body=b"v1")
-        check("PUT via A -> LIST via B sees k1 (strong, no poll)", "k1" in keys(b))
+        # Reads echo each write's session token, so every cross-node read must reflect
+        # the peer's write *immediately* — asserted with NO poll (the token barrier does
+        # the waiting).
+        token = write(a, "k1", b"v1")
+        check("PUT response carries a write token", bool(token))
+        check("PUT via A -> LIST via B sees k1 (token barrier, no poll)", "k1" in keys(b))
 
         check("GET via B returns v1", body(b, "k1") == b"v1")  # primes B's hot copy
-        a.put_object(Bucket=BUCKET, Key="k1", Body=b"v2-overwritten")
-        check("overwrite via A -> GET via B returns v2 (strong, no poll, no stale hot)",
+        write(a, "k1", b"v2-overwritten")
+        check("overwrite via A -> GET via B returns v2 (token barrier, no stale hot)",
               body(b, "k1") == b"v2-overwritten")
 
-        a.delete_object(Bucket=BUCKET, Key="k1")
-        check("DELETE via A -> LIST via B loses k1 (strong, no poll)", "k1" not in keys(b))
+        delete(a, "k1")
+        check("DELETE via A -> LIST via B loses k1 (token barrier, no poll)", "k1" not in keys(b))
 
-        b.put_object(Bucket=BUCKET, Key="k2", Body=b"from-b")
-        check("PUT via B -> LIST via A sees k2 (strong, no poll)", "k2" in keys(a))
+        write(b, "k2", b"from-b")
+        check("PUT via B -> LIST via A sees k2 (token barrier, no poll)", "k2" in keys(a))
 
         # With the disk (warm) tier on, a peer's overwrite must invalidate the *disk* copy
         # too, not just hot — else a hot-evicted-but-disk-cached object goes stale.
@@ -82,11 +115,11 @@ def main():
         try:
             assert h.wait_port(18033) and h.wait_port(18034)
             time.sleep(1.5)
-            c, dd = h.s3("http://127.0.0.1:18033"), h.s3("http://127.0.0.1:18034")
-            c.put_object(Bucket=BUCKET, Key="w", Body=b"one")
-            check("disk tier: D LIST sees C's write (strong, no poll)", "w" in keys(dd))
+            c, dd = tokenized("http://127.0.0.1:18033"), tokenized("http://127.0.0.1:18034")
+            write(c, "w", b"one")
+            check("disk tier: D LIST sees C's write (token barrier, no poll)", "w" in keys(dd))
             _ = body(dd, "w")  # D reads it -> now in D's hot AND disk tiers
-            c.put_object(Bucket=BUCKET, Key="w", Body=b"two")  # C overwrites
+            write(c, "w", b"two")  # C overwrites
             check("disk tier: D GET reflects C's overwrite (hot+disk invalidated, no poll)",
                   body(dd, "w") == b"two")
         finally:

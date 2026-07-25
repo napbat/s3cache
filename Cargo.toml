@@ -19,6 +19,7 @@ tierstore-mmap = { git = "https://github.com/coconutbird/tierstore", branch = "m
 tierstore-moka = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
 groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency", "udp"] }
 bytes = { version = "1", features = ["serde"] }
+http = "1"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

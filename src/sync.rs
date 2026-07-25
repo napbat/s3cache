@@ -25,7 +25,9 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use groupnet::consistency::{Frontier, PeerWrite, PeerWrites, WriteFeed, advertised_head};
+use groupnet::consistency::{
+    Frontier, PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head,
+};
 use groupnet::core::NodeId;
 use groupnet::runtime::{Group, Node};
 use groupnet::transport::udp::UdpTransport;
@@ -39,6 +41,23 @@ use crate::tier::LocalCache;
 /// Ring capacity: a peer that falls further behind than this many writes
 /// gets a gap (flush + origin resync) instead of per-event application.
 const FEED_CAPACITY: usize = 4096;
+
+/// Response header carrying a write's session token (`writer:epoch:seq`).
+/// A client that echoes it on later reads gets strict read-after-write for
+/// that write on any node, regardless of propagation timing.
+pub(crate) const WRITE_TOKEN_HEADER: &str = "x-s3cache-write-token";
+
+/// Request header echoing a [`WRITE_TOKEN_HEADER`] value: the read barriers
+/// on that specific write having been applied locally.
+pub(crate) const READ_TOKEN_HEADER: &str = "x-s3cache-read-token";
+
+/// Splits `writer:epoch:seq` from the right, so writer names may contain
+/// colons. `None` for anything else.
+fn parse_token(value: &str) -> Option<(&str, u64, u64)> {
+    let (rest, seq) = value.rsplit_once(':')?;
+    let (writer, epoch) = rest.rsplit_once(':')?;
+    Some((writer, epoch.parse().ok()?, seq.parse().ok()?))
+}
 
 /// Attempts (one per second) to resolve a gossip seed's DNS name before
 /// giving up — a `StatefulSet` peer's record can lag its own startup.
@@ -130,6 +149,7 @@ impl WriteSync {
     }
 
     /// Advertise a durable put to peers, stamped with the local index's `ts`.
+    /// Returns the write's session token (a [`WRITE_TOKEN_HEADER`] value).
     pub(crate) async fn publish_put(
         &self,
         bucket: &str,
@@ -137,20 +157,20 @@ impl WriteSync {
         size: i64,
         ts: SystemTime,
         metrics: &Metrics,
-    ) {
+    ) -> String {
         self.publish(IndexOp::Put { size }, bucket, key, ts, metrics)
-            .await;
+            .await
     }
 
-    /// Advertise a durable delete to peers.
+    /// Advertise a durable delete to peers. Returns the write's session token.
     pub(crate) async fn publish_del(
         &self,
         bucket: &str,
         key: &str,
         ts: SystemTime,
         metrics: &Metrics,
-    ) {
-        self.publish(IndexOp::Del, bucket, key, ts, metrics).await;
+    ) -> String {
+        self.publish(IndexOp::Del, bucket, key, ts, metrics).await
     }
 
     async fn publish(
@@ -160,15 +180,36 @@ impl WriteSync {
         key: &str,
         ts: SystemTime,
         metrics: &Metrics,
-    ) {
+    ) -> String {
         let event = IndexEvent {
             op,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             ts_ms: to_millis(ts),
         };
-        let _token = self.feed.publish(&event).await;
+        let token = self.feed.publish(&event).await;
         metrics.feed_published();
+        format!("{}:{}:{}", self.me.as_str(), token.epoch, token.seq)
+    }
+
+    /// Waits (bounded) until one specific write — a [`WRITE_TOKEN_HEADER`]
+    /// value echoed by a client — has been applied locally. Tokens this node
+    /// issued are trivially satisfied (its own writes are already local);
+    /// garbled tokens are ignored (the freshness barrier still ran).
+    pub(crate) async fn reached_token(&self, header: &str, timeout: Duration) -> bool {
+        let Some((writer, epoch, seq)) = parse_token(header) else {
+            return true;
+        };
+        if writer == self.me.as_str() {
+            return true;
+        }
+        let Some(view) = self.view.get() else {
+            return true;
+        };
+        let write = WriteToken { epoch, seq };
+        tokio::time::timeout(timeout, view.reached(&NodeId::new(writer), write))
+            .await
+            .unwrap_or(false)
     }
 
     /// Spawn the apply loop: peers' events fold into the LIST index and drop
@@ -446,6 +487,36 @@ mod tests {
         assert!(
             caught_up,
             "barrier must pass once the apply loop is caught up"
+        );
+    }
+
+    /// Session tokens: the issuer satisfies its own instantly, a peer only
+    /// once the write is applied, and garbage never blocks a read.
+    #[tokio::test]
+    async fn write_tokens_upgrade_reads_to_strict() {
+        let net = Network::new();
+        let (sync_a, sync_b, state, _cache) = wired_pair(&net);
+        let metrics = Metrics::default();
+
+        let token = sync_a
+            .publish_put("bkt", "tok", 1, SystemTime::now(), &metrics)
+            .await;
+        assert!(
+            sync_a
+                .reached_token(&token, Duration::from_millis(50))
+                .await,
+            "the issuer's own token is trivially satisfied"
+        );
+        assert!(
+            sync_b.reached_token(&token, Duration::from_secs(5)).await,
+            "a peer satisfies the token once the write is applied"
+        );
+        assert_eq!(indexed_size(&state, "bkt", "tok"), Some(1));
+        assert!(
+            sync_b
+                .reached_token("not-a-token", Duration::from_millis(10))
+                .await,
+            "garbage tokens never block"
         );
     }
 

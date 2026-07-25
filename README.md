@@ -91,9 +91,12 @@ bounded** rather than falsely absolute:
   conditional `If-Match`/`If-None-Match` writes pass through and are decided at the
   origin (OCC), which can never lose an update. The index is a cache of origin state and
   heals from it (gap resync, startup bootstrap).
-- **Roadmap.** The feed already returns read-your-writes session tokens
-  (`(writer, epoch, seq)`); surfacing them in API responses would give clients strict
-  read-after-write across nodes regardless of propagation timing.
+- **Session tokens (opt-in strict read-after-write).** Every write response carries
+  `x-s3cache-write-token: <writer>:<epoch>:<seq>`. A client that echoes it on a later
+  read as `x-s3cache-read-token` makes that read barrier on *that specific write*
+  having been applied locally — strict cross-node read-after-write regardless of
+  propagation timing, bounded by the same 1s degrade. Standard SDKs ignore the headers;
+  smart clients opt in (boto3: an event hook injecting the request header).
 Requests the cache cannot reproduce faithfully — a specific `versionId`,
 `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
 

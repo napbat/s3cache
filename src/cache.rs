@@ -32,8 +32,9 @@ use crate::index::{
     BucketState, apply_del, apply_put, list_objects_v2_from_index, sync_bucket_into,
 };
 use crate::metrics::Metrics;
-use crate::sync::WriteSync;
+use crate::sync::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteSync};
 use crate::tier::{self, CachedObject, TieredCache, WarmPair};
+use http::{HeaderMap, HeaderName, HeaderValue};
 
 /// Sizing for the object cache, passed to [`CachingProxy::new`].
 #[derive(Clone, Copy)]
@@ -132,11 +133,26 @@ impl CachingProxy {
     /// head has been applied locally, so a peer's just-completed write is not read stale.
     /// Freshness is bounded by one push/gossip hop (see [`crate::sync`]); degrades to
     /// serving current state on timeout. No-op without gossip (single-node is strict).
-    async fn read_barrier(&self) {
-        if let Some(sync) = &self.sync
-            && !sync.await_fresh(READ_BARRIER_TIMEOUT).await
-        {
+    async fn read_barrier(&self, headers: &HeaderMap) {
+        let Some(sync) = &self.sync else { return };
+        if !sync.await_fresh(READ_BARRIER_TIMEOUT).await {
             tracing::debug!("freshness barrier timed out; serving current state");
+        }
+        // A client-echoed write token upgrades the read to strict
+        // read-after-write for that write, independent of propagation timing.
+        if let Some(token) = headers.get(READ_TOKEN_HEADER).and_then(|v| v.to_str().ok())
+            && !sync.reached_token(token, READ_BARRIER_TIMEOUT).await
+        {
+            tracing::debug!("read-token barrier timed out; serving current state");
+        }
+    }
+
+    /// Attach a write's session token to a response, when coherence is on.
+    fn attach_token(headers: &mut HeaderMap, token: Option<String>) {
+        if let Some(token) = token
+            && let Ok(value) = HeaderValue::from_str(&token)
+        {
+            headers.insert(HeaderName::from_static(WRITE_TOKEN_HEADER), value);
         }
     }
 
@@ -146,22 +162,26 @@ impl CachingProxy {
 
     /// Record a durable put: fold it into the local index (LWW, same rule the
     /// apply loop uses for peers) and advertise it over the write feed.
-    async fn record_put(&self, bucket: &str, key: &str, size: i64) {
+    /// Returns the write's session token when coherence is on.
+    async fn record_put(&self, bucket: &str, key: &str, size: i64) -> Option<String> {
         let ts = SystemTime::now();
         if apply_put(&self.state, bucket, key, size, ts) {
             self.metrics.writes_indexed.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(sync) = &self.sync {
-            sync.publish_put(bucket, key, size, ts, &self.metrics).await;
+        match &self.sync {
+            Some(sync) => Some(sync.publish_put(bucket, key, size, ts, &self.metrics).await),
+            None => None,
         }
     }
 
-    /// Record a durable delete: tombstone + remove locally, advertise to peers.
-    async fn record_del(&self, bucket: &str, key: &str) {
+    /// Record a durable delete: tombstone + remove locally, advertise to
+    /// peers. Returns the write's session token when coherence is on.
+    async fn record_del(&self, bucket: &str, key: &str) -> Option<String> {
         let ts = SystemTime::now();
         apply_del(&self.state, bucket, key, ts);
-        if let Some(sync) = &self.sync {
-            sync.publish_del(bucket, key, ts, &self.metrics).await;
+        match &self.sync {
+            Some(sync) => Some(sync.publish_del(bucket, key, ts, &self.metrics).await),
+            None => None,
         }
     }
 
@@ -328,7 +348,7 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         if self.is_synced(req.input.bucket.as_str()) {
-            self.read_barrier().await; // index is node-local -> barrier when strict
+            self.read_barrier(&req.headers).await; // index is node-local -> barrier when strict
             self.metrics.list_from_index.fetch_add(1, Ordering::Relaxed);
             let out = self.list_from_index(&req.input);
             return Ok(S3Response::new(out));
@@ -347,9 +367,10 @@ impl s3s::S3 for CachingProxy {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let size = req.input.content_length.unwrap_or(0);
-        let resp = self.inner.put_object(req).await?;
-        self.record_put(&bucket, &key, size).await;
+        let mut resp = self.inner.put_object(req).await?;
+        let token = self.record_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
+        Self::attach_token(&mut resp.headers, token);
         Ok(resp)
     }
 
@@ -359,9 +380,10 @@ impl s3s::S3 for CachingProxy {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let resp = self.inner.delete_object(req).await?;
-        self.record_del(&bucket, &key).await;
+        let mut resp = self.inner.delete_object(req).await?;
+        let token = self.record_del(&bucket, &key).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
+        Self::attach_token(&mut resp.headers, token);
         Ok(resp)
     }
 
@@ -377,11 +399,15 @@ impl s3s::S3 for CachingProxy {
             .iter()
             .map(|o| o.key.clone())
             .collect();
-        let resp = self.inner.delete_objects(req).await?;
+        let mut resp = self.inner.delete_objects(req).await?;
+        let mut token = None;
         for k in keys {
-            self.record_del(&bucket, &k).await;
+            // Keep the newest token: it covers the whole batch (one writer,
+            // ordered feed).
+            token = self.record_del(&bucket, &k).await.or(token);
             self.obj_cache.invalidate(&(bucket.clone(), k)).await;
         }
+        Self::attach_token(&mut resp.headers, token);
         Ok(resp)
     }
 
@@ -391,13 +417,14 @@ impl s3s::S3 for CachingProxy {
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let resp = self.inner.complete_multipart_upload(req).await?;
+        let mut resp = self.inner.complete_multipart_upload(req).await?;
         // Multipart is how the big objects arrive, and indexing them at a
         // placeholder size poisoned the range-promotion decision (a "0-byte"
         // entry promoted a multi-GB fetch). One HEAD learns the real size.
         let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
-        self.record_put(&bucket, &key, size).await;
+        let token = self.record_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
+        Self::attach_token(&mut resp.headers, token);
         Ok(resp)
     }
 
@@ -407,10 +434,11 @@ impl s3s::S3 for CachingProxy {
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let resp = self.inner.copy_object(req).await?;
+        let mut resp = self.inner.copy_object(req).await?;
         let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
-        self.record_put(&bucket, &key, size).await;
+        let token = self.record_put(&bucket, &key, size).await;
         self.obj_cache.invalidate(&(bucket, key)).await;
+        Self::attach_token(&mut resp.headers, token);
         Ok(resp)
     }
 
@@ -443,7 +471,7 @@ impl s3s::S3 for CachingProxy {
         // Before any read served from a node-local hot copy, barrier so a peer's
         // overwrite is never read stale (strong consistency); misses go to the origin.
         if cacheable || int_range.is_some() {
-            self.read_barrier().await;
+            self.read_barrier(&req.headers).await;
         }
         if let Some((first, last)) = int_range {
             // Cached whole object → serve the slice locally.
@@ -517,7 +545,7 @@ impl s3s::S3 for CachingProxy {
             && req.input.checksum_mode.is_none()
             && req.input.sse_customer_key.is_none();
         if cache_eligible {
-            self.read_barrier().await; // strong consistency for a hot-served HEAD
+            self.read_barrier(&req.headers).await; // strong consistency for a hot-served HEAD
             let ckey = (req.input.bucket.clone(), req.input.key.clone());
             if let Some(obj) = self.obj_cache.get(&ckey).await {
                 self.metrics.get_hit.fetch_add(1, Ordering::Relaxed);

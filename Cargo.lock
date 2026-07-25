@@ -2182,6 +2182,7 @@ dependencies = [
  "bytes",
  "futures",
  "groupnet",
+ "http 1.4.2",
  "hyper-util",
  "rlimit",
  "s3s",
