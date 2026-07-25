@@ -13,7 +13,7 @@ helm:
     # every alive peer's invalidation ack). Scaling is only this number.
     replicaCount: 3
     image:
-      tag: 482bba1399909a8d673eaf0c7f715a4519fc176c
+      tag: 589ace3b3b969c6edff63c4cba2c2ca605ac9212
     upstream:
       endpoint: https://e340c486028724e7b58d09928fdf10e2.r2.cloudflarestorage.com
       buckets: docres
