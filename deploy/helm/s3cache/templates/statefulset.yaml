@@ -30,11 +30,9 @@ spec:
           ports:
             - name: s3
               containerPort: 8014
-            {{- if .Values.gossip.enabled }}
             - name: gossip
               containerPort: {{ .Values.gossip.port }}
               protocol: UDP
-            {{- end }}
           env:
             - name: S3CACHE_LISTEN
               value: "0.0.0.0:8014"
@@ -48,11 +46,11 @@ spec:
             - name: S3CACHE_DISK_CACHE_BYTES
               value: {{ .Values.diskCache.bytes | quote }}
             {{- end }}
-            {{- if .Values.gossip.enabled }}
             # Pod name = gossip node id (HOSTNAME is set by the kubelet). Pod-0 is the
             # only static seed; the rest resolves via gossiped advertisements. The
             # advertise address must be the routable pod IP (peers parse it as an
-            # address), hence the downward API rather than a DNS name.
+            # address), hence the downward API rather than a DNS name. Always on: a
+            # single replica is a cluster of one, and scaling is just replicaCount.
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -65,7 +63,6 @@ spec:
               value: "s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }}"
             - name: S3CACHE_CONSISTENCY
               value: {{ .Values.gossip.consistency | quote }}
-            {{- end }}
             - name: RUST_LOG
               value: "info"
           # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION for the upstream.

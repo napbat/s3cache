@@ -1,7 +1,6 @@
-# Replica count. With gossip.enabled=false (default) the in-memory LIST index is
-# node-local, so this MUST stay 1 (replicas would diverge) — HA is by fast restart.
-# With gossip.enabled=true the replicas keep each other coherent over the write feed,
-# so you can safely raise this.
+# Replica count — the ONE scaling knob. Every pod is always a gossip cluster member
+# (a single replica is just a cluster of one, which costs nothing); raising this adds
+# coherent replicas with no other configuration.
 replicaCount: 1
 
 image:
@@ -28,13 +27,11 @@ diskCache:
   volume:                   # any pod-volume spec backing diskCache.path
     emptyDir: {}
 
-# Cross-node coherence via the gossip write feed (groupnet) — no extra services.
-# Enable to run more than one replica without their LIST indexes drifting: pods gossip
-# over a headless UDP service, pod-0 is the only static seed (everyone else resolves
-# through gossiped advertisements), and pod names are the node identities. Multi-node
-# freshness is bounded by one gossip/push hop — see the repo README, "Consistency".
+# Cross-node coherence via the gossip write feed (groupnet) — always on, no extra
+# services, no toggle: pods gossip over a headless UDP service, pod-0 is the only
+# static seed (everyone else resolves through gossiped advertisements), and pod names
+# are the node identities. A single replica is a cluster of one.
 gossip:
-  enabled: false
   port: 7946
   # strong (default): writes wait for every alive peer to apply their invalidation and
   # unhealthy nodes serve via the origin — indistinguishable from one S3 node, right for
