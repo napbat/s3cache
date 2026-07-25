@@ -202,11 +202,11 @@ impl Core {
     /// tier is a warm hit (and is promoted into hot by policy); an incomplete report means
     /// a tier failed and was routed around.
     async fn lookup(&self, key: &CacheKey) -> Option<Arc<CachedObject>> {
-        let report = self.cache.router().read_many(std::slice::from_ref(key)).await.ok()?;
-        if !report.is_complete() {
+        let (status, failures) = self.cache.router().read_one(key).await.ok()?;
+        if !failures.is_empty() {
             self.metrics.warm_error();
         }
-        if let Some(KeyStatus::Hit { tier, value }) = report.statuses.into_iter().next() {
+        if let KeyStatus::Hit { tier, value } = status {
             if tier > 0 {
                 self.metrics.warm_hit();
             }
@@ -288,7 +288,9 @@ impl TieredCache {
         self.core.invalidate(key).await;
     }
 
-    /// Get `key`, or run `origin` to fetch it and populate the tiers. Probe-then-gate
+    /// Get `key`, or run `origin` to fetch it and populate the tiers. Kept local (rather
+    /// than `tierstore::TieredCache::get_or_load`) because the probes here feed the
+    /// per-request warm metrics via tier provenance. Probe-then-gate
     /// singleflight: hot hits never touch the gate; concurrent misses for one key share a
     /// single origin round-trip (followers re-probe under the gate and reuse the leader's
     /// fill). Errors are not cached.
