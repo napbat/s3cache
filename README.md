@@ -102,6 +102,38 @@ bounded** rather than falsely absolute:
 Requests the cache cannot reproduce faithfully — a specific `versionId`,
 `ChecksumMode`, or SSE-C — bypass the cache and are served by the origin.
 
+### Client cookbook: tokens and cross-node OCC
+
+**Getting / using the session token** (opt-in; standard SDKs work fine without it):
+
+```python
+# boto3: capture each write's token, echo it on reads.
+TOKEN = {"v": None}
+def inject(request, **_kw):
+    if TOKEN["v"]:
+        request.headers["x-s3cache-read-token"] = TOKEN["v"]
+cli.meta.events.register("before-send.s3", inject)
+
+resp = cli.put_object(Bucket=b, Key=k, Body=data)
+TOKEN["v"] = resp["ResponseMetadata"]["HTTPHeaders"]["x-s3cache-write-token"]
+# every following read via ANY node now reflects that write, or is served
+# by the origin — never stale, never silently downgraded
+```
+
+Zero-client-change alternative: session affinity at the load balancer — a client
+pinned to one node reads its own writes locally by construction.
+
+**Cross-node OCC (read-modify-write)** needs no token — conditional operations
+bypass the cache and the *origin* arbitrates, so no update is ever lost:
+
+1. `GET key` (any node) → body + ETag.
+2. `PUT If-Match: <etag>` with the new value. `200` ⇒ you won (keep the write
+   token for your session's reads).
+3. `412` ⇒ someone else won: re-read fresh and retry. `GET If-None-Match:
+   <your-stale-etag>` is guaranteed fresh in one shot (conditional GETs pass
+   through to the origin); a plain re-read is fresh within ~1 RTT.
+4. Create-only: `PUT If-None-Match: *` — exactly one creator across all nodes.
+
 ### Testing coherence and parity
 
 - **Unit / protocol tests** (`cargo test`): fully in-process — real groupnet nodes over
