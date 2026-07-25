@@ -3186,7 +3186,7 @@ dependencies = [
 [[package]]
 name = "tierstore"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#a6ea7ab08de3e20c7eab8e0ad7afcbbae5d24aca"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
 dependencies = [
  "tierstore-core",
 ]
@@ -3194,12 +3194,12 @@ dependencies = [
 [[package]]
 name = "tierstore-core"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#a6ea7ab08de3e20c7eab8e0ad7afcbbae5d24aca"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
 
 [[package]]
 name = "tierstore-mmap"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#a6ea7ab08de3e20c7eab8e0ad7afcbbae5d24aca"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
 dependencies = [
  "bytes",
  "memmap2",
@@ -3209,7 +3209,7 @@ dependencies = [
 [[package]]
 name = "tierstore-moka"
 version = "0.1.0"
-source = "git+https://github.com/coconutbird/tierstore?branch=main#a6ea7ab08de3e20c7eab8e0ad7afcbbae5d24aca"
+source = "git+https://github.com/coconutbird/tierstore?branch=main#f7f8770c4c6c6042eeb59fa37db6731451212bf4"
 dependencies = [
  "moka",
  "tierstore-core",
