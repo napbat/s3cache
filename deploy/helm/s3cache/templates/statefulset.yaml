@@ -59,8 +59,11 @@ spec:
               value: "0.0.0.0:{{ .Values.gossip.port }}"
             - name: S3CACHE_GOSSIP_ADVERTISE
               value: "$(POD_IP):{{ .Values.gossip.port }}"
+            # Two seed ordinals so no pod is ever seedless: each pod skips itself,
+            # leaving pod-0 seeding pod-1 and everyone else seeding pod-0. With a
+            # single replica the second entry never resolves — harmless retries.
             - name: S3CACHE_GOSSIP_SEEDS
-              value: "s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }}"
+              value: "s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }},s3cache-1=s3cache-1.s3cache-gossip:{{ .Values.gossip.port }}"
             - name: S3CACHE_CONSISTENCY
               value: {{ .Values.gossip.consistency | quote }}
             - name: RUST_LOG

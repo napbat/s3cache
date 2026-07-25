@@ -413,14 +413,24 @@ pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
         let (id, addr) = (id.to_owned(), addr.to_owned());
         let (transport, group) = (transport.clone(), group.clone());
         tokio::spawn(async move {
-            match resolve_seed(&addr).await {
-                Some(sock) => {
-                    transport.register_peer(NodeId::new(id.as_str()), sock);
-                    group.add_peer(NodeId::new(id.as_str()));
+            let mut registered: Option<std::net::SocketAddr> = None;
+            loop {
+                match resolve_seed(&addr).await {
+                    Some(sock) if registered != Some(sock) => {
+                        if registered.is_some() {
+                            info!("gossip seed `{id}` moved to {sock}; re-registering");
+                        }
+                        transport.register_peer(NodeId::new(id.as_str()), sock);
+                        group.add_peer(NodeId::new(id.as_str()));
+                        registered = Some(sock);
+                    }
+                    Some(_) => {}
+                    None if registered.is_none() => {
+                        warn!("gossip seed `{id}={addr}` not resolving yet; will keep trying");
+                    }
+                    None => {}
                 }
-                None => {
-                    warn!("gossip seed `{id}={addr}` never resolved; relying on inbound contact");
-                }
+                tokio::time::sleep(SEED_REFRESH).await;
             }
         });
     }
