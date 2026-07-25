@@ -14,9 +14,9 @@ aws-sdk-s3 = "1"
 aws-credential-types = "1"
 tokio = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
-tierstore = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
-tierstore-mmap = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
-tierstore-moka = { git = "https://github.com/coconutbird/tierstore", branch = "main" }
+tierstore = { git = "https://github.com/napbat/tierstore", branch = "main" }
+tierstore-mmap = { git = "https://github.com/napbat/tierstore", branch = "main" }
+tierstore-moka = { git = "https://github.com/napbat/tierstore", branch = "main" }
 groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency-acks", "udp"] }
 bytes = { version = "1", features = ["serde"] }
 http = "1"
