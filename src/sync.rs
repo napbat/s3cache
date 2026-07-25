@@ -87,9 +87,15 @@ fn parse_token(value: &str) -> Option<(&str, u64, u64)> {
     Some((writer, epoch.parse().ok()?, seq.parse().ok()?))
 }
 
-/// Attempts (one per second) to resolve a gossip seed's DNS name before
-/// giving up — a `StatefulSet` peer's record can lag its own startup.
+/// Attempts (one per second) to resolve a gossip seed's DNS name within one
+/// refresh cycle — a `StatefulSet` peer's record can lag its own startup.
 const SEED_RESOLVE_ATTEMPTS: u32 = 30;
+
+/// How often each seed is re-resolved, forever. Pod IPs churn on restarts
+/// and the seed's DNS record follows; re-resolution is the recovery channel
+/// that works even when gossip cannot deliver the new address (a rebooted
+/// peer is deaf to us until OUR datagrams come from an address it knows).
+const SEED_REFRESH: Duration = Duration::from_secs(15);
 
 /// Resolves `host:port` (a DNS name or a literal address) to a socket
 /// address, retrying briefly; `None` when it never resolves.
