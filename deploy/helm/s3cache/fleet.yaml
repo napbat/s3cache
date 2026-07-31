@@ -8,10 +8,9 @@ labels:
 helm:
   releaseName: s3cache
   values:
-    # Three coherent replicas: pods join by name off pod-0, self-resolve via
-    # gossiped advertisements, and run strong consistency (writes wait for
-    # every alive peer's invalidation ack). Scaling is only this number.
-    replicaCount: 3
+    # One replica is sufficient for the current workload. Scaling is only this
+    # number; replicas join by name off pod-0 when this is raised again.
+    replicaCount: 1
     image:
       tag: 8611c092483b684469d94bd2366e934442cd0539
     upstream:
