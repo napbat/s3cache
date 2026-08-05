@@ -80,6 +80,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // fails to sync just stays in passthrough (safe).
     cp.spawn_background_sync(cfg.buckets);
     metrics::spawn_stats(cp.metrics(), cfg.stats_secs);
+    // Optional Prometheus text endpoint on its own port, so the counters can be graphed
+    // and alerted on instead of diffed out of the stats line by hand. Off by default;
+    // a bad S3CACHE_METRICS_LISTEN fails startup rather than leaving a silent blind spot.
+    if let Some(listen) = &cfg.metrics_listen {
+        metrics::spawn_exporter(cp.metrics(), listen).await?;
+    }
 
     let service = {
         let mut b = S3ServiceBuilder::new(cp);

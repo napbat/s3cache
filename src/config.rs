@@ -44,6 +44,9 @@ pub struct Config {
     pub node_name: String,
     /// Stats log interval in seconds (`S3CACHE_STATS_SECS`).
     pub stats_secs: u64,
+    /// Bind address for the Prometheus text endpoint, `None` when disabled
+    /// (`S3CACHE_METRICS_LISTEN`).
+    pub metrics_listen: Option<String>,
 }
 
 impl Config {
@@ -68,6 +71,7 @@ impl Config {
             disk_bytes: parse_or(var("S3CACHE_DISK_CACHE_BYTES"), DEFAULT_DISK_CACHE_BYTES),
             node_name: env_or(var("HOSTNAME"), DEFAULT_NODE_NAME),
             stats_secs: parse_or(var("S3CACHE_STATS_SECS"), DEFAULT_STATS_SECS),
+            metrics_listen: var("S3CACHE_METRICS_LISTEN"),
         }
     }
 }

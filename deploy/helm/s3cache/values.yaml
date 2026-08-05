@@ -46,6 +46,13 @@ gossip:
   # the origin ack, no per-write cluster round — for large clusters. Set uniformly.
   consistency: strong
 
+# Prometheus text endpoint (GET /metrics) on its own port, carrying the same counters as
+# the 60s stats line — graphable and alertable instead of diffed out of pod logs by hand.
+# Off by default: nothing else changes when it is on, it is just another listener.
+metrics:
+  enabled: false
+  port: 9090
+
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from
 # this externally-provided Secret (cicd/fleet/secrets/prod/s3cache.yaml).
 auth:

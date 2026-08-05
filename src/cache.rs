@@ -1,9 +1,10 @@
 //! Caching layer over the upstream `s3s_aws::Proxy`.
 //!
 //! Every client request funnels through this proxy, so it sees every write. That lets
-//! it answer **LIST** from an in-memory key index (LISTs are R2's expensive Class-A
-//! tier) and serve small GET/HEAD bodies from an LRU, while writes forward through to
-//! the upstream — which stays the authority for conditional (OCC) writes.
+//! it answer **LIST** and **HEAD** from an in-memory key index (LISTs are R2's expensive
+//! Class-A tier, and a HEAD-per-key existence probe its most voluminous Class-B one) and
+//! serve small GET/HEAD bodies from an LRU, while writes forward through to the upstream
+//! — which stays the authority for conditional (OCC) writes.
 //!
 //! Correctness rests on one property: this proxy is the *only* path to the bucket. The
 //! index warms lazily — LISTs pass through until a bucket's background full-LIST sync
@@ -20,15 +21,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use s3s::dto::{
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput,
-    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, GetObjectInput,
-    GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output,
-    PutObjectInput, PutObjectOutput, StreamingBlob,
+    DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, ETag,
+    GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input,
+    ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob,
 };
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
 use crate::index::{
-    BucketState, apply_del, apply_put, list_objects_v2_from_index, sync_bucket_into,
+    BucketState, ObjEntry, apply_del, apply_put, head_object_from_index,
+    list_objects_v2_from_index, sync_bucket_into,
 };
 use crate::metrics::Metrics;
 use crate::sync::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteSync};
@@ -62,6 +64,26 @@ const WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 /// How long a strict read waits for the freshness barrier before serving
 /// current state anyway (degrading to eventual rather than hanging).
 const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Which write folded a key into the LIST index. Each of these is a separately
+/// billed upstream (R2 class A) operation, so each gets its own counter — one
+/// lumped `writes_indexed` can't attribute the spend.
+#[derive(Clone, Copy)]
+enum IndexedWrite {
+    Put,
+    Copy,
+    MultipartComplete,
+}
+
+impl IndexedWrite {
+    fn record(self, metrics: &Metrics) {
+        match self {
+            Self::Put => metrics.write_indexed_put(),
+            Self::Copy => metrics.write_indexed_copy(),
+            Self::MultipartComplete => metrics.write_indexed_multipart(),
+        }
+    }
+}
 
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
 /// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
@@ -203,10 +225,22 @@ impl CachingProxy {
     /// cooperation. An ack timeout is counted and logged, never an error —
     /// the unresponsive peer is either dying (SWIM will exclude it) or
     /// partitioned (its own health gate stops it serving cached state).
-    async fn record_put(&self, bucket: &str, key: &str, size: i64) -> Option<String> {
+    async fn record_put(
+        &self,
+        op: IndexedWrite,
+        bucket: &str,
+        key: &str,
+        size: i64,
+        etag: Option<ETag>,
+    ) -> Option<String> {
         let ts = SystemTime::now();
-        if apply_put(&self.state, bucket, key, size, ts) {
-            self.metrics.write_indexed();
+        let entry = ObjEntry {
+            size,
+            last_modified: ts,
+            etag,
+        };
+        if apply_put(&self.state, bucket, key, entry) {
+            op.record(&self.metrics);
         }
         let Some(sync) = &self.sync else { return None };
         let receipt = sync.publish_put(bucket, key, size, ts, &self.metrics).await;
@@ -262,8 +296,13 @@ impl CachingProxy {
     /// key provably exists at the origin now, so LWW at `now` is correct and
     /// nothing is advertised (peers learn real writes from their writers).
     fn index_insert(&self, bucket: &str, key: &str, size: i64) {
-        if apply_put(&self.state, bucket, key, size, SystemTime::now()) {
-            self.metrics.write_indexed();
+        let entry = ObjEntry {
+            size,
+            last_modified: SystemTime::now(),
+            etag: None,
+        };
+        if apply_put(&self.state, bucket, key, entry) {
+            self.metrics.write_indexed_observed();
         }
     }
 
@@ -278,18 +317,25 @@ impl CachingProxy {
             .map(|e| e.size)
     }
 
-    /// The upstream's actual size of a key (one HEAD via the direct client).
-    /// Used where the write path doesn't carry the size (multipart complete,
-    /// copy) — indexing those at a placeholder poisons range promotion.
-    async fn upstream_size(&self, bucket: &str, key: &str) -> Option<i64> {
-        self.client
+    /// The upstream's actual size and `ETag` for a key (one HEAD via the direct
+    /// client). Used where the write path doesn't carry the size (multipart
+    /// complete, copy) — indexing those at a placeholder poisons range
+    /// promotion.
+    async fn upstream_meta(&self, bucket: &str, key: &str) -> (Option<i64>, Option<ETag>) {
+        let Ok(head) = self
+            .client
             .head_object()
             .bucket(bucket)
             .key(key)
             .send()
             .await
-            .ok()?
-            .content_length()
+        else {
+            return (None, None);
+        };
+        (
+            head.content_length(),
+            head.e_tag().and_then(|raw| raw.parse().ok()),
+        )
     }
 
     /// Serve an int-range GET by promoting the whole object into the tiered cache (one
@@ -389,6 +435,13 @@ impl CachingProxy {
         let g = self.state.read().unwrap();
         list_objects_v2_from_index(g.get(inp.bucket.as_str()).map(|b| &b.keys), inp)
     }
+
+    /// Build a `HeadObject` response from this bucket's index; `None` when the key is
+    /// not indexed (see [`head_object_from_index`]).
+    fn head_from_index(&self, bucket: &str, key: &str) -> Option<HeadObjectOutput> {
+        let g = self.state.read().unwrap();
+        head_object_from_index(g.get(bucket).map(|b| &b.keys), key)
+    }
 }
 
 #[async_trait]
@@ -418,7 +471,12 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let size = req.input.content_length.unwrap_or(0);
         let mut resp = self.inner.put_object(req).await?;
-        let token = self.record_put(&bucket, &key, size).await;
+        // The origin's ETag rides back on the response, so the index learns it here
+        // rather than paying a HEAD for what a later HEAD will want to report.
+        let etag = resp.output.e_tag.clone();
+        let token = self
+            .record_put(IndexedWrite::Put, &bucket, &key, size, etag)
+            .await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Self::attach_token(&mut resp.headers, token);
         Ok(resp)
@@ -471,8 +529,17 @@ impl s3s::S3 for CachingProxy {
         // Multipart is how the big objects arrive, and indexing them at a
         // placeholder size poisoned the range-promotion decision (a "0-byte"
         // entry promoted a multi-GB fetch). One HEAD learns the real size.
-        let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
-        let token = self.record_put(&bucket, &key, size).await;
+        let (size, head_etag) = self.upstream_meta(&bucket, &key).await;
+        let etag = resp.output.e_tag.clone().or(head_etag);
+        let token = self
+            .record_put(
+                IndexedWrite::MultipartComplete,
+                &bucket,
+                &key,
+                size.unwrap_or(0),
+                etag,
+            )
+            .await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Self::attach_token(&mut resp.headers, token);
         Ok(resp)
@@ -485,8 +552,16 @@ impl s3s::S3 for CachingProxy {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
         let mut resp = self.inner.copy_object(req).await?;
-        let size = self.upstream_size(&bucket, &key).await.unwrap_or(0);
-        let token = self.record_put(&bucket, &key, size).await;
+        let (size, head_etag) = self.upstream_meta(&bucket, &key).await;
+        let etag = resp
+            .output
+            .copy_object_result
+            .as_ref()
+            .and_then(|result| result.e_tag.clone())
+            .or(head_etag);
+        let token = self
+            .record_put(IndexedWrite::Copy, &bucket, &key, size.unwrap_or(0), etag)
+            .await;
         self.obj_cache.invalidate(&(bucket, key)).await;
         Self::attach_token(&mut resp.headers, token);
         Ok(resp)
@@ -593,8 +668,14 @@ impl s3s::S3 for CachingProxy {
         Ok(resp)
     }
 
-    // HEAD served from the object cache when the body is already cached. Requests that
-    // need the origin (range, part, specific version, checksums, SSE-C) pass through.
+    // HEAD served from the object cache when the body is already cached, and from the
+    // LIST index when it is not: on a synced bucket the index is authoritative for
+    // existence (the property LIST-from-index already rests on) and carries the size,
+    // mtime and ETag a HEAD reports — so a HEAD of an uncached object costs nothing,
+    // and a HEAD of an absent key is a local 404. Requests that need the origin pass
+    // through: a range or part, a specific version, checksums, SSE-C, and — as on the
+    // GET path — anything conditional, since the origin is the authority on whether a
+    // precondition holds. So does any bucket whose index has not finished warming.
     async fn head_object(
         &self,
         req: S3Request<HeadObjectInput>,
@@ -603,14 +684,27 @@ impl s3s::S3 for CachingProxy {
             && req.input.part_number.is_none()
             && req.input.version_id.is_none()
             && req.input.checksum_mode.is_none()
-            && req.input.sse_customer_key.is_none();
+            && req.input.sse_customer_key.is_none()
+            && req.input.if_match.is_none()
+            && req.input.if_none_match.is_none()
+            && req.input.if_modified_since.is_none()
+            && req.input.if_unmodified_since.is_none();
         if cache_eligible && self.read_barrier(&req.headers).await == ReadRoute::Local {
             let ckey = (req.input.bucket.clone(), req.input.key.clone());
             if let Some(obj) = self.obj_cache.get(&ckey).await {
-                self.metrics.get_hit();
+                self.metrics.head_hit();
                 return Ok(S3Response::new(obj.to_head()));
             }
+            if self.is_synced(&ckey.0) {
+                let Some(out) = self.head_from_index(&ckey.0, &ckey.1) else {
+                    self.metrics.head_404();
+                    return Err(s3s::s3_error!(NoSuchKey, "the key does not exist"));
+                };
+                self.metrics.head_index();
+                return Ok(S3Response::new(out));
+            }
         }
+        self.metrics.head_miss();
         self.inner.head_object(req).await
     }
 

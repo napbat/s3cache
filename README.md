@@ -9,11 +9,14 @@ endpoint to this proxy; no client code changes.
 
 ## What it does
 
-- **LIST from an in-memory key index.** Because every request funnels through the
-  proxy, it sees every write and maintains an authoritative key index — so
+- **LIST and HEAD from an in-memory key index.** Because every request funnels through
+  the proxy, it sees every write and maintains an authoritative key index — so
   `ListObjectsV2` is answered locally with **no upstream LIST call**. LISTs are the
   expensive S3 tier (R2 Class A), and clients that poll/list constantly (e.g. a
-  log-structured store allocating slots) dominate the bill; this removes them.
+  log-structured store allocating slots) dominate the bill; this removes them. The same
+  index answers `HeadObject` for a synced bucket — size, mtime and ETag for a key it
+  holds, an immediate 404 for one it doesn't — so a per-key existence probe (the
+  class-B volume driver) costs no upstream call either, cached body or not.
 - **Layered GET/HEAD object cache — hot / warm / cold.** Cacheable reads (no range / part
   / conditional headers) of objects up to `S3CACHE_MAX_OBJECT_BYTES` are served from a
   **hot** node-local in-memory LRU (`S3CACHE_CACHE_BYTES`) in front of an optional **warm**
@@ -147,6 +150,17 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
   an in-memory transport, no external services. They cover peer-write index folding +
   hot invalidation, out-of-order LWW convergence (tombstones, delete-wins-ties,
   no-resurrection), the freshness barrier, and the flush path.
+- **Integration tests** (`cargo test`, needs a Docker daemon): `tests/e2e.rs` and
+  `tests/coherence.rs` run the real `CachingProxy` against a **real MinIO origin**
+  (testcontainers) reached through a transparent request counter, so every claim is
+  asserted twice — what the client saw, and what the origin was asked for. LIST/HEAD
+  from the index cost the origin nothing; a GET misses once; over-cap objects bypass;
+  ranges slice the cached body; conditional writes (`If-None-Match: *`, `If-Match`)
+  keep the origin's 412 semantics and leave the index and cache consistent with the
+  outcome. `tests/coherence.rs` does the same with two nodes gossiping over loopback
+  UDP: a write on A is in B's index by the time it returns, an overwrite on A drops B's
+  cached body, a delete on A makes B's HEAD a local 404, and a contested
+  create-if-absent is arbitrated by the origin.
 - **End-to-end** (`scripts/coherence-e2e.sh`): spins up MinIO and runs boto3
   harnesses against **real s3cache nodes** gossiping over loopback UDP. Needs
   podman/docker and `python3` + `boto3`.
@@ -177,7 +191,23 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
 | `S3CACHE_GOSSIP_ADVERTISE` | bind addr | Address peers should dial back (set under NAT/container networking) |
 | `S3CACHE_CONSISTENCY` | `strong` | `strong`: writes wait for cluster-wide invalidation, unhealthy nodes serve via origin. `bounded`: ~one-hop freshness, no per-write ack round (large clusters; set uniformly) |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval (seconds) |
+| `S3CACHE_METRICS_LISTEN` | (empty) | Listen address for the Prometheus text endpoint (e.g. `0.0.0.0:9090`); unset = no endpoint |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Upstream creds (R2: region `auto`) |
 
 Clients authenticate to the proxy with the same key; the proxy re-signs to the
 upstream.
+
+## Metrics
+
+Every counter is logged as one `s3cache stats:` line each `S3CACHE_STATS_SECS`, and —
+when `S3CACHE_METRICS_LISTEN` is set — served as Prometheus text at `GET /metrics` on
+that address, `s3cache_`-prefixed (`metrics.enabled` in the chart). Both are generated
+from one declaration, so a counter cannot exist in one and not the other.
+
+What they attribute: LIST (`list_from_index` vs `list_passthrough`), GET
+(`get_hit` / `get_miss` / `get_bypass`, `range_*`), HEAD (`head_hit` from a cached body,
+`head_index` and `head_404` from the key index, `head_miss` forwarded upstream), the
+writes folded into the index by operation (`writes_indexed_put` / `_copy` / `_multipart`,
+each a separately billed upstream class-A call, plus `_observed` for keys learned on the
+read path), the warm tier (`warm_*`) and the gossip write feed (`feed_*`, `ack_timeouts`,
+`unhealthy_bypasses`).

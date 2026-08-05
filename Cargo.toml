@@ -14,6 +14,9 @@ aws-sdk-s3 = "1"
 aws-credential-types = "1"
 tokio = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
+# Already under hyper-util/s3s; direct so the metrics endpoint can build its own responses.
+hyper = { version = "1", features = ["server", "http1"] }
+http-body-util = "0.1"
 tierstore = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-mmap = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-moka = { git = "https://github.com/napbat/tierstore", branch = "main" }
@@ -34,3 +37,10 @@ pedantic = { level = "deny", priority = -1 }
 
 [profile.release]
 opt-level = 2
+
+[dev-dependencies]
+# A real S3 origin (MinIO) for the end-to-end tests — conditional writes, ETags and
+# error codes are the upstream's semantics, so the tests put the real thing behind us.
+testcontainers = { version = "0.27.3", features = ["http_wait"] }
+# The tests' counting forwarder needs hyper's client half; the binary only ever serves.
+hyper = { version = "1", features = ["client"] }

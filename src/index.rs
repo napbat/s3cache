@@ -6,14 +6,24 @@ use std::ops::Bound;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use s3s::dto::{CommonPrefix, ListObjectsV2Input, ListObjectsV2Output, Object, Timestamp};
+use s3s::dto::{
+    CommonPrefix, ETag, HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
+    Timestamp,
+};
 use tracing::info;
 
-/// One indexed key's LIST metadata: its size and last-modified time.
+/// One indexed key's metadata: what LIST reports about it, which is also all a HEAD
+/// needs. In memory only — the index is rebuilt from the origin at startup, so this
+/// struct is never serialized and carries no format compatibility.
 #[derive(Clone)]
 pub(crate) struct ObjEntry {
     pub(crate) size: i64,
     pub(crate) last_modified: SystemTime,
+    /// The origin's entity tag, when the path that indexed the key carried one:
+    /// LIST and the write responses do, a peer's feed event does not (the gossip
+    /// wire format stays as it is; those entries get their `ETag` at the next origin
+    /// sync). An entry without one still answers existence, size and mtime.
+    pub(crate) etag: Option<ETag>,
 }
 
 /// Per-bucket LIST index: the sorted key set, whether its warm-up sync has
@@ -39,14 +49,15 @@ const TOMBSTONE_PRUNE_LEN: usize = 65_536;
 /// observation) by per-key last-writer-wins: a strictly newer entry or an
 /// equal-or-newer tombstone rejects it; ties between puts fall to
 /// last-applied (cross-writer same-millisecond puts are healed by the next
-/// origin sync). Returns whether the index changed.
+/// origin sync). `entry.last_modified` is the write's timestamp — the LWW
+/// clock. Returns whether the index changed.
 pub(crate) fn apply_put(
     state: &RwLock<HashMap<String, BucketState>>,
     bucket: &str,
     key: &str,
-    size: i64,
-    ts: SystemTime,
+    entry: ObjEntry,
 ) -> bool {
+    let ts = entry.last_modified;
     let mut g = state.write().unwrap();
     let b = g.entry(bucket.to_owned()).or_default();
     if b.gone.get(key).is_some_and(|dead| *dead >= ts) {
@@ -55,13 +66,7 @@ pub(crate) fn apply_put(
     if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
         return false; // a newer put is already indexed
     }
-    b.keys.insert(
-        key.to_owned(),
-        ObjEntry {
-            size,
-            last_modified: ts,
-        },
-    );
+    b.keys.insert(key.to_owned(), entry);
     true
 }
 
@@ -149,6 +154,7 @@ pub(crate) fn list_objects_v2_from_index(
                 key: Some(key.clone()),
                 size: Some(entry.size),
                 last_modified: Some(Timestamp::from(entry.last_modified)),
+                e_tag: entry.etag.clone(),
                 ..Default::default()
             });
         }
@@ -174,6 +180,28 @@ pub(crate) fn list_objects_v2_from_index(
         start_after: inp.start_after.clone(),
         ..Default::default()
     }
+}
+
+/// A HEAD answered from an already-borrowed key index: the index is authoritative for
+/// existence on a synced bucket (this proxy is the only writer — the property
+/// `ListObjectsV2` correctness already rests on), and the entry carries the size,
+/// mtime and `ETag` a HEAD reports. `None` means the key is absent, which on a synced
+/// bucket is an authoritative 404 rather than a reason to ask the origin. Free-standing
+/// alongside [`list_objects_v2_from_index`], and unit-testable the same way.
+pub(crate) fn head_object_from_index(
+    keys: Option<&BTreeMap<String, ObjEntry>>,
+    key: &str,
+) -> Option<HeadObjectOutput> {
+    let entry = keys?.get(key)?;
+    Some(HeadObjectOutput {
+        content_length: Some(entry.size),
+        last_modified: Some(Timestamp::from(entry.last_modified)),
+        // An entry indexed by a path that carried no ETag still answers existence:
+        // the index is authoritative for that, and an origin round-trip to decorate
+        // a known-good answer is the cost this whole path exists to avoid.
+        e_tag: entry.etag.clone(),
+        ..Default::default()
+    })
 }
 
 /// Full paginated LIST of a bucket into `state`, then mark it synced. Merges (never
@@ -202,6 +230,9 @@ pub(crate) async fn sync_bucket_into(
                 let entry = ObjEntry {
                     size: obj.size().unwrap_or(0),
                     last_modified,
+                    // LIST reports the ETag per key, so the bootstrap is where the
+                    // index learns them; an unparseable one is simply not carried.
+                    etag: obj.e_tag().and_then(|raw| raw.parse().ok()),
                 };
                 let mut g = state.write().unwrap();
                 g.entry(bucket.to_owned())
@@ -232,7 +263,9 @@ pub(crate) async fn sync_bucket_into(
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjEntry, apply_del, apply_put, list_objects_v2_from_index};
+    use super::{
+        ObjEntry, apply_del, apply_put, head_object_from_index, list_objects_v2_from_index,
+    };
     use std::collections::HashMap;
     use std::sync::RwLock;
     use std::time::Duration;
@@ -241,6 +274,20 @@ mod tests {
 
     fn ts(secs: u64) -> std::time::SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// A put of `size` at `secs`, the way every write path applies one.
+    fn put(state: &Index, key: &str, size: i64, secs: u64) -> bool {
+        apply_put(
+            state,
+            "b",
+            key,
+            ObjEntry {
+                size,
+                last_modified: ts(secs),
+                etag: None,
+            },
+        )
     }
 
     fn size_of(state: &Index, key: &str) -> Option<i64> {
@@ -258,27 +305,24 @@ mod tests {
     #[test]
     fn lww_applies_out_of_order_events_convergently() {
         let state: Index = RwLock::new(HashMap::new());
-        assert!(apply_put(&state, "b", "k", 1, ts(10)));
-        assert!(!apply_put(&state, "b", "k", 9, ts(5)), "older put loses");
+        assert!(put(&state, "k", 1, 10));
+        assert!(!put(&state, "k", 9, 5), "older put loses");
         assert_eq!(size_of(&state, "k"), Some(1));
-        assert!(apply_put(&state, "b", "k", 2, ts(20)), "newer put wins");
+        assert!(put(&state, "k", 2, 20), "newer put wins");
         assert_eq!(size_of(&state, "k"), Some(2));
 
         // Delete at t=30; an older put (t=25) must NOT resurrect the key.
         assert!(apply_del(&state, "b", "k", ts(30)));
-        assert!(!apply_put(&state, "b", "k", 3, ts(25)), "tombstoned");
+        assert!(!put(&state, "k", 3, 25), "tombstoned");
         assert_eq!(size_of(&state, "k"), None);
         // Deletes win timestamp ties, in either arrival order.
-        assert!(apply_put(&state, "b", "tie", 1, ts(40)));
+        assert!(put(&state, "tie", 1, 40));
         apply_del(&state, "b", "tie", ts(40));
         assert_eq!(size_of(&state, "tie"), None, "delete wins the tie");
-        assert!(
-            !apply_put(&state, "b", "tie", 2, ts(40)),
-            "still tombstoned"
-        );
+        assert!(!put(&state, "tie", 2, 40), "still tombstoned");
 
         // A genuinely newer put after a delete brings the key back.
-        assert!(apply_put(&state, "b", "k", 4, ts(35)));
+        assert!(put(&state, "k", 4, 35));
         assert_eq!(size_of(&state, "k"), Some(4));
     }
 
@@ -288,13 +332,10 @@ mod tests {
     fn delete_first_reorder_suppresses_the_put() {
         let state: Index = RwLock::new(HashMap::new());
         assert!(!apply_del(&state, "b", "k", ts(50)), "nothing live yet");
-        assert!(
-            !apply_put(&state, "b", "k", 1, ts(45)),
-            "arrives late, loses"
-        );
+        assert!(!put(&state, "k", 1, 45), "arrives late, loses");
         assert_eq!(size_of(&state, "k"), None);
     }
-    use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
+    use s3s::dto::{ETag, ListObjectsV2Input, ListObjectsV2Output};
     use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
 
@@ -306,6 +347,7 @@ mod tests {
                     ObjEntry {
                         size: 1,
                         last_modified: UNIX_EPOCH,
+                        etag: Some(ETag::Strong(format!("etag-{k}"))),
                     },
                 )
             })
@@ -412,5 +454,30 @@ mod tests {
         assert_eq!(out.is_truncated, Some(false));
         assert!(out.contents.is_none());
         assert_eq!(out.key_count, Some(0));
+    }
+
+    /// A HEAD off the index answers with everything the entry carries; an absent key
+    /// answers `None`, which the proxy turns into a 404 on a synced bucket.
+    #[test]
+    fn head_reports_the_indexed_metadata() {
+        let idx = index(&["a", "b"]);
+        let out = head_object_from_index(Some(&idx), "a").expect("indexed key");
+        assert_eq!(out.content_length, Some(1));
+        assert_eq!(out.last_modified, Some(super::Timestamp::from(UNIX_EPOCH)));
+        assert_eq!(out.e_tag, Some(ETag::Strong("etag-a".to_owned())));
+        assert!(head_object_from_index(Some(&idx), "missing").is_none());
+        assert!(head_object_from_index(None, "a").is_none(), "empty bucket");
+    }
+
+    /// An entry indexed by a path that carried no `ETag` (a peer's feed event) still
+    /// answers existence — the index is authoritative for that either way.
+    #[test]
+    fn head_without_an_etag_still_answers() {
+        let state: Index = RwLock::new(HashMap::new());
+        assert!(put(&state, "k", 12, 10));
+        let g = state.read().unwrap();
+        let out = head_object_from_index(g.get("b").map(|b| &b.keys), "k").expect("indexed key");
+        assert_eq!(out.content_length, Some(12));
+        assert_eq!(out.e_tag, None);
     }
 }

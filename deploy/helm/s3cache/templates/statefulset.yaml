@@ -33,6 +33,10 @@ spec:
             - name: gossip
               containerPort: {{ .Values.gossip.port }}
               protocol: UDP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port | int64 }}
+            {{- end }}
           env:
             - name: S3CACHE_LISTEN
               value: "0.0.0.0:8014"
@@ -53,6 +57,12 @@ spec:
               value: {{ .Values.diskCache.path | quote }}
             - name: S3CACHE_DISK_CACHE_BYTES
               value: {{ .Values.diskCache.bytes | int64 | quote }}
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            # Prometheus text endpoint (GET /metrics), on its own port so the S3 API
+            # port stays exactly the S3 API.
+            - name: S3CACHE_METRICS_LISTEN
+              value: "0.0.0.0:{{ .Values.metrics.port | int64 }}"
             {{- end }}
             # Pod name = gossip node id (HOSTNAME is set by the kubelet). Pod-0 is the
             # only static seed; the rest resolves via gossiped advertisements. The
