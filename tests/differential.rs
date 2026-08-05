@@ -42,13 +42,15 @@ const LIST_SHAPE: Fields = Fields::LIST
     .without(Fields::LAST_MODIFIED)
     .without(Fields::STORAGE_CLASS);
 
-/// What an index-served HEAD of a *just-written* key is compared on: everything except
-/// `Last-Modified`, which cannot be asserted equal here because the index stamps a write
-/// with the local clock rather than the origin's mtime, so byte-for-byte equality would
-/// straddle a second boundary at random. The bound that does hold is asserted explicitly
-/// by [`assert_same_moment`]. Every other field is compared, index-served or not — an
-/// entry the proxy is willing to answer a HEAD from has to carry all of them.
-const WRITE_HEAD: Fields = Fields::OBJECT.without(Fields::LAST_MODIFIED);
+/// What an answer built by the *write* path is compared on — an index-served HEAD of a
+/// just-written key, or a GET served from the body that write kept. Everything except
+/// `Last-Modified`, which cannot be asserted equal here because a write is stamped with
+/// the local clock rather than the origin's mtime (a `PutObject` response carries no
+/// mtime to use instead), so byte-for-byte equality would straddle a second boundary at
+/// random. The bound that does hold is asserted explicitly by [`assert_same_moment`].
+/// Every other field is compared, locally served or not — a copy the proxy is willing to
+/// answer from has to carry all of them.
+const WRITE_SHAPE: Fields = Fields::OBJECT.without(Fields::LAST_MODIFIED);
 
 /// How far a write-path index timestamp may sit from the origin's own mtime. Generous
 /// enough that a slow container never trips it, tight enough to catch a placeholder.
@@ -633,6 +635,13 @@ async fn head_from_the_index_matches_the_origin_field_for_field() {
 /// A write is only correct if every read path agrees with the origin afterwards. PUT
 /// (fresh and overwriting), then DELETE, each followed by GET, HEAD and LIST down both
 /// legs — including the shape of a read of the deleted key.
+///
+/// The reads after a PUT are answered from what the write itself kept: the index entry it
+/// folded in, and the body it was already holding. So this row is also the proof that the
+/// copy a write constructs is faithful — `Content-Type`, user metadata, `ETag`,
+/// `Accept-Ranges`, `Content-Length` and the bytes are compared field for field against
+/// the origin's own answer, with only the write clock's `Last-Modified` held to a bound
+/// (see [`WRITE_SHAPE`]) — and the origin's counters say it never left this process.
 #[tokio::test]
 async fn writes_read_back_identically_on_every_path() {
     let origin = Origin::start("diff-write").await;
@@ -640,22 +649,28 @@ async fn writes_read_back_identically_on_every_path() {
     wait_for_index(&r.proxy, &origin, &r.bucket).await;
 
     put_through(&r, "obj", b"first version", Some("text/x-fixture"), &[]).await;
+    let fetched = origin.ops.get();
     let head = r
-        .head("HEAD after PUT (index-served)", WRITE_HEAD, || {
+        .head("HEAD after PUT (index-served)", WRITE_SHAPE, || {
             head_input(&r.bucket, "obj")
         })
         .await;
     assert_same_moment(&head, &r, "obj").await;
-    r.get("GET after PUT", Fields::OBJECT, || {
-        get_input(&r.bucket, "obj")
-    })
-    .await;
-    r.head("HEAD after PUT (body cached)", Fields::OBJECT, || {
+    let read = r
+        .get("GET after PUT", WRITE_SHAPE, || get_input(&r.bucket, "obj"))
+        .await;
+    assert_same_moment(&read, &r, "obj").await;
+    r.head("HEAD after PUT (body cached)", WRITE_SHAPE, || {
         head_input(&r.bucket, "obj")
     })
     .await;
     r.list("LIST after PUT", LIST_SHAPE, || list_input(&r.bucket))
         .await;
+    assert_eq!(
+        origin.ops.get(),
+        fetched,
+        "the read after the write was answered from the body the write kept"
+    );
 
     put_through(
         &r,
@@ -665,16 +680,23 @@ async fn writes_read_back_identically_on_every_path() {
         &[],
     )
     .await;
-    r.get("GET after overwrite", Fields::OBJECT, || {
-        get_input(&r.bucket, "obj")
-    })
-    .await;
-    r.head("HEAD after overwrite", WRITE_HEAD, || {
+    let read = r
+        .get("GET after overwrite", WRITE_SHAPE, || {
+            get_input(&r.bucket, "obj")
+        })
+        .await;
+    assert_same_moment(&read, &r, "obj").await;
+    r.head("HEAD after overwrite", WRITE_SHAPE, || {
         head_input(&r.bucket, "obj")
     })
     .await;
     r.list("LIST after overwrite", LIST_SHAPE, || list_input(&r.bucket))
         .await;
+    assert_eq!(
+        origin.ops.get(),
+        fetched,
+        "and the overwrite replaced that body rather than dropping it"
+    );
 
     delete(&r.proxy, &r.bucket, "obj").await;
     r.get("GET after DELETE", Fields::OBJECT, || {
@@ -712,7 +734,7 @@ async fn copy_object_reads_back_identically() {
         .await
         .expect("the copy succeeds");
 
-    r.head("HEAD the copy (index-served)", WRITE_HEAD, || {
+    r.head("HEAD the copy (index-served)", WRITE_SHAPE, || {
         head_input(&r.bucket, "dst")
     })
     .await;
@@ -778,7 +800,7 @@ async fn multipart_complete_reads_back_identically() {
         .await
         .expect("the upload completes");
 
-    r.head("HEAD the assembled object", WRITE_HEAD, || {
+    r.head("HEAD the assembled object", WRITE_SHAPE, || {
         head_input(&r.bucket, "assembled")
     })
     .await;
@@ -1297,7 +1319,7 @@ async fn put_through(
 }
 
 /// The index stamps a write with the local clock rather than the origin's mtime, so its
-/// `Last-Modified` is not byte-for-byte assertable (see [`WRITE_HEAD`]). What is
+/// `Last-Modified` is not byte-for-byte assertable (see [`WRITE_SHAPE`]). What is
 /// assertable — and what a client depends on — is that the two describe the same moment.
 async fn assert_same_moment(indexed: &Answer, r: &Routes, key: &str) {
     let origin = common::diff::answer_head(&r.origin, head_input(&r.bucket, key)).await;

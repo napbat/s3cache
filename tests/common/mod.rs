@@ -622,7 +622,23 @@ pub async fn head_if_none_match(
     Ok(proxy.head_object(request(input)).await?.output)
 }
 
-/// A write-through PUT, optionally conditional (the CAS clients build OCC on).
+/// The write a test issues: the bytes, their declared length, and the `Content-Type` —
+/// which is what decides whether the proxy may keep the body it just wrote (with none
+/// set the origin invents one, so nothing faithful could be cached).
+fn put_input(bucket: &str, key: &str, body: &[u8], content_type: Option<&str>) -> PutObjectInput {
+    let bytes = Bytes::copy_from_slice(body);
+    PutObjectInput {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        content_length: Some(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
+        body: Some(body_blob(bytes)),
+        content_type: content_type.map(str::to_owned),
+        ..Default::default()
+    }
+}
+
+/// A write-through PUT, optionally conditional (the CAS clients build OCC on). It names
+/// no `Content-Type`, so the proxy indexes it but keeps no copy of its body.
 pub async fn put_conditional(
     proxy: &CachingProxy,
     bucket: &str,
@@ -631,23 +647,44 @@ pub async fn put_conditional(
     if_none_match: Option<ETagCondition>,
     if_match: Option<ETagCondition>,
 ) -> S3Result<()> {
-    let bytes = Bytes::copy_from_slice(body);
     let input = PutObjectInput {
-        bucket: bucket.to_owned(),
-        key: key.to_owned(),
-        content_length: Some(i64::try_from(bytes.len()).unwrap_or(i64::MAX)),
-        body: Some(body_blob(bytes)),
         if_none_match,
         if_match,
-        ..Default::default()
+        ..put_input(bucket, key, body, None)
     };
     proxy.put_object(request(input)).await?;
     Ok(())
 }
 
-/// A write-through PUT.
+/// A write-through PUT, as above.
 pub async fn put(proxy: &CachingProxy, bucket: &str, key: &str, body: &[u8]) {
     put_conditional(proxy, bucket, key, body, None, None)
+        .await
+        .expect("put succeeds");
+}
+
+/// A write-through PUT carrying a `Content-Type`, the shape a real client sends and the
+/// one the proxy can fill its own cache from — optionally conditional, so a test can
+/// check what a *refused* fillable write leaves behind.
+pub async fn put_typed_conditional(
+    proxy: &CachingProxy,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    content_type: &str,
+    if_none_match: Option<ETagCondition>,
+) -> S3Result<()> {
+    let input = PutObjectInput {
+        if_none_match,
+        ..put_input(bucket, key, body, Some(content_type))
+    };
+    proxy.put_object(request(input)).await?;
+    Ok(())
+}
+
+/// A write-through PUT carrying a `Content-Type` (see [`put_typed_conditional`]).
+pub async fn put_typed(proxy: &CachingProxy, bucket: &str, key: &str, body: &[u8], ct: &str) {
+    put_typed_conditional(proxy, bucket, key, body, ct, None)
         .await
         .expect("put succeeds");
 }

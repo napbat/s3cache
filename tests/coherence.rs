@@ -10,7 +10,7 @@ mod common;
 
 use common::{
     Origin, delete, get, gossip_pair, head, list, list_entry, proxy_over, put, put_conditional,
-    wait_for_index,
+    put_typed, wait_for_index,
 };
 use s3cache::cache::CachingProxy;
 use s3s::S3ErrorCode;
@@ -146,8 +146,11 @@ async fn a_write_on_a_folds_into_bs_index() {
     );
 }
 
-/// The invalidation half: B has a body cached, A overwrites it, and B's next read is the
-/// new bytes — refetched from the origin, because its stale copy was dropped.
+/// The invalidation half, and the asymmetry that makes it right: B has a body cached, A
+/// overwrites it, and B's next read is the new bytes — refetched from the origin, because
+/// its stale copy was dropped. The *writer* is the one node that does not have to refetch:
+/// A wrote those bytes and kept them, so A's own read after the write is both fresh and
+/// free. Peers are invalidated; the writer is refilled.
 #[tokio::test]
 async fn an_overwrite_on_a_invalidates_bs_cached_body() {
     let origin = Origin::start("coherence-invalidate").await;
@@ -165,7 +168,18 @@ async fn an_overwrite_on_a_invalidates_bs_cached_body() {
     );
     assert_eq!(origin.ops.get(), fetched, "B served it locally");
 
-    put(&node_a, bucket, "obj", b"version-2").await;
+    put_typed(&node_a, bucket, "obj", b"version-2", "text/x-fixture").await;
+
+    assert_eq!(
+        get(&node_a, bucket, "obj").await,
+        "version-2",
+        "A serves what it just wrote — the writer's kept copy is fresh, not stale"
+    );
+    assert_eq!(
+        origin.ops.get(),
+        fetched,
+        "and A did not pay the origin for bytes it had in hand"
+    );
 
     assert_eq!(
         get(&node_b, bucket, "obj").await,

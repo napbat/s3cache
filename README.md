@@ -29,10 +29,19 @@ endpoint to this proxy; no client code changes.
   origin — on a miss. Always layered, no mode to pick. Ranged reads slice the cached whole
   object; HEAD is served from the same cache; larger objects stream straight through. See
   [Cache tiers](#cache-tiers).
-- **Write-through + invalidation.** `PutObject` / `DeleteObject` / multipart /
-  `CopyObject` forward to the upstream (which stays the authority for conditional/OCC
-  writes — identical semantics), then update the index **and invalidate the object
-  cache** for that key, so reads are never stale.
+- **Write-through + invalidation, and fill-on-write.** `PutObject` / `DeleteObject` /
+  multipart / `CopyObject` forward to the upstream (which stays the authority for
+  conditional/OCC writes — identical semantics), then update the index **and invalidate
+  the object cache** for that key, so reads are never stale. A `PutObject` goes one
+  further: its body is already in hand, so the writing node **keeps it** (`write_fill`)
+  instead of leaving the object's first read to be a guaranteed origin GET. Peers are
+  still invalidated over the write feed — only the writer, which knows the new bytes, is
+  refilled. The fill is taken only when the write knows exactly what a read of it will
+  report: a `Content-Type` (without one the origin invents one), an `ETag` on the write
+  response, a body within `S3CACHE_MAX_OBJECT_BYTES`, and none of the request forms whose
+  stored object or response headers a kept copy could not reproduce (SSE-C, an append, a
+  named storage class, object lock, tagging, a website redirect, `Expires`). Everything
+  else — and every refused write — behaves exactly as before.
 - **Full passthrough for everything else** — all 98 S3 operations are implemented
   (generated from the `s3s` S3 trait), so arbitrary S3 clients work, not just one.
 
@@ -230,7 +239,8 @@ What they attribute: LIST (`list_from_index` vs `list_passthrough`), GET
 `head_index` and `head_404` from the key index, `head_miss` forwarded upstream), the
 writes folded into the index by operation (`writes_indexed_put` / `_copy` / `_multipart`,
 each a separately billed upstream class-A call, plus `_observed` for keys learned on the
-read path), `index_backfills` (index entries completed from a forwarded answer — see
-below), the warm tier (`warm_hit` / `warm_miss` / `warm_error`, with `warm_rejects` for
+read path), `write_fill` (writes whose body was kept rather than dropped — each one an
+origin GET the object's first read no longer costs), `index_backfills` (index entries
+completed from a forwarded answer — see below), the warm tier (`warm_hit` / `warm_miss` / `warm_error`, with `warm_rejects` for
 objects the per-object cap declined, kept apart so `warm_error` stays alertable) and the
 gossip write feed (`feed_*`, `ack_timeouts`, `unhealthy_bypasses`).

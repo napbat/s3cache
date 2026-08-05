@@ -21,6 +21,9 @@ helm:
     # re-paying cold R2 reads (get_miss was climbing with warm_hit pinned at 0).
     memoryCache:
       bytes: 2147483648
+      # 32 MiB: get_bypass showed a band of segment blobs just over the 8 MiB
+      # default streaming from R2 on every read; the 2G/20G budgets have room.
+      maxObjectBytes: 33554432
     diskCache:
       enabled: true
       bytes: 21474836480

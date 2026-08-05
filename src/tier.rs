@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use s3s::dto::{ETag, GetObjectOutput, HeadObjectOutput, Metadata, StreamingBlob, Timestamp};
 use serde::{Deserialize, Serialize};
 use tierstore::{CodecTier, KeyStatus, OffloadTier, SingleFlight};
@@ -89,10 +89,7 @@ impl CachedObject {
     }
 
     fn body_blob(&self) -> StreamingBlob {
-        let b = self.body.clone();
-        StreamingBlob::wrap(futures::stream::once(async move {
-            Ok::<Bytes, std::io::Error>(b)
-        }))
+        blob_of(self.body.clone())
     }
 
     /// The cached response metadata as a body-less GET — the base every GET-shaped
@@ -140,18 +137,62 @@ impl CachedObject {
     }
 }
 
-/// Drain a streamed body into memory, bailing (`None`) past `cap` bytes or on error.
-pub async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
-    let mut blob = std::pin::pin!(blob);
+/// A one-shot body stream over bytes already in memory.
+#[must_use]
+pub fn blob_of(bytes: Bytes) -> StreamingBlob {
+    StreamingBlob::wrap(futures::stream::once(async move {
+        Ok::<Bytes, std::io::Error>(bytes)
+    }))
+}
+
+/// What draining a body against a cap produced (see [`buffer_or_forward`]).
+pub enum BufferedBody {
+    /// The whole body, within the cap.
+    Whole(Bytes),
+    /// The body did not fit the cap, or the stream faulted: what was drained, spliced
+    /// back in front of the untouched remainder.
+    Streamed(StreamingBlob),
+}
+
+/// Drain a streamed body into memory, up to `cap` bytes.
+///
+/// Past the cap the prefix is **not** discarded — it is spliced back in front of the rest
+/// of the stream, so a caller that has to forward the body anyway forwards exactly the
+/// bytes the client sent. A body can only be read once, and a proxy that has started
+/// reading one has no way to un-read it; this is what lets the write path attempt a cache
+/// fill without committing to it.
+pub async fn buffer_or_forward(mut blob: StreamingBlob, cap: usize) -> BufferedBody {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = blob.next().await {
-        let b = chunk.ok()?;
-        if buf.len() + b.len() > cap {
-            return None;
+        match chunk {
+            Ok(b) if buf.len() + b.len() <= cap => buf.extend_from_slice(&b),
+            over => {
+                let head = Bytes::from(buf);
+                let tail = futures::stream::once(async move { over.map_err(io_error) })
+                    .chain(blob.map_err(io_error));
+                return BufferedBody::Streamed(StreamingBlob::wrap(
+                    futures::stream::once(async move { Ok(head) }).chain(tail),
+                ));
+            }
         }
-        buf.extend_from_slice(&b);
     }
-    Some(Bytes::from(buf))
+    BufferedBody::Whole(Bytes::from(buf))
+}
+
+/// A body stream's boxed error as an `io::Error`, the error type a re-wrapped
+/// [`StreamingBlob`] carries.
+fn io_error(e: s3s::StdError) -> std::io::Error {
+    std::io::Error::other(e)
+}
+
+/// Drain a streamed body into memory, bailing (`None`) past `cap` bytes or on error. The
+/// unread remainder is dropped with it — for the paths that have no use for a body they
+/// cannot cache (see [`buffer_or_forward`] for the one that does).
+pub async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
+    match buffer_or_forward(blob, cap).await {
+        BufferedBody::Whole(bytes) => Some(bytes),
+        BufferedBody::Streamed(_) => None,
+    }
 }
 
 /// Blake3 of `bucket\0key` — a fixed-length, path-safe, collision-free warm-tier key.
@@ -412,7 +453,9 @@ impl LocalCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{CachedObject, TieredCache, buffer_body, open_warm};
+    use super::{
+        BufferedBody, CachedObject, TieredCache, buffer_body, buffer_or_forward, open_warm,
+    };
     use crate::metrics::Metrics;
     use bytes::Bytes;
     use s3s::dto::{ETag, GetObjectOutput, Timestamp};
@@ -471,6 +514,38 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"0123456789"))
         }));
         assert!(buffer_body(blob, 4).await.is_none()); // over cap -> None
+    }
+
+    /// A body read past the cap is not a body lost: what was drained is spliced back in
+    /// front of the untouched rest, because the caller still has to forward the bytes the
+    /// client sent and a stream cannot be read twice.
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_handed_back_whole() {
+        let chunks = ["0123", "4567", "89ab"].map(|s| Bytes::from_static(s.as_bytes()));
+        let blob = s3s::dto::StreamingBlob::wrap(futures::stream::iter(
+            chunks.map(Ok::<Bytes, std::io::Error>),
+        ));
+        let BufferedBody::Streamed(rest) = buffer_or_forward(blob, 6).await else {
+            panic!("12 bytes do not fit a 6-byte cap");
+        };
+        assert_eq!(
+            buffer_body(rest, usize::MAX).await.expect("readable"),
+            Bytes::from_static(b"0123456789ab"),
+            "every byte forwards, in order, exactly once"
+        );
+    }
+
+    /// A body inside the cap comes back as bytes, chunking and all.
+    #[tokio::test]
+    async fn a_body_inside_the_cap_is_buffered() {
+        let chunks = ["ab", "cd"].map(|s| Bytes::from_static(s.as_bytes()));
+        let blob = s3s::dto::StreamingBlob::wrap(futures::stream::iter(
+            chunks.map(Ok::<Bytes, std::io::Error>),
+        ));
+        let BufferedBody::Whole(bytes) = buffer_or_forward(blob, 4).await else {
+            panic!("4 bytes fit a 4-byte cap");
+        };
+        assert_eq!(bytes, Bytes::from_static(b"abcd"));
     }
 
     #[tokio::test]

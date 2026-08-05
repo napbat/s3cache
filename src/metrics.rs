@@ -87,6 +87,9 @@ counters! {
     /// Record a key folded into the LIST index from a read-path observation
     /// (not a write of ours — the origin proved the key's size).
     writes_indexed_observed => write_indexed_observed,
+    /// Record a `PutObject` whose body was kept in the tiers rather than dropped —
+    /// one origin GET the object's first read no longer costs.
+    write_fill => write_fill,
     /// Record a GET served from a cached body.
     get_hit => get_hit,
     /// Record a GET that missed and was cached on the way back.

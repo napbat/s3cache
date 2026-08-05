@@ -151,6 +151,81 @@ fn observed_entry(observed: Option<&ObservedObject>) -> ObjEntry {
     }
 }
 
+/// Whether a `PutObject` stores something other than *the body it carries, described by
+/// the headers on the request* — the write path's twin of the `origin_only` set on
+/// [`CachingProxy::serve_get`]. Each of these makes a later plain GET report something a
+/// write-filled copy could not reproduce, so such a write forwards its body and keeps
+/// nothing:
+///
+/// * **SSE-C** — the origin stores ciphertext and refuses a GET that does not present the
+///   key. A cached plaintext copy would both differ from the origin's answer and hand the
+///   bytes to a caller who never presented the key.
+/// * **`write_offset_bytes`** — an append: what is stored is the previous object plus
+///   this body, not this body.
+/// * **a named storage class** — the origin reports `x-amz-storage-class` for anything
+///   but the default, and an archive class is not directly readable at all.
+/// * **object lock, tagging, a website redirect, `Expires`** — each surfaces on a GET of
+///   the object as a header [`CachedObject`] does not carry.
+///
+/// Deliberately *not* here: the conditional headers (a refused write returns before the
+/// fill), checksums and `Content-MD5` (integrity of this request — a GET reports a
+/// checksum only when it asks for one, and such a GET is origin-only), ACLs and grants
+/// (invisible on a GET), `expected_bucket_owner` (the guard was evaluated for this write,
+/// and a *read* carrying one is origin-only), and SSE-S3/SSE-KMS (the origin decrypts
+/// transparently, so the body a GET returns is exactly this one; the
+/// `x-amz-server-side-encryption` echo is unmodelled on the read-path fill too, and a
+/// bucket's *default* encryption never appears on the request at all — excluding the
+/// explicit form would buy no fidelity and cost the common case).
+fn put_origin_only(input: &PutObjectInput) -> bool {
+    input.sse_customer_algorithm.is_some()
+        || input.sse_customer_key.is_some()
+        || input.sse_customer_key_md5.is_some()
+        || input.write_offset_bytes.is_some()
+        || input.storage_class.is_some()
+        || input.object_lock_mode.is_some()
+        || input.object_lock_retain_until_date.is_some()
+        || input.object_lock_legal_hold_status.is_some()
+        || input.tagging.is_some()
+        || input.website_redirect_location.is_some()
+        || input.expires.is_some()
+}
+
+/// The GET response a read of the object a `PutObject` just stored would produce: the
+/// headers the request described the body with, the length actually written, and the
+/// `ETag` the origin answered with. It is handed to the very [`CachedObject::from_get`]
+/// the read-path fill uses, so a copy kept by a write and a copy filled by a read can
+/// never describe the same object differently.
+///
+/// `last_modified` is the **local write clock**: a `PutObject` response carries no mtime,
+/// and paying a HEAD for one would give back the origin round trip the fill exists to
+/// save. The index entry is stamped from the same clock for the same reason (see
+/// [`CachingProxy::record_put`]), so the two agree with each other; against the origin's
+/// own mtime the guarantee is a bound rather than an equality, which is what the
+/// differential suite's `assert_same_moment` asserts.
+fn written_object(
+    content_type: Option<String>,
+    e_tag: ETag,
+    meta: &ObjMeta,
+    len: usize,
+) -> GetObjectOutput {
+    GetObjectOutput {
+        content_length: Some(i64::try_from(len).unwrap_or(i64::MAX)),
+        content_type,
+        e_tag: Some(e_tag),
+        last_modified: Some(Timestamp::from(SystemTime::now())),
+        // Every S3 object is byte-range addressable and the origin says so on every read;
+        // a locally-served one must not be the exception a client notices (the same
+        // header an index-served HEAD carries).
+        accept_ranges: Some("bytes".to_owned()),
+        cache_control: meta.cache_control.clone(),
+        content_disposition: meta.content_disposition.clone(),
+        content_encoding: meta.content_encoding.clone(),
+        content_language: meta.content_language.clone(),
+        metadata: meta.metadata.clone(),
+        ..Default::default()
+    }
+}
+
 /// Reads an origin response into an [`ObservedObject`]. `GetObjectOutput` and
 /// `HeadObjectOutput` spell these fields identically, so one macro drives both and the
 /// two can never learn to disagree.
@@ -548,6 +623,45 @@ impl CachingProxy {
         None
     }
 
+    /// The PUT body held in memory for a fill, or `None` when this write's body is not
+    /// one the cache may keep. Either way the request carries the same bytes onward: a
+    /// buffered body is put back as itself, and a body that outgrew the cap is spliced
+    /// back together and streams through exactly as it does without a fill — a body can
+    /// only be read once, so an attempted fill must never cost the forward its bytes.
+    async fn buffered_put_body(&self, input: &mut PutObjectInput) -> Option<Bytes> {
+        // Nothing faithful can be built without a `Content-Type`: with none set the
+        // origin invents one (`application/octet-stream` here, `binary/octet-stream` on
+        // AWS), and a cached copy reporting none would answer GETs and HEADs the origin
+        // answers differently. This is the same bar an index entry has to clear before it
+        // may answer a HEAD (`ObjEntry::is_faithful`), for the same reason — such a write
+        // still lands and still indexes, its body just stays the origin's to serve once.
+        if input.content_type.is_none() || put_origin_only(input) {
+            return None;
+        }
+        // A declared over-cap length is refused before a byte is read, so an object that
+        // could never be cached streams through untouched.
+        if input.content_length.is_some_and(|len| {
+            len < 0 || usize::try_from(len).unwrap_or(usize::MAX) > self.max_obj_bytes
+        }) {
+            return None;
+        }
+        let Some(body) = input.body.take() else {
+            return Some(Bytes::new()); // a bodiless PUT stores an empty object
+        };
+        match tier::buffer_or_forward(body, self.max_obj_bytes).await {
+            tier::BufferedBody::Whole(bytes) => {
+                input.body = Some(tier::blob_of(bytes.clone()));
+                Some(bytes)
+            }
+            // An undeclared length that outgrew the cap mid-read (or a body that faulted):
+            // forward what was read plus the untouched remainder, and cache nothing.
+            tier::BufferedBody::Streamed(rest) => {
+                input.body = Some(rest);
+                None
+            }
+        }
+    }
+
     /// Serve an int-range GET by promoting the whole object into the tiered cache (one
     /// upstream fetch, singleflighted when hot is active) and slicing it. `Some` when served — a
     /// slice, or `InvalidRange` past EOF; `None` when the promote was refused/failed and
@@ -849,10 +963,12 @@ impl s3s::S3 for CachingProxy {
         self.inner.list_objects_v2(req).await
     }
 
-    // Writes: forward (write-through), then update the index from the result.
+    // Writes: forward (write-through), then update the index from the result — and, when
+    // the write knows exactly what a read of it will report, keep the body it just wrote
+    // rather than dropping it (see [`buffered_put_body`](CachingProxy::buffered_put_body)).
     async fn put_object(
         &self,
-        req: S3Request<PutObjectInput>,
+        mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
@@ -876,6 +992,7 @@ impl s3s::S3 for CachingProxy {
                     .collect()
             }),
         };
+        let content_type = req.input.content_type.clone();
         let mut entry = ObjEntry {
             // A PUT with no Content-Length leaves the size unknown rather than zero: a
             // fabricated `0` is served as an authoritative Content-Length forever.
@@ -883,19 +1000,37 @@ impl s3s::S3 for CachingProxy {
             last_modified: SystemTime::UNIX_EPOCH, // stamped by `record_put`
             etag: None,
             storage_class: write_storage_class(req.input.storage_class.as_ref()),
-            content_type: req.input.content_type.clone(),
-            meta: faithful.then(|| Box::new(meta)),
+            content_type: content_type.clone(),
+            meta: faithful.then(|| Box::new(meta.clone())),
         };
+        // The bytes a client writes are the bytes its next read wants, and they are
+        // already in hand: buffer them (bounded by the same per-object cap the read path
+        // uses) so a freshly written object's first read is not a guaranteed origin GET.
+        let written = self.buffered_put_body(&mut req.input).await;
         let mut resp = self.inner.put_object(req).await?;
+        let ckey = (bucket.clone(), key.clone());
         // Drop this node's own copy the instant the origin has the new bytes — before
         // the cluster-ack round the index update pays for. Otherwise the writing node
         // is the one node in the fleet still serving the old body.
-        self.obj_cache
-            .invalidate(&(bucket.clone(), key.clone()))
-            .await;
+        self.obj_cache.invalidate(&ckey).await;
         // The origin's ETag rides back on the response, so the index learns it here
         // rather than paying a HEAD for what a later HEAD will want to report.
         entry.etag = resp.output.e_tag.clone();
+        // ...and the body just written takes the dropped copy's place. Invalidate *then*
+        // insert, rather than letting the insert overwrite on its own: a tier write is
+        // best-effort each, so a warm-tier put that is refused (the encoded object over
+        // the cap) or fails would otherwise leave the *older* body on disk, to be served
+        // the moment hot evicts the new one. Between the two there is only a local miss
+        // — an origin read, never a stale answer — where an insert-only ordering risks a
+        // stale one. An ETag-less write response is not enough to describe the object
+        // with, so it fills nothing either.
+        if let (Some(body), Some(e_tag)) = (written, entry.etag.clone()) {
+            let out = written_object(content_type, e_tag, &meta, body.len());
+            self.obj_cache
+                .insert(ckey, Arc::new(CachedObject::from_get(&out, body)))
+                .await;
+            self.metrics.write_fill();
+        }
         let token = self
             .record_put(IndexedWrite::Put, &bucket, &key, entry)
             .await;

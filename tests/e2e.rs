@@ -13,7 +13,7 @@ mod common;
 
 use common::{
     Origin, delete, get, get_if_none_match, get_range, head, head_if_none_match, list, list_entry,
-    node, put, put_conditional, wait_for_index,
+    node, put, put_conditional, put_typed, put_typed_conditional, wait_for_index,
 };
 use s3s::S3ErrorCode;
 use s3s::dto::{ETag, ETagCondition};
@@ -156,9 +156,10 @@ async fn head_is_answered_from_the_index_without_touching_the_origin() {
     );
 }
 
-/// A write through the proxy lands upstream and folds into the index: LIST and HEAD then
-/// answer from local state with no further origin traffic, and only the body itself
-/// still has to be fetched.
+/// A write through the proxy lands upstream and folds into the index *and* into the body
+/// cache: LIST, HEAD and the read-after-write are all answered from local state, so a
+/// write that a client immediately reads back costs the origin exactly one operation —
+/// the write itself.
 #[tokio::test]
 async fn a_write_through_lands_upstream_and_folds_into_the_index() {
     let origin = Origin::start("e2e-write").await;
@@ -167,7 +168,14 @@ async fn a_write_through_lands_upstream_and_folds_into_the_index() {
     wait_for_index(&proxy, &origin, bucket).await;
     let (lists, heads) = (origin.ops.list(), origin.ops.head());
 
-    put(&proxy, bucket, "fresh", b"written through").await;
+    put_typed(
+        &proxy,
+        bucket,
+        "fresh",
+        b"written through",
+        "text/x-fixture",
+    )
+    .await;
     assert_eq!(
         origin.stored("fresh").await.as_deref(),
         Some(&b"written through"[..]),
@@ -177,35 +185,29 @@ async fn a_write_through_lands_upstream_and_folds_into_the_index() {
 
     assert_eq!(list(&proxy, bucket).await, ["fresh"]);
     assert_eq!(origin.ops.list(), lists, "LIST came out of the index");
-    let out = head(&proxy, bucket, "fresh").await.expect("indexed");
-    assert_eq!(out.content_length, Some(15));
-    assert_eq!(
-        out.e_tag.map(ETag::into_value),
-        origin.etag("fresh").await,
-        "the write path captured the origin's ETag"
-    );
-    // This write set no Content-Type, so the origin picked one and the index entry does
-    // not know which: rather than answer a HEAD that differs from the origin's, the
-    // first HEAD is forwarded and completes the entry. A write that *does* carry a
-    // Content-Type is HEAD-able locally straight away — see `tests/differential.rs`.
-    assert_eq!(origin.ops.head(), heads + 1);
-    let heads = origin.ops.head();
-    assert_eq!(
-        head(&proxy, bucket, "fresh")
-            .await
-            .expect("indexed")
-            .content_length,
-        Some(15)
-    );
+    for _ in 0..2 {
+        let out = head(&proxy, bucket, "fresh").await.expect("indexed");
+        assert_eq!(out.content_length, Some(15));
+        assert_eq!(
+            out.e_tag.map(ETag::into_value),
+            origin.etag("fresh").await,
+            "the write path captured the origin's ETag"
+        );
+        assert_eq!(out.content_type.as_deref(), Some("text/x-fixture"));
+    }
     assert_eq!(
         origin.ops.head(),
         heads,
-        "and every HEAD after it is answered from the completed entry"
+        "a write that names its Content-Type is HEAD-able locally straight away"
     );
 
-    // A write is not a fill: the body still comes from the origin, once.
+    // The write kept the bytes it was already holding, so the read after it is free.
     assert_eq!(get(&proxy, bucket, "fresh").await, "written through");
-    assert_eq!(origin.ops.get(), 1);
+    assert_eq!(
+        origin.ops.get(),
+        0,
+        "the read after the write came out of the write's own fill"
+    );
 
     delete(&proxy, bucket, "fresh").await;
     assert!(
@@ -215,8 +217,131 @@ async fn a_write_through_lands_upstream_and_folds_into_the_index() {
     assert!(origin.stored("fresh").await.is_none());
 }
 
+/// The write path may only keep a body it can describe exactly. A PUT that names no
+/// `Content-Type` cannot: the origin invents one (`application/octet-stream` here,
+/// `binary/octet-stream` on AWS), and a locally-served answer reporting none would differ
+/// from the origin's. Such a write still lands and still indexes — its entry just stays
+/// skeletal until a forwarded HEAD completes it, and its body stays the origin's to serve
+/// once. This is the same bar `ObjEntry::is_faithful` sets for an index-served HEAD.
+#[tokio::test]
+async fn a_write_that_names_no_content_type_keeps_no_body() {
+    let origin = Origin::start("e2e-write-untyped").await;
+    let bucket = origin.bucket();
+    let proxy = node(&origin, 1024 * 1024);
+    wait_for_index(&proxy, &origin, bucket).await;
+    let heads = origin.ops.head();
+
+    put(&proxy, bucket, "untyped", b"written through").await;
+
+    let out = head(&proxy, bucket, "untyped").await.expect("indexed");
+    assert_eq!(out.content_length, Some(15));
+    assert_eq!(
+        origin.ops.head(),
+        heads + 1,
+        "the first HEAD was forwarded, and completed the skeletal entry"
+    );
+    let heads = origin.ops.head();
+    assert_eq!(
+        head(&proxy, bucket, "untyped")
+            .await
+            .expect("indexed")
+            .content_length,
+        Some(15)
+    );
+    assert_eq!(
+        origin.ops.head(),
+        heads,
+        "every HEAD after it is answered from the completed entry"
+    );
+
+    assert_eq!(get(&proxy, bucket, "untyped").await, "written through");
+    assert_eq!(origin.ops.get(), 1, "the body itself was not kept");
+    assert_eq!(get(&proxy, bucket, "untyped").await, "written through");
+    assert_eq!(origin.ops.get(), 1, "the read filled it, as ever");
+}
+
+/// The writer keeps its *own* fresh copy: an overwrite replaces the cached body with the
+/// bytes it just wrote rather than dropping them, so the read after it is both new and
+/// free. And a write the origin *refuses* (a lost CAS) changes neither — the rejected
+/// bytes are not cached, and the copy that was already there is not disturbed.
+#[tokio::test]
+async fn a_fillable_overwrite_serves_its_own_new_bytes() {
+    let origin = Origin::start("e2e-write-fill").await;
+    let bucket = origin.bucket();
+    let proxy = node(&origin, 1024 * 1024);
+    wait_for_index(&proxy, &origin, bucket).await;
+
+    put_typed(&proxy, bucket, "obj", b"version-1", "text/x-fixture").await;
+    assert_eq!(get(&proxy, bucket, "obj").await, "version-1");
+
+    // No settling: the fill lands before the write returns, so the very next read must
+    // already be the new bytes — and must not have gone to the origin for them.
+    put_typed(&proxy, bucket, "obj", b"version-2", "text/x-fixture").await;
+    assert_eq!(
+        get(&proxy, bucket, "obj").await,
+        "version-2",
+        "the writer serves what it just wrote, not what it had"
+    );
+    assert_eq!(
+        head(&proxy, bucket, "obj").await.expect("indexed").e_tag,
+        origin.etag("obj").await.map(ETag::Strong),
+        "and the kept copy carries the origin's ETag for the new bytes"
+    );
+    assert_eq!(origin.ops.get(), 0, "neither read reached the origin");
+
+    let err = put_typed_conditional(
+        &proxy,
+        bucket,
+        "obj",
+        b"rejected",
+        "text/x-fixture",
+        Some(ETagCondition::Any),
+    )
+    .await
+    .expect_err("the key exists, so create-if-absent loses");
+    assert_eq!(err.status_code().map(|status| status.as_u16()), Some(412));
+    assert_eq!(
+        get(&proxy, bucket, "obj").await,
+        "version-2",
+        "a refused write neither cached its body nor dropped the one already held"
+    );
+    assert_eq!(origin.ops.get(), 0, "so the read stayed local");
+}
+
+/// A write past `max_obj_bytes` keeps nothing: the body streams through to the origin
+/// byte for byte, and reads of it are origin reads like any other over-cap object.
+#[tokio::test]
+async fn an_over_cap_write_streams_through_and_keeps_nothing() {
+    const CAP: usize = 64;
+    let origin = Origin::start("e2e-write-over-cap").await;
+    let bucket = origin.bucket();
+    let big: Vec<u8> = (0..CAP * 4)
+        .map(|n| u8::try_from(n % 251).unwrap_or(0))
+        .collect();
+    let proxy = node(&origin, CAP);
+    wait_for_index(&proxy, &origin, bucket).await;
+
+    put_typed(&proxy, bucket, "big", &big, "application/x-fixture").await;
+    assert_eq!(
+        origin.stored("big").await.as_deref(),
+        Some(&big[..]),
+        "an over-cap write reaches the origin unaltered"
+    );
+
+    for expected_gets in 1..=2 {
+        assert_eq!(get(&proxy, bucket, "big").await, big);
+        assert_eq!(
+            origin.ops.get(),
+            expected_gets,
+            "an over-cap object is fetched every time, written through us or not"
+        );
+    }
+}
+
 /// A write invalidates the writer's own cached copy: the next read must return the new
-/// bytes, refetched, rather than the body cached a moment earlier.
+/// bytes, refetched, rather than the body cached a moment earlier. (This write names no
+/// `Content-Type`, so there is nothing to put in the dropped copy's place — the write
+/// that *can* refill is `a_fillable_overwrite_serves_its_own_new_bytes`.)
 #[tokio::test]
 async fn an_overwrite_invalidates_the_local_copy() {
     let origin = Origin::start("e2e-invalidate").await;
