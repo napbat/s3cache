@@ -2,7 +2,7 @@
 name = "s3cache"
 version = "0.1.0"
 edition = "2024"
-description = "Transparent S3 caching proxy — serves LIST from an in-memory key index and GET from a tiered hot (heap) / warm (disk) / cold (origin) object cache, write-through to an upstream S3. Cuts S3 request costs for chatty clients."
+description = "Transparent S3 caching proxy — serves LIST and HEAD from an in-memory key index and GET from a tiered hot (heap) / warm (disk) / cold (origin) object cache, write-through (fill-on-write) to an upstream S3. Cuts S3 request costs for chatty clients."
 license = "MIT"
 
 [dependencies]

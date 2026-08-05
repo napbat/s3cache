@@ -55,8 +55,11 @@ Dockerfile
 Integration tests live in `tests/` and exercise the public library surface:
 `tier_cache.rs` (hot→warm rollover and warm-tier restart survival), `e2e.rs` and
 `coherence.rs` (the whole proxy against a real MinIO origin, single- and dual-node),
-`metrics_endpoint.rs` (the Prometheus listener), with the shared origin/counter harness
-in `common/mod.rs`.
+`differential.rs` (every row asked twice — through the proxy and straight at MinIO —
+asserting a client couldn't tell which answered; the referee for anything served
+locally), `metrics_endpoint.rs` (the Prometheus listener), with the shared
+origin/counter harness in `common/mod.rs` and the differential comparator in
+`common/diff.rs`.
 
 ## Build, test, lint
 
@@ -106,8 +109,10 @@ daemon. The proxy reaches MinIO through a transparent counting forwarder in
 
 - `memoryCache.bytes` — hot in-memory cache size (`S3CACHE_CACHE_BYTES`).
 - `memoryCache.maxObjectBytes` — per-object cache cap (`S3CACHE_MAX_OBJECT_BYTES`).
-- `diskCache.enabled` / `diskCache.path` / `diskCache.bytes` / `diskCache.volume` —
-  the warm disk tier that hot-tier evictions roll over into.
+- `diskCache.enabled` / `diskCache.path` / `diskCache.bytes` — the warm disk tier
+  that hot-tier evictions roll over into. Back it with
+  `diskCache.volumeClaimTemplate` (per-ordinal PVCs that survive deploys — wins over
+  `diskCache.volume` when set) or a plain `diskCache.volume` pod-volume spec.
 - `replicaCount` — the one scaling knob; every pod is a gossip cluster member.
 - `upstream.endpoint` (required) / `upstream.buckets`.
 - `metrics.enabled` / `metrics.port` — the Prometheus text endpoint
