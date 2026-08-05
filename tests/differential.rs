@@ -42,22 +42,13 @@ const LIST_SHAPE: Fields = Fields::LIST
     .without(Fields::LAST_MODIFIED)
     .without(Fields::STORAGE_CLASS);
 
-/// What an index-served HEAD is compared on in rows that are *about* something else. The
-/// fields an index entry does not carry — `Content-Type`, `Accept-Ranges` and user
-/// metadata — are the subject of
-/// [`head_from_the_index_matches_the_origin_field_for_field`], which compares the whole
-/// record so one divergence cannot blanket-ignore every row that merely reads a HEAD.
-const INDEX_HEAD: Fields = Fields::OBJECT
-    .without(Fields::CONTENT_TYPE)
-    .without(Fields::ACCEPT_RANGES)
-    .without(Fields::METADATA);
-
-/// What an index-served HEAD of a *just-written* key is compared on. On top of the
-/// index-HEAD gaps, `Last-Modified` cannot be asserted equal here: the index stamps a
-/// write with the local clock rather than the origin's mtime, so byte-for-byte equality
-/// would straddle a second boundary at random. The bound that does hold is asserted
-/// explicitly by [`assert_same_moment`].
-const WRITE_HEAD: Fields = INDEX_HEAD.without(Fields::LAST_MODIFIED);
+/// What an index-served HEAD of a *just-written* key is compared on: everything except
+/// `Last-Modified`, which cannot be asserted equal here because the index stamps a write
+/// with the local clock rather than the origin's mtime, so byte-for-byte equality would
+/// straddle a second boundary at random. The bound that does hold is asserted explicitly
+/// by [`assert_same_moment`]. Every other field is compared, index-served or not — an
+/// entry the proxy is willing to answer a HEAD from has to carry all of them.
+const WRITE_HEAD: Fields = Fields::OBJECT.without(Fields::LAST_MODIFIED);
 
 /// How far a write-path index timestamp may sit from the origin's own mtime. Generous
 /// enough that a slow container never trips it, tight enough to catch a placeholder.
@@ -278,6 +269,14 @@ async fn range_rows(r: &Routes, key: &str, state: &str, rows: &[(&str, Range)]) 
 /// the 416 shape, open-ended and suffix forms are all in the matrix.
 #[tokio::test]
 async fn ranges_match_the_origin_in_every_serving_state() {
+    // Two rows of the matrix start past the end of the object. Their 416 is not
+    // synthesized locally — its shape is the origin's (AWS sends
+    // `Content-Range: bytes */<size>`, this origin sends no header at all), and letting
+    // the origin answer is the only way to match every origin — so they cost one fetch
+    // each in every state, cached or not. See
+    // [`an_unsatisfiable_range_reports_content_range_like_the_origin`].
+    const UNSATISFIABLE: u64 = 2;
+
     let origin = Origin::start("diff-range").await;
     origin.seed("obj", b"0123456789").await;
 
@@ -295,14 +294,16 @@ async fn ranges_match_the_origin_in_every_serving_state() {
     range_rows(&r, "obj", "promoted", INT_RANGES).await;
     assert_eq!(
         origin.ops.get(),
-        fetched + 1,
-        "the first range promoted the whole object, exactly once"
+        fetched + 1 + UNSATISFIABLE,
+        "the first range promoted the whole object exactly once, and only the \
+         unsatisfiable rows went back to the origin"
     );
+    let promoted = origin.ops.get();
     range_rows(&r, "obj", "cached", INT_RANGES).await;
     assert_eq!(
         origin.ops.get(),
-        fetched + 1,
-        "and every range after it was sliced locally"
+        promoted + UNSATISFIABLE,
+        "and every satisfiable range after it was sliced locally"
     );
     range_rows(&r, "obj", "cached", SUFFIX_RANGES).await;
 }
@@ -449,12 +450,11 @@ async fn list_matches_the_origin_across_the_matrix() {
 /// The `Last-Modified` a LIST reports per key, compared at the granularity the LIST XML
 /// carries (ISO 8601 with milliseconds).
 ///
-/// Observed: proxy `"2026-08-05T04:46:40.000Z"` where the origin says
-/// `"2026-08-05T04:46:40.042Z"`. The bootstrap in `sync_bucket_into` (src/index.rs) keeps
-/// only `d.secs()` of each listed timestamp, so every indexed mtime is truncated to the
-/// whole second and every LIST the index answers reports a time up to a second early.
+/// Was: proxy `"2026-08-05T04:46:40.000Z"` where the origin said
+/// `"2026-08-05T04:46:40.042Z"` — the bootstrap in `sync_bucket_into` (src/index.rs)
+/// kept only `d.secs()` of each listed timestamp, so every indexed mtime landed up to a
+/// second early. It now keeps the sub-second part the origin sent.
 #[tokio::test]
-#[ignore = "BUG: the index truncates listed mtimes to whole seconds, losing the origin's milliseconds"]
 async fn list_last_modified_matches_the_origin() {
     let origin = Origin::start("diff-list-mtime").await;
     for key in ["a", "b/1", "c"] {
@@ -473,13 +473,12 @@ async fn list_last_modified_matches_the_origin() {
 
 /// The storage class a LIST reports per key.
 ///
-/// Observed: proxy `[None, None, None]` where the origin says
-/// `[Some("STANDARD"), Some("STANDARD"), Some("STANDARD")]`. `ObjEntry` (src/index.rs)
-/// has no storage-class field, so `list_objects_v2_from_index` leaves `StorageClass` out
-/// of every object it emits and a client reading it back gets nothing where the origin
-/// sends a value.
+/// Was: proxy `[None, None, None]` where the origin said
+/// `[Some("STANDARD"), Some("STANDARD"), Some("STANDARD")]` — `ObjEntry` (src/index.rs)
+/// had no storage-class field. It now carries one on every path: the bootstrap reads it
+/// off the listed row, a write off the request (S3's default when the request names
+/// none), and a peer's write off the v2 feed envelope.
 #[tokio::test]
-#[ignore = "BUG: index-served LIST omits StorageClass, which the origin reports as STANDARD"]
 async fn list_storage_class_matches_the_origin() {
     let origin = Origin::start("diff-list-class").await;
     for key in ["a", "b/1", "c"] {
@@ -519,10 +518,26 @@ async fn head_matches_the_origin_from_the_index_and_from_the_cache() {
     let r = routes(&origin, 1024 * 1024);
     wait_for_index(&r.proxy, &origin, &r.bucket).await;
 
+    // A bootstrap LIST row proves the key exists but carries neither its Content-Type
+    // nor its user metadata, so the first HEAD is forwarded rather than answered from a
+    // record that would differ from the origin's — and the answer completes the entry.
     let heads = origin.ops.head();
-    r.head("HEAD from the index", INDEX_HEAD, || {
+    r.head("HEAD from a skeletal index entry", Fields::OBJECT, || {
         head_input(&r.bucket, "obj")
     })
+    .await;
+    assert_eq!(
+        origin.ops.head(),
+        heads + 1,
+        "one forwarded HEAD is what completes a bootstrap entry"
+    );
+
+    let heads = origin.ops.head();
+    r.head(
+        "HEAD from the completed index entry",
+        Fields::OBJECT,
+        || head_input(&r.bucket, "obj"),
+    )
     .await;
     // A HEAD 404 carries no body on the wire, so the reference leg's error *code* is the
     // SDK's synthesis rather than anything the origin said: only the status compares.
@@ -551,19 +566,21 @@ async fn head_matches_the_origin_from_the_index_and_from_the_cache() {
 /// [`head_matches_the_origin_from_the_index_and_from_the_cache`], on an object that
 /// actually carries the fields at issue.
 ///
-/// Observed against a seeded object with `Content-Type: text/x-fixture` and two user
+/// Was, against a seeded object with `Content-Type: text/x-fixture` and two user
 /// metadata entries:
 ///
 /// * `content-type: proxy=None origin=Some("text/x-fixture")`
 /// * `accept-ranges: proxy=None origin=Some("bytes")`
 /// * `metadata: proxy=None origin=Some({"fixture": "value", "second": "entry"})`
 ///
-/// `head_object_from_index` (src/index.rs) builds a `HeadObjectOutput` out of size, mtime
-/// and `ETag`, which is all `ObjEntry` holds — so the same HEAD answers differently
-/// depending on whether the body happens to be cached, and a client that branches on
-/// `Content-Type` (or reads its own metadata back) sees the difference.
+/// `head_object_from_index` (src/index.rs) built a `HeadObjectOutput` out of size, mtime
+/// and `ETag`, which was all `ObjEntry` held — so the same HEAD answered differently
+/// depending on whether the body happened to be cached. An entry is now either
+/// **faithful** (it carries everything a HEAD reports) or **skeletal**, and only a
+/// faithful one answers: a bootstrap row is completed by the first forwarded HEAD, which
+/// is what this row walks through. The issue-#1 absorption is unchanged for the pattern
+/// that motivated it — repeated HEADs of the same key — it just costs one HEAD to start.
 #[tokio::test]
-#[ignore = "BUG: an index-served HEAD drops Content-Type, Accept-Ranges and user metadata"]
 async fn head_from_the_index_matches_the_origin_field_for_field() {
     let origin = Origin::start("diff-head-strict").await;
     origin
@@ -577,14 +594,30 @@ async fn head_from_the_index_matches_the_origin_field_for_field() {
     let r = routes(&origin, 1024 * 1024);
     wait_for_index(&r.proxy, &origin, &r.bucket).await;
 
+    let heads = origin.ops.head();
+    r.head(
+        "HEAD that completes the index entry",
+        Fields::OBJECT,
+        || head_input(&r.bucket, "obj"),
+    )
+    .await;
+    assert_eq!(
+        origin.ops.head(),
+        heads + 1,
+        "a skeletal entry is completed rather than answered from"
+    );
+
+    // And now the row this test exists for: the same HEAD, answered out of the index,
+    // identical to the origin's in every field — and costing the origin nothing.
+    let heads = origin.ops.head();
     r.head("HEAD from the index", Fields::OBJECT, || {
         head_input(&r.bucket, "obj")
     })
     .await;
+    assert_eq!(origin.ops.head(), heads, "answered from the index");
 
-    // The same HEAD, once the body is cached, is the answer the index-served one has to
-    // reproduce: identical to the origin's, every field. It is asserted here so the fix
-    // round can see both halves of the divergence in one place.
+    // The same HEAD once the body is cached, which is the answer the index-served one
+    // has to reproduce: identical to the origin's, every field.
     r.get("warm the body cache", Fields::OBJECT, || {
         get_input(&r.bucket, "obj")
     })
@@ -845,7 +878,7 @@ async fn over_cap_reads_match_the_origin() {
         })
         .await;
     }
-    r.head("HEAD over the cap", INDEX_HEAD, || {
+    r.head("HEAD over the cap", Fields::OBJECT, || {
         head_input(&r.bucket, "big")
     })
     .await;
@@ -868,15 +901,15 @@ fn overriding(bucket: &str, key: &str) -> GetObjectInput {
 /// filled with: the overrides belong to the request, and the origin applies them to every
 /// response, hit or miss.
 ///
-/// Observed, on the second (cache-hit) GET:
+/// Was, on the second (cache-hit) GET:
 /// `content-type: proxy=Some("text/x-fixture") origin=Some("application/x-override")`,
 /// `content-disposition: proxy=None origin=Some("attachment; filename=\"override.txt\"")`,
-/// `cache-control: proxy=None origin=Some("max-age=99")`. `CachingProxy::get_object`
-/// (src/cache.rs) decides cacheability from `version_id`, `checksum_mode`, `sse_customer_key`,
-/// `part_number`, the conditionals and the range — the `response_*` fields are not
-/// considered, so the request is served from the cache as if it had asked for nothing.
+/// `cache-control: proxy=None origin=Some("max-age=99")` — `CachingProxy::get_object`
+/// (src/cache.rs) never looked at the `response_*` fields, so an overriding request was
+/// served from the cache as if it had asked for nothing. They are now lifted off the
+/// request on the way in and applied to the answer on the way out, whichever tier
+/// produced it.
 #[tokio::test]
-#[ignore = "BUG: a cache hit ignores response-content-type/-disposition/-cache-control"]
 async fn response_overrides_are_applied_on_a_cache_hit() {
     let origin = Origin::start("diff-overrides").await;
     origin
@@ -900,14 +933,15 @@ async fn response_overrides_are_applied_on_a_cache_hit() {
 /// The mirror image: a GET carrying overrides must not leave them in the cache for the
 /// next client, who asked for no such thing.
 ///
-/// Observed, on the plain GET that follows an overriding one:
+/// Was, on the plain GET that follows an overriding one:
 /// `content-type: proxy=Some("application/x-override") origin=Some("text/x-fixture")`,
 /// `content-disposition: proxy=Some("attachment; filename=\"override.txt\"") origin=None`,
-/// `cache-control: proxy=Some("max-age=99") origin=None`. The overriding GET is treated as
-/// cacheable (see above), so `CachedObject::from_get` stores the *overridden* headers and
-/// every later reader is served one client's per-request formatting.
+/// `cache-control: proxy=Some("max-age=99") origin=None`. The overriding GET was treated
+/// as cacheable, so `CachedObject::from_get` stored the *overridden* headers and every
+/// later reader got one client's per-request formatting. Because the overrides are now
+/// stripped before the request reaches the origin, the fill is of the object as the
+/// origin stores it — an overriding read still warms the cache, and warms it correctly.
 #[tokio::test]
-#[ignore = "BUG: an overriding GET poisons the cached headers for every later reader"]
 async fn a_response_override_does_not_poison_the_cache() {
     let origin = Origin::start("diff-overrides-poison").await;
     origin
@@ -941,15 +975,22 @@ const ENCODED_KEYS: &[&str] = &[
 /// `encoding-type=url` is a wire-format request: the origin percent-encodes the keys, the
 /// prefixes, the delimiter and `start-after` in its answer, and echoes `EncodingType`.
 ///
-/// Observed: `keys: proxy=["dir/with space", "plain", "with space", "with%pct", "with+plus"]`
+/// Was: `keys: proxy=["dir/with space", "plain", "with space", "with%pct", "with+plus"]`
 /// versus `origin=["dir/with+space", "plain", "with+space", "with%25pct", "with%2Bplus"]`,
-/// and `encoding_type: proxy=None origin=Some("url")` in the paging envelope. Note the
-/// proxy's *order* differs too, because the origin sorts the encoded forms.
-/// `list_objects_v2_from_index` (src/index.rs) never reads `inp.encoding_type`, so a
-/// client that asked for encoded keys gets raw ones — and a client that decodes what it
-/// receives (as it must, having asked) corrupts every key containing a `%` or a `+`.
+/// and `encoding_type: proxy=None origin=Some("url")` in the paging envelope —
+/// `list_objects_v2_from_index` (src/index.rs) never read `inp.encoding_type`, so a
+/// client that asked for encoded keys got raw ones and corrupted every key containing a
+/// `%` or a `+` when it decoded them.
+///
+/// The fix is to forward, not to encode: the escaping is the *origin's* wire format and
+/// it is not portable. This origin escapes a space as `+` and leaves `/`, `*`, `-`, `_`
+/// and `.` alone (`s3ShouldEscape` in `MinIO`'s `cmd/api-utils.go`); Go's own
+/// `url.QueryEscape` — the function that code is derived from — escapes `/` and `*`, and
+/// AWS and R2 need not agree with either. A proxy that guesses the rule hands back keys
+/// that decode to something the bucket does not contain, which is worse than an
+/// origin round trip, so an `encoding-type` LIST passes through. The row stays as the
+/// referee: it compares the two legs whatever this proxy decides to do with them.
 #[tokio::test]
-#[ignore = "BUG: index-served LIST ignores encoding-type=url — raw keys, no echoed EncodingType"]
 async fn list_with_url_encoding_matches_the_origin() {
     let origin = Origin::start("diff-list-encoding").await;
     for key in ENCODED_KEYS {
@@ -976,13 +1017,12 @@ async fn list_with_url_encoding_matches_the_origin() {
 
 /// `max-keys=0` asks for no keys at all — a shape clients use to probe a bucket cheaply.
 ///
-/// Observed: `keys: proxy=["a"] origin=[]`, and in the envelope
-/// `max_keys: proxy=Some(1) origin=Some(0)`, `key_count: proxy=Some(1) origin=Some(0)`.
-/// `list_objects_v2_from_index` (src/index.rs) clamps `max_keys` into `1..=1000`, so a
-/// request for nothing is answered with an object — and one whose `max-keys` echo tells
-/// the client its request was rewritten.
+/// Was: `keys: proxy=["a"] origin=[]`, and in the envelope
+/// `max_keys: proxy=Some(1) origin=Some(0)`, `key_count: proxy=Some(1) origin=Some(0)` —
+/// `list_objects_v2_from_index` (src/index.rs) clamped `max_keys` into `1..=1000`, so a
+/// request for nothing was answered with an object, and the echo told the client its
+/// request had been rewritten. The floor is now 0.
 #[tokio::test]
-#[ignore = "BUG: index-served LIST clamps max-keys=0 to 1 and returns a key the origin does not"]
 async fn list_with_max_keys_zero_matches_the_origin() {
     let origin = Origin::start("diff-list-zero").await;
     for key in ["a", "b", "c"] {
@@ -1000,12 +1040,14 @@ async fn list_with_max_keys_zero_matches_the_origin() {
 
 /// `fetch-owner=true` asks for the per-object `Owner` element.
 ///
-/// Observed: `list-owner: proxy=[None, None, None]` versus
-/// `origin=[Some(("02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4", "minio")), ...]`.
-/// `ObjEntry` (src/index.rs) has no owner field and `list_objects_v2_from_index` ignores
-/// `fetch_owner`, so the element the client explicitly asked for is missing.
+/// Was: `list-owner: proxy=[None, None, None]` versus
+/// `origin=[Some(("02d6176db174dc93cb1b899f7c6078f08654445fe8cf1b6ce98d8855f66bdbf4", "minio")), ...]`
+/// — `ObjEntry` (src/index.rs) has no owner field and no write path carries one, because
+/// the owner is the origin's account, not anything a write says. A `fetch-owner` LIST
+/// therefore passes through rather than answering without the element the client
+/// explicitly asked for; the row still compares the two legs, and no origin-LIST-counter
+/// assertion is made because this one is *meant* to cost a LIST.
 #[tokio::test]
-#[ignore = "BUG: index-served LIST ignores fetch-owner and never reports Owner"]
 async fn list_with_fetch_owner_matches_the_origin() {
     let origin = Origin::start("diff-list-owner").await;
     for key in ["a", "b", "c"] {
@@ -1093,12 +1135,12 @@ async fn an_unsatisfiable_range_reports_content_range_like_the_origin() {
 /// named account does not own the bucket, a locally-served answer must reject it too.
 ///
 /// This origin does not implement the guard — a HEAD carrying `000000000000` is answered
-/// `200` by `MinIO` itself — so the row currently proves only that the proxy does not
-/// contradict it. It is kept because it is the row that starts failing the day the origin
-/// (R2, AWS) does enforce it, and because the proxy would then be serving 200s from the
-/// index for a request the origin would have refused: `cache_eligible` in
-/// `CachingProxy::head_object` and `origin_only` in `get_object` (src/cache.rs) do not
-/// look at `expected_bucket_owner`, and `list_objects_v2_from_index` ignores it too.
+/// `200` by `MinIO` itself — so the row cannot prove the refusal, only that the proxy
+/// does not contradict the origin. What makes it hold the day the origin (R2, AWS) does
+/// enforce it is that a request carrying the header is no longer eligible for a local
+/// answer at all: it is in the `origin_only` set on GET, out of `cache_eligible` on
+/// HEAD, and out of the index-served LIST path (src/cache.rs), so the origin evaluates
+/// the guard on every one.
 #[tokio::test]
 async fn expected_bucket_owner_is_honoured_like_the_origin() {
     let origin = Origin::start("diff-owner-guard").await;
@@ -1140,13 +1182,14 @@ async fn expected_bucket_owner_is_honoured_like_the_origin() {
 /// A batch delete reports per key: the call succeeds while individual keys are refused.
 /// The index may only drop the ones the origin actually deleted.
 ///
-/// Observed: after the origin refused to delete a version under a legal hold,
-/// `keys: proxy=[] origin=["held"]` and the HEAD is `status: proxy=Some(404)
-/// origin=Some(200)`. `CachingProxy::delete_objects` (src/cache.rs) records a delete for
-/// every key in the *request* — the `Errors` half of the response is never read — so a
-/// key the origin still holds disappears from LIST and HEADs 404 until the next resync.
+/// Was: after the origin refused to delete a version under a legal hold,
+/// `keys: proxy=[] origin=["held"]` and the HEAD was `status: proxy=Some(404)
+/// origin=Some(200)` — `CachingProxy::delete_objects` (src/cache.rs) recorded a delete
+/// for every key in the *request*, never reading the `Errors` half of the response, so a
+/// key the origin still held disappeared from LIST and 404ed until the next resync. The
+/// applied set now comes off the response (`Deleted`, or requested-minus-`Errors` under
+/// `quiet`), and a version-scoped identifier never tombstones the key at all.
 #[tokio::test]
-#[ignore = "BUG: a batch delete unindexes keys the origin refused to delete"]
 async fn a_refused_batch_delete_leaves_the_key_indexed() {
     let origin = Origin::start("diff-batch-delete").await;
     origin.make_bucket("diff-locked", true).await;
@@ -1169,7 +1212,7 @@ async fn a_refused_batch_delete_leaves_the_key_indexed() {
         list_input(&r.bucket)
     })
     .await;
-    r.head("HEAD after a refused batch delete", INDEX_HEAD, || {
+    r.head("HEAD after a refused batch delete", Fields::OBJECT, || {
         head_input(&r.bucket, "held")
     })
     .await;

@@ -10,5 +10,13 @@ spec:
     - name: s3
       port: {{ .Values.service.port }}
       targetPort: s3
+    {{- if .Values.metrics.enabled }}
+    # The scrape target. A ServiceMonitor (or a plain kubernetes-service-endpoints
+    # scrape job) can only find a port the Service publishes, so the exporter's
+    # container port is only half of enabling metrics.
+    - name: metrics
+      port: {{ .Values.metrics.port | int64 }}
+      targetPort: metrics
+    {{- end }}
   selector:
     app.kubernetes.io/name: s3cache

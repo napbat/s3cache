@@ -113,6 +113,10 @@ counters! {
     warm_miss => warm_miss,
     /// Record a warm-tier error/timeout/decode failure (all handled as a miss/drop).
     warm_error => warm_error,
+    /// Record an object the warm tier declined because its encoding exceeds the
+    /// per-object cap — policy, not failure, and kept out of `warm_error` so that
+    /// counter stays alertable.
+    warm_rejects => warm_reject,
     /// Record a write advertised to peers over the gossip write feed.
     feed_published => feed_published,
     /// Record a peer's write applied from the feed (index + invalidation).
@@ -124,6 +128,9 @@ counters! {
     /// Record a cache-served read routed to the origin because this node's
     /// membership view was not fully alive.
     unhealthy_bypasses => unhealthy_bypass,
+    /// Record a skeletal index entry completed from an origin response (the one
+    /// forwarded HEAD that makes every later HEAD of that key local *and* faithful).
+    index_backfills => index_backfill,
 }
 
 /// Periodically log the cache-effectiveness counters (LISTs served from the index
@@ -223,7 +230,7 @@ mod tests {
         assert!(line.contains(" get_hit=2 "), "{line}");
         assert!(line.contains(" warm_hit=1 "), "{line}");
         assert!(line.contains(" head_index=1 "), "{line}");
-        assert!(line.ends_with(" unhealthy_bypasses=0"), "{line}");
+        assert!(line.ends_with(" index_backfills=0"), "{line}");
     }
 
     /// The exposition is generated from the same declaration as the stats line, so

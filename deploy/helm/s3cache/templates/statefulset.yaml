@@ -18,6 +18,15 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: s3cache
+      {{- if .Values.metrics.enabled }}
+      # Pod-level scrape annotations, for the Prometheus setups that discover pods
+      # rather than ServiceMonitors. Same conditional as the port and the listener:
+      # metrics.enabled turns on the whole path, not just the process.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | int64 | quote }}
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       {{- with .Values.imagePullSecret.existingSecret }}
       imagePullSecrets:

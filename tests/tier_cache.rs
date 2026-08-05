@@ -93,8 +93,10 @@ async fn served_body(obj: &CachedObject) -> Bytes {
 }
 
 fn cache(dir: &TempDir, hot_bytes: u64, disk_bytes: u64, max_obj_bytes: usize) -> TieredCache {
-    let warm = open_warm(dir.path(), disk_bytes, max_obj_bytes).expect("warm tier opens");
-    TieredCache::new(hot_bytes, Some(warm), Arc::new(Metrics::default()))
+    let metrics = Arc::new(Metrics::default());
+    let warm = open_warm(dir.path(), disk_bytes, max_obj_bytes, Arc::clone(&metrics))
+        .expect("warm tier opens");
+    TieredCache::new(hot_bytes, Some(warm), metrics)
 }
 
 /// Inserts `count` distinct `len`-byte objects, `obj-0` first.

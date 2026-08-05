@@ -9,11 +9,12 @@
 mod common;
 
 use common::{
-    Origin, delete, get, gossip_pair, head, list, proxy_over, put, put_conditional, wait_for_index,
+    Origin, delete, get, gossip_pair, head, list, list_entry, proxy_over, put, put_conditional,
+    wait_for_index,
 };
 use s3cache::cache::CachingProxy;
 use s3s::S3ErrorCode;
-use s3s::dto::ETagCondition;
+use s3s::dto::{ETag, ETagCondition};
 
 /// Nothing here is about the size cap; keep every object cacheable.
 const CAP: usize = 1024 * 1024;
@@ -45,7 +46,12 @@ async fn two_nodes(origin: &Origin, ids: (&str, &str)) -> (CachingProxy, Caching
 /// returns. Until membership is established there is no peer to wait for an ack from,
 /// so A's write returns without B having applied anything — a startup window, not the
 /// steady-state semantics the tests below assert.
-async fn settle_cluster(node_a: &CachingProxy, node_b: &CachingProxy, bucket: &str) {
+async fn settle_cluster(
+    origin: &Origin,
+    node_a: &CachingProxy,
+    node_b: &CachingProxy,
+    bucket: &str,
+) {
     let mut probe = 0;
     eventually!("the gossip cluster to establish", {
         probe += 1;
@@ -61,17 +67,32 @@ async fn settle_cluster(node_a: &CachingProxy, node_b: &CachingProxy, bucket: &s
     eventually!("the probe keys to clear from both indexes", {
         cleared(list(node_a, bucket).await) && cleared(list(node_b, bucket).await)
     });
+    // A node only answers the index-authoritative 404 once its view of the cluster has
+    // held still for the failure detector's whole window — inside it a peer could be
+    // holding a write this node has not seen, and a 404 for a key that exists is a lie
+    // no retry fixes. Steady state includes that window having elapsed, and the only
+    // signal for it a test should use is the black-box one: a 404 that costs nothing.
+    eventually!(
+        "the index-authoritative 404 to be trustworthy on both nodes",
+        {
+            let heads = origin.ops.head();
+            let _ = head(node_a, bucket, "never-written").await;
+            let _ = head(node_b, bucket, "never-written").await;
+            origin.ops.head() == heads
+        }
+    );
 }
 
 /// A write on A is in B's index by the time the write returns — no polling: strong mode
 /// holds the response until every alive peer has applied the event. B then answers LIST
-/// and HEAD for a key it has never seen at the origin, without asking it anything.
+/// for a key it has never seen at the origin, carrying the writer's own `ETag`, and one
+/// forwarded HEAD completes the entry so every HEAD after it is local too.
 #[tokio::test]
 async fn a_write_on_a_folds_into_bs_index() {
     let origin = Origin::start("coherence-fold").await;
     let bucket = origin.bucket();
     let (node_a, node_b) = two_nodes(&origin, ("fold-a", "fold-b")).await;
-    settle_cluster(&node_a, &node_b, bucket).await;
+    settle_cluster(&origin, &node_a, &node_b, bucket).await;
     let (lists, heads) = (origin.ops.list(), origin.ops.head());
 
     put(&node_a, bucket, "shared", b"from-a").await;
@@ -81,19 +102,47 @@ async fn a_write_on_a_folds_into_bs_index() {
         ["shared"],
         "B's index has the key the moment A's write returned"
     );
+    // The v2 feed envelope carries the origin's ETag, so B reports it without ever
+    // asking the origin — where v1 advertised existence and size and nothing else.
+    let (size, etag) = list_entry(&node_b, bucket, "shared")
+        .await
+        .expect("B lists the key");
+    assert_eq!(size, 6);
+    assert_eq!(
+        etag,
+        origin.etag("shared").await,
+        "the feed carried the writer's ETag to the peer"
+    );
+    assert_eq!(
+        origin.ops.list(),
+        lists,
+        "B answered LIST from its own index"
+    );
+
+    // A HEAD is the one answer the feed cannot supply: no user metadata rides it, and a
+    // HEAD that omitted `x-amz-meta-*` would differ from the origin's. B forwards the
+    // first one, completes the entry from the answer, and is local from then on.
     let out = head(&node_b, bucket, "shared")
         .await
         .expect("B can HEAD it too");
     assert_eq!(out.content_length, Some(6));
+    assert_eq!(out.e_tag.as_ref().map(ETag::value), etag.as_deref());
     assert_eq!(
-        (origin.ops.list(), origin.ops.head()),
-        (lists, heads),
-        "B answered both from its own index"
+        origin.ops.head(),
+        heads + 1,
+        "one forwarded HEAD completed the peer-folded entry"
     );
-    assert!(
-        out.e_tag.is_none(),
-        "a peer-folded entry carries no ETag: the feed advertises existence and size, \
-         and the ETag arrives with the next origin sync"
+
+    let heads = origin.ops.head();
+    let again = head(&node_b, bucket, "shared")
+        .await
+        .expect("and B still has it");
+    assert_eq!(again.content_length, Some(6));
+    assert_eq!(again.e_tag, out.e_tag);
+    assert_eq!(
+        origin.ops.head(),
+        heads,
+        "the completed entry answers every HEAD after it"
     );
 }
 
@@ -105,7 +154,7 @@ async fn an_overwrite_on_a_invalidates_bs_cached_body() {
     let bucket = origin.bucket();
     origin.seed("obj", b"version-1").await;
     let (node_a, node_b) = two_nodes(&origin, ("inval-a", "inval-b")).await;
-    settle_cluster(&node_a, &node_b, bucket).await;
+    settle_cluster(&origin, &node_a, &node_b, bucket).await;
 
     assert_eq!(get(&node_b, bucket, "obj").await, "version-1");
     let fetched = origin.ops.get();
@@ -137,7 +186,7 @@ async fn a_delete_on_a_removes_the_key_from_bs_index() {
     let origin = Origin::start("coherence-delete").await;
     let bucket = origin.bucket();
     let (node_a, node_b) = two_nodes(&origin, ("del-a", "del-b")).await;
-    settle_cluster(&node_a, &node_b, bucket).await;
+    settle_cluster(&origin, &node_a, &node_b, bucket).await;
 
     put(&node_a, bucket, "doomed", b"briefly here").await;
     assert_eq!(list(&node_b, bucket).await, ["doomed"]);
@@ -169,7 +218,7 @@ async fn a_contested_create_is_arbitrated_by_the_origin() {
     let origin = Origin::start("coherence-cas").await;
     let bucket = origin.bucket();
     let (node_a, node_b) = two_nodes(&origin, ("cas-a", "cas-b")).await;
-    settle_cluster(&node_a, &node_b, bucket).await;
+    settle_cluster(&origin, &node_a, &node_b, bucket).await;
 
     let (from_a, from_b) = tokio::join!(
         put_conditional(

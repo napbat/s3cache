@@ -175,15 +175,25 @@ pub type WarmPair = (WarmTier, Arc<MmapDiskTier>);
 /// Worker threads for the warm tier's blocking file I/O.
 const WARM_IO_THREADS: usize = 4;
 
+/// The codec's rejection message for an object whose encoding does not fit the
+/// per-object cap.
+const WARM_TOO_LARGE: &str = "encoded object exceeds S3CACHE_MAX_OBJECT_BYTES";
+
 /// Open (creating if needed) the warm disk tier under `dir`, byte-bounded to `disk_bytes`;
 /// files already present are re-indexed so the cache survives restarts. Objects whose
 /// encoding exceeds `max_obj_bytes` are rejected by the codec — under the cache's
-/// best-effort write policy that skips the disk fill without failing the hot one.
+/// best-effort write policy that skips the disk fill without failing the hot one, which
+/// is also why the rejection is counted inside the codec: it never reaches a caller.
 ///
 /// # Errors
 ///
 /// The I/O error from creating or re-indexing `dir`.
-pub fn open_warm(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize) -> anyhow::Result<WarmPair> {
+pub fn open_warm(
+    dir: PathBuf,
+    disk_bytes: u64,
+    max_obj_bytes: usize,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<WarmPair> {
     let budget = NonZeroU64::new(disk_bytes.max(1)).unwrap_or(NonZeroU64::MIN);
     let disk = Arc::new(MmapDiskTier::open_bounded(dir, budget)?);
     let codec = CodecTier::new(
@@ -193,7 +203,10 @@ pub fn open_warm(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize) -> anyhow:
             let bytes =
                 bincode::serialize(&(key, obj.as_ref())).map_err(tierstore::BoxError::from)?;
             if bytes.len() > max_obj_bytes {
-                return Err("encoded object exceeds S3CACHE_MAX_OBJECT_BYTES".into());
+                // The configured cap doing its job, not a failure — kept out of
+                // `warm_error` so that counter stays something an operator can page on.
+                metrics.warm_reject();
+                return Err(WARM_TOO_LARGE.into());
             }
             Ok(Bytes::from(bytes))
         },
@@ -245,7 +258,9 @@ impl Core {
     }
 
     /// Best-effort fill of hot and (inclusively) warm: a disk rejection or I/O error is
-    /// skipped by policy, never surfaced to the data plane.
+    /// skipped by policy, never surfaced to the data plane. The per-object-cap rejection
+    /// is counted by the codec itself (see [`open_warm`]), precisely because the policy
+    /// means it never arrives here.
     async fn insert(&self, key: CacheKey, obj: Arc<CachedObject>) {
         if self.cache.put(key, obj).await.is_err() {
             self.metrics.warm_error();
@@ -432,6 +447,11 @@ mod tests {
         (bucket.to_owned(), key.to_owned())
     }
 
+    /// A counter set for a test that does not read it back.
+    fn metrics() -> Arc<Metrics> {
+        Arc::new(Metrics::default())
+    }
+
     #[test]
     fn cached_object_bincode_roundtrip() {
         let obj = sample();
@@ -459,7 +479,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cap = 10 * 1024 * 1024;
 
-        let (warm, _disk) = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
+        let (warm, _disk) = open_warm(dir.clone(), cap, 8 * 1024 * 1024, metrics()).unwrap();
         let obj = Arc::new(sample());
         warm.put(ck("b", "k"), obj.clone()).await.unwrap();
         assert_eq!(
@@ -469,7 +489,7 @@ mod tests {
         assert!(warm.get(&ck("b", "missing")).await.unwrap().is_none());
 
         // A fresh tier over the same dir re-indexes the file — survives a restart.
-        let (warm2, _disk2) = open_warm(dir.clone(), cap, 8 * 1024 * 1024).unwrap();
+        let (warm2, _disk2) = open_warm(dir.clone(), cap, 8 * 1024 * 1024, metrics()).unwrap();
         assert!(
             warm2.get(&ck("b", "k")).await.unwrap().is_some(),
             "warm tier survives restart"
@@ -484,11 +504,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An object too big for the warm tier is the per-object cap doing its job, not a
+    /// disk failure. The two are counted apart so `warm_error` stays a counter an
+    /// operator can page on — a workload that simply holds large objects must not keep
+    /// it permanently lit.
+    #[tokio::test]
+    async fn an_oversize_object_counts_a_rejection_not_an_error() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let metrics = Arc::new(Metrics::default());
+        // A cap below anything's encoded size, so the codec refuses every disk fill.
+        let warm = open_warm(dir.clone(), 10 * 1024 * 1024, 1, Arc::clone(&metrics)).unwrap();
+        let cache = TieredCache::new(1024 * 1024, Some(warm), Arc::clone(&metrics));
+
+        cache.insert(ck("b", "k"), Arc::new(sample())).await;
+        assert!(
+            cache.get(&ck("b", "k")).await.is_some(),
+            "the disk rejection never blocks the hot fill"
+        );
+        let text = metrics.prometheus_text();
+        assert!(text.contains("\ns3cache_warm_rejects 1\n"), "{text}");
+        assert!(text.contains("\ns3cache_warm_error 0\n"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn layered_cache_fills_and_invalidates() {
         let dir = temp_dir();
         let _ = std::fs::remove_dir_all(&dir);
-        let warm = open_warm(dir.clone(), 10 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+        let warm = open_warm(dir.clone(), 10 * 1024 * 1024, 8 * 1024 * 1024, metrics()).unwrap();
         let cache = TieredCache::new(1024 * 1024, Some(warm), Arc::new(Metrics::default()));
 
         let key = ck("b", "k");

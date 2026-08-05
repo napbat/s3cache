@@ -38,6 +38,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     );
     let proxy = s3s_aws::Proxy::from(client.clone());
 
+    // One counter set for the whole process: the tiers, the write feed, the proxy and
+    // the stats task all report into it.
+    let counters = Arc::new(metrics::Metrics::default());
+
     // Optional node-local disk (warm) tier: inclusive, size-limited, survives restarts so
     // a fresh pod comes up warm instead of stampeding the origin. Set S3CACHE_DISK_CACHE
     // to a directory (typically a mounted volume) to enable it.
@@ -49,6 +53,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 path.clone(),
                 cfg.disk_bytes,
                 cfg.cache.max_obj_bytes,
+                Arc::clone(&counters),
             )?)
         }
         None => None,
@@ -62,16 +67,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     info!("gossip coherence (write feed): {}", write_sync.is_some());
 
     // Object-body cache: hot (node-local heap) in front of the optional disk tier (warm),
-    // in front of the S3 origin (cold). Always layered — no mode to pick. The counters
-    // are shared by the tiers, the feed, and the stats task.
-    let cp = cache::CachingProxy::new(
-        proxy,
-        client,
-        cfg.cache,
-        disk,
-        write_sync,
-        Arc::new(metrics::Metrics::default()),
-    );
+    // in front of the S3 origin (cold). Always layered — no mode to pick.
+    let cp = cache::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters);
     cp.start_coherence(&cfg.buckets);
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the

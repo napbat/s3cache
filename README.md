@@ -14,9 +14,14 @@ endpoint to this proxy; no client code changes.
   `ListObjectsV2` is answered locally with **no upstream LIST call**. LISTs are the
   expensive S3 tier (R2 Class A), and clients that poll/list constantly (e.g. a
   log-structured store allocating slots) dominate the bill; this removes them. The same
-  index answers `HeadObject` for a synced bucket — size, mtime and ETag for a key it
-  holds, an immediate 404 for one it doesn't — so a per-key existence probe (the
-  class-B volume driver) costs no upstream call either, cached body or not.
+  index answers `HeadObject` for a synced bucket — an immediate 404 for a key it does not
+  hold, and the full record for one it does — so a per-key existence probe (the class-B
+  volume driver) costs no upstream call either, cached body or not. An entry only answers
+  a HEAD once it is *faithful*: a bootstrap LIST row or a peer's gossiped write proves the
+  key exists and carries what LIST reports, but not the `Content-Type` or `x-amz-meta-*`
+  a HEAD does, so the first HEAD of such a key is forwarded once and its answer completes
+  the entry in place (`index_backfills`). Nothing local is ever served that would differ
+  from the origin — see [Testing coherence and parity](#testing-coherence-and-parity).
 - **Layered GET/HEAD object cache — hot / warm / cold.** Cacheable reads (no range / part
   / conditional headers) of objects up to `S3CACHE_MAX_OBJECT_BYTES` are served from a
   **hot** node-local in-memory LRU (`S3CACHE_CACHE_BYTES`) in front of an optional **warm**
@@ -93,6 +98,13 @@ client, no headers, no cooperation:
   cache-eligible reads via the origin until the view heals: slower, never stale. (This
   is also what bounds the writer's ack wait: a dying peer is excluded once SWIM marks
   it suspect.)
+- **The authoritative 404 waits for a settled view.** A HEAD of a key the index does
+  not hold is a local 404 only once the membership view has been unchanged — no status
+  change, no ack timeout, no write-feed gap — for the failure detector's whole window.
+  Inside it, a peer that has just written the key may not yet look unhealthy, and a 404
+  for an object that exists is a lie no retry corrects; so the HEAD is forwarded and
+  counted as `head_miss`. Without gossip (single node) there is no such window and the
+  404 is always local.
 - **Honesty footnote:** the residual window is an *asymmetric* partition inside the
   SWIM probe window combined with an ack timeout (logged + counted, ~2s) — bounded and
   loud, never silent. The absolute arbiter for conflicting writers remains the origin:
@@ -161,6 +173,15 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
   UDP: a write on A is in B's index by the time it returns, an overwrite on A drops B's
   cached body, a delete on A makes B's HEAD a local 404, and a contested
   create-if-absent is arbitrated by the origin.
+- **Differential tests** (`tests/differential.rs`, same Docker origin): every row asks
+  one question twice — once through the proxy, once straight at MinIO — and asserts a
+  client could not tell which answered, over the status, the body and the headers it
+  branches on (`ETag`, `Content-Length`, `Content-Range`, `Last-Modified`,
+  `Content-Type`, `Accept-Ranges`, `x-amz-meta-*`) plus the whole `ListObjectsV2`
+  envelope. It is the referee for anything the proxy chooses to answer locally: the
+  conditional-request matrix, the range matrix in every serving state, the LIST matrix
+  walked to exhaustion, `response-*` overrides, `max-keys=0`, and a partially-refused
+  batch delete.
 - **End-to-end** (`scripts/coherence-e2e.sh`): spins up MinIO and runs boto3
   harnesses against **real s3cache nodes** gossiping over loopback UDP. Needs
   podman/docker and `python3` + `boto3`.
@@ -209,5 +230,7 @@ What they attribute: LIST (`list_from_index` vs `list_passthrough`), GET
 `head_index` and `head_404` from the key index, `head_miss` forwarded upstream), the
 writes folded into the index by operation (`writes_indexed_put` / `_copy` / `_multipart`,
 each a separately billed upstream class-A call, plus `_observed` for keys learned on the
-read path), the warm tier (`warm_*`) and the gossip write feed (`feed_*`, `ack_timeouts`,
-`unhealthy_bypasses`).
+read path), `index_backfills` (index entries completed from a forwarded answer — see
+below), the warm tier (`warm_hit` / `warm_miss` / `warm_error`, with `warm_rejects` for
+objects the per-object cap declined, kept apart so `warm_error` stays alertable) and the
+gossip write feed (`feed_*`, `ack_timeouts`, `unhealthy_bypasses`).

@@ -13,9 +13,9 @@
 //! Cross-node coherence rides the gossip write feed (see [`crate::sync`]): peers' writes
 //! fold into the index and invalidate local copies; strict reads barrier on feed heads.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,17 +23,19 @@ use s3s::dto::{
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput,
     DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput, DeleteObjectsOutput, ETag,
     GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input,
-    ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob,
+    ListObjectsV2Output, ObjectStorageClass, PutObjectInput, PutObjectOutput, StreamingBlob,
+    Timestamp,
 };
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
 use crate::index::{
-    BucketState, ObjEntry, apply_del, apply_put, head_object_from_index,
-    list_objects_v2_from_index, sync_bucket_into,
+    BucketState, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del, apply_put,
+    complete_entry, head_object_from_index, list_objects_v2_from_index, standard_class,
+    sync_bucket_into,
 };
 use crate::metrics::Metrics;
-use crate::sync::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteSync};
+use crate::sync::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync, wire_stamp};
 use crate::tier::{self, CachedObject, TieredCache, WarmPair};
 use http::{HeaderMap, HeaderName, HeaderValue};
 
@@ -64,6 +66,140 @@ const WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 /// How long a strict read waits for the freshness barrier before serving
 /// current state anyway (degrading to eventual rather than hanging).
 const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// First and longest wait between attempts at a bucket's warm-up sync. A bucket whose
+/// LIST fails is not lost for the process lifetime — it stays passthrough (correct, just
+/// expensive) and keeps trying, because the origin being briefly unreachable at startup
+/// is the ordinary case, not a permanent verdict.
+const SYNC_RETRY_MIN: Duration = Duration::from_secs(1);
+const SYNC_RETRY_MAX: Duration = Duration::from_mins(1);
+
+/// The per-request `response-*` overrides on a read: headers the origin applies to that
+/// one response, and a property of the request rather than of the stored object. They
+/// are stripped on the way in — so a fill always caches the object's own headers and no
+/// client's formatting is served to the next — and applied on the way out, hit or miss,
+/// so an overriding read is answered exactly as the origin would answer it.
+#[derive(Clone, Default)]
+struct ResponseOverrides {
+    content_type: Option<String>,
+    content_disposition: Option<String>,
+    content_encoding: Option<String>,
+    content_language: Option<String>,
+    cache_control: Option<String>,
+    expires: Option<Timestamp>,
+}
+
+/// Moves the `response-*` fields out of an input into a [`ResponseOverrides`]; one macro
+/// so GET and HEAD (which spell them identically) cannot drift apart.
+macro_rules! take_overrides {
+    ($input:expr) => {{
+        let input = $input;
+        ResponseOverrides {
+            content_type: input.response_content_type.take(),
+            content_disposition: input.response_content_disposition.take(),
+            content_encoding: input.response_content_encoding.take(),
+            content_language: input.response_content_language.take(),
+            cache_control: input.response_cache_control.take(),
+            expires: input.response_expires.take(),
+        }
+    }};
+}
+
+/// What an origin response says about an object — the shape [`CachingProxy::observe`]
+/// folds into the LIST index. `size: None` is a size that was never learned, and stays
+/// that way: an entry is never given a number the origin did not report.
+#[derive(Clone)]
+struct ObservedObject {
+    size: Option<i64>,
+    etag: Option<ETag>,
+    content_type: Option<String>,
+    storage_class: ObjectStorageClass,
+    meta: ObjMeta,
+}
+
+/// The storage class a write puts a key in: what the request asked for, or S3's default.
+fn write_storage_class(requested: Option<&s3s::dto::StorageClass>) -> ObjectStorageClass {
+    requested.map_or_else(standard_class, |class| {
+        ObjectStorageClass::from(class.as_str().to_owned())
+    })
+}
+
+/// An index entry for a key the write path cannot describe itself (a copy, a completed
+/// multipart): everything an origin HEAD reported, or — when the HEAD would not answer
+/// even on retry — a skeletal entry with **no size**, which neither LIST nor HEAD will
+/// serve until something completes it. Nothing is invented: the old `size: 0` was served
+/// as an authoritative `Content-Length` forever. `last_modified` is stamped by
+/// [`CachingProxy::record_put`].
+fn observed_entry(observed: Option<&ObservedObject>) -> ObjEntry {
+    let Some(observed) = observed else {
+        return ObjEntry {
+            size: None,
+            last_modified: SystemTime::UNIX_EPOCH,
+            etag: None,
+            storage_class: standard_class(),
+            content_type: None,
+            meta: None,
+        };
+    };
+    ObjEntry {
+        size: observed.size,
+        last_modified: SystemTime::UNIX_EPOCH,
+        etag: observed.etag.clone(),
+        storage_class: observed.storage_class.clone(),
+        content_type: observed.content_type.clone(),
+        meta: Some(Box::new(observed.meta.clone())),
+    }
+}
+
+/// Reads an origin response into an [`ObservedObject`]. `GetObjectOutput` and
+/// `HeadObjectOutput` spell these fields identically, so one macro drives both and the
+/// two can never learn to disagree.
+macro_rules! observed {
+    ($out:expr) => {{
+        let out = $out;
+        ObservedObject {
+            size: out.content_length,
+            etag: out.e_tag.clone(),
+            content_type: out.content_type.clone(),
+            storage_class: out
+                .storage_class
+                .as_ref()
+                .map_or_else(standard_class, |class| {
+                    ObjectStorageClass::from(class.as_str().to_owned())
+                }),
+            meta: ObjMeta {
+                cache_control: out.cache_control.clone(),
+                content_disposition: out.content_disposition.clone(),
+                content_encoding: out.content_encoding.clone(),
+                content_language: out.content_language.clone(),
+                metadata: out.metadata.clone(),
+            },
+        }
+    }};
+}
+
+/// Applies the overrides onto a response, leaving untouched anything the request did not
+/// ask to override. `GetObjectOutput` and `HeadObjectOutput` spell these identically, so
+/// one macro drives both.
+macro_rules! apply_overrides {
+    ($overrides:expr, $out:expr) => {{
+        let (overrides, out) = ($overrides, $out);
+        for (field, value) in [
+            (&mut out.content_type, &overrides.content_type),
+            (&mut out.content_disposition, &overrides.content_disposition),
+            (&mut out.content_encoding, &overrides.content_encoding),
+            (&mut out.content_language, &overrides.content_language),
+            (&mut out.cache_control, &overrides.cache_control),
+        ] {
+            if value.is_some() {
+                field.clone_from(value);
+            }
+        }
+        if overrides.expires.is_some() {
+            out.expires.clone_from(&overrides.expires);
+        }
+    }};
+}
 
 /// Which write folded a key into the LIST index. Each of these is a separately
 /// billed upstream (R2 class A) operation, so each gets its own counter — one
@@ -216,126 +352,200 @@ impl CachingProxy {
         self.metrics.clone()
     }
 
-    /// Record a durable put: fold it into the local index (LWW, same rule the
-    /// apply loop uses for peers) and advertise it over the write feed.
-    /// Returns the write's session token when coherence is on. The write
-    /// response is held until every alive peer has applied the invalidation
-    /// (a couple of in-cluster hops behind the origin round-trip already
-    /// paid), so a subsequent read via ANY node is fresh with no client
-    /// cooperation. An ack timeout is counted and logged, never an error —
-    /// the unresponsive peer is either dying (SWIM will exclude it) or
-    /// partitioned (its own health gate stops it serving cached state).
+    /// Record a durable put: fold `entry` into the local index (LWW, same rule the apply
+    /// loop uses for peers), advertise it over the write feed, and hold the response
+    /// until every alive peer has applied the invalidation (a couple of in-cluster hops
+    /// behind the origin round-trip already paid), so a subsequent read via ANY node is
+    /// fresh with no client cooperation. Returns the write's session token when
+    /// coherence is on. The caller has already dropped this node's own body copy — the
+    /// writer must not serve its own stale bytes while the cluster round runs.
     async fn record_put(
         &self,
         op: IndexedWrite,
         bucket: &str,
         key: &str,
-        size: i64,
-        etag: Option<ETag>,
+        mut entry: ObjEntry,
     ) -> Option<String> {
-        let ts = SystemTime::now();
-        let entry = ObjEntry {
-            size,
-            last_modified: ts,
-            etag,
-        };
+        entry.last_modified = wire_stamp(SystemTime::now());
+        // Apply locally first: the writer must never be the one node still answering
+        // from the older entry, not even for the length of a publish. The copy is only
+        // taken when there is a feed to advertise it on.
+        let advertised = self.sync.is_some().then(|| entry.clone());
         if apply_put(&self.state, bucket, key, entry) {
             op.record(&self.metrics);
         }
-        let Some(sync) = &self.sync else { return None };
-        let receipt = sync.publish_put(bucket, key, size, ts, &self.metrics).await;
-        if !sync
-            .wait_cluster_applied(receipt.token, WRITE_ACK_TIMEOUT)
-            .await
-        {
-            tracing::warn!("write ack timed out for {bucket}/{key}; a peer may lag");
-            self.metrics.ack_timeout();
-        }
+        let (sync, entry) = (self.sync.as_ref()?, advertised?);
+        let receipt = sync.publish_put(bucket, key, &entry, &self.metrics).await;
+        sync.ack_write(receipt.token, WRITE_ACK_TIMEOUT, bucket, key, &self.metrics)
+            .await;
         Some(receipt.header)
     }
 
-    /// Record a durable delete: tombstone + remove locally, advertise to
-    /// peers and hold the response for cluster-wide application (see
-    /// [`record_put`](Self::record_put)).
-    async fn record_del(&self, bucket: &str, key: &str) -> Option<String> {
-        let ts = SystemTime::now();
+    /// Record a durable delete: tombstone + remove locally and advertise it to peers,
+    /// returning the receipt rather than waiting. The caller chooses when to wait — one
+    /// key waits immediately, a batch publishes every key first and then waits once (see
+    /// [`await_cluster`](Self::await_cluster)).
+    async fn record_del(&self, bucket: &str, key: &str) -> Option<WriteReceipt> {
+        let ts = wire_stamp(SystemTime::now());
         apply_del(&self.state, bucket, key, ts);
-        let Some(sync) = &self.sync else { return None };
-        let receipt = sync.publish_del(bucket, key, ts, &self.metrics).await;
-        if !sync
-            .wait_cluster_applied(receipt.token, WRITE_ACK_TIMEOUT)
-            .await
-        {
-            tracing::warn!("delete ack timed out for {bucket}/{key}; a peer may lag");
-            self.metrics.ack_timeout();
-        }
+        let sync = self.sync.as_ref()?;
+        Some(sync.publish_del(bucket, key, ts, &self.metrics).await)
+    }
+
+    /// Hold a write's response until every alive peer has applied it, then hand back the
+    /// session token for the response header (see [`record_put`](Self::record_put)).
+    async fn await_cluster(
+        &self,
+        receipt: Option<WriteReceipt>,
+        bucket: &str,
+        key: &str,
+    ) -> Option<String> {
+        let (sync, receipt) = (self.sync.as_ref()?, receipt?);
+        sync.ack_write(receipt.token, WRITE_ACK_TIMEOUT, bucket, key, &self.metrics)
+            .await;
         Some(receipt.header)
     }
 
     /// Warm each bucket's LIST index in the background so startup stays instant and
     /// independent of bucket size. Until a bucket's full sync finishes its LISTs pass
-    /// through to the upstream (always correct), then flip to index-served.
+    /// through to the upstream (always correct), then flip to index-served. A failed
+    /// sync retries with capped exponential backoff rather than leaving the bucket
+    /// passthrough for the process lifetime — a transient origin outage at startup
+    /// should not cost every LIST for the next fortnight.
     pub fn spawn_background_sync(&self, buckets: Vec<String>) {
-        let client = self.client.clone();
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            for bucket in buckets {
-                match sync_bucket_into(&client, &state, &bucket).await {
-                    Ok(n) => info!("warmed LIST index for `{bucket}`: {n} keys"),
-                    Err(e) => {
-                        tracing::warn!(
-                            "background sync of `{bucket}` failed (staying passthrough): {e}"
-                        );
+        for bucket in buckets {
+            let client = self.client.clone();
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let mut backoff = SYNC_RETRY_MIN;
+                loop {
+                    match sync_bucket_into(&client, &state, &bucket).await {
+                        Ok(n) => {
+                            info!("warmed LIST index for `{bucket}`: {n} keys");
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "background sync of `{bucket}` failed (staying passthrough, \
+                                 retrying in {backoff:?}): {e}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(SYNC_RETRY_MAX);
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 
-    /// Index a size observed on the READ path (a successful origin GET): the
-    /// key provably exists at the origin now, so LWW at `now` is correct and
-    /// nothing is advertised (peers learn real writes from their writers).
-    fn index_insert(&self, bucket: &str, key: &str, size: i64) {
+    /// Fold what an origin response proved into the index. An already-indexed key is
+    /// *completed* in place — the response fills the fields a skeletal entry lacks and
+    /// nothing else, so this observes rather than writes and cannot reorder against a
+    /// concurrent write. A key that is not indexed at all is added as a read
+    /// observation, stamped with the origin's own mtime (the truest clock available for
+    /// something the origin just described) and advertised to nobody: peers learn real
+    /// writes from their writers.
+    fn observe(&self, bucket: &str, key: &str, observed: &ObservedObject) {
+        let fill = EntryFill {
+            size: observed.size,
+            etag: observed.etag.clone(),
+            content_type: observed.content_type.clone(),
+            meta: observed.meta.clone(),
+        };
+        match complete_entry(&self.state, bucket, key, fill) {
+            Completion::Completed => {
+                self.metrics.index_backfill();
+                return;
+            }
+            Completion::AlreadyComplete => return,
+            Completion::NotIndexed => {}
+        }
         let entry = ObjEntry {
-            size,
-            last_modified: SystemTime::now(),
-            etag: None,
+            size: observed.size,
+            last_modified: wire_stamp(SystemTime::now()),
+            etag: observed.etag.clone(),
+            storage_class: observed.storage_class.clone(),
+            content_type: observed.content_type.clone(),
+            meta: Some(Box::new(observed.meta.clone())),
         };
         if apply_put(&self.state, bucket, key, entry) {
             self.metrics.write_indexed_observed();
         }
     }
 
-    /// The indexed size of a key, if this proxy has seen it (write-through or
-    /// LIST warm-up). Drives the range-promotion decision without a HEAD.
+    /// Index a size learned on the read path where nothing else about the object is in
+    /// hand (a refused range promotion reporting the real Content-Length). Skeletal by
+    /// construction: it stops the promotion decision re-firing, nothing more.
+    fn index_size_only(&self, bucket: &str, key: &str, size: i64) {
+        let entry = ObjEntry {
+            size: Some(size),
+            last_modified: wire_stamp(SystemTime::now()),
+            etag: None,
+            storage_class: standard_class(),
+            content_type: None,
+            meta: None,
+        };
+        if apply_put(&self.state, bucket, key, entry) {
+            self.metrics.write_indexed_observed();
+        }
+    }
+
+    /// The indexed size of a key, if this proxy has seen it *and* learned its size
+    /// (write-through or LIST warm-up). Drives the range-promotion decision without a
+    /// HEAD.
     fn index_size(&self, bucket: &str, key: &str) -> Option<i64> {
         self.state
             .read()
             .unwrap()
             .get(bucket)
             .and_then(|b| b.keys.get(key))
-            .map(|e| e.size)
+            .and_then(|e| e.size)
     }
 
-    /// The upstream's actual size and `ETag` for a key (one HEAD via the direct
-    /// client). Used where the write path doesn't carry the size (multipart
-    /// complete, copy) — indexing those at a placeholder poisons range
-    /// promotion.
-    async fn upstream_meta(&self, bucket: &str, key: &str) -> (Option<i64>, Option<ETag>) {
-        let Ok(head) = self
-            .client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-        else {
-            return (None, None);
-        };
-        (
-            head.content_length(),
-            head.e_tag().and_then(|raw| raw.parse().ok()),
-        )
+    /// The upstream's own description of a key (one HEAD via the direct client), used
+    /// where the write path does not carry it: multipart complete and copy know neither
+    /// the assembled size nor the metadata the origin ended up with. Retried once,
+    /// because the alternative to knowing is a key the index holds but cannot serve.
+    async fn upstream_meta(&self, bucket: &str, key: &str) -> Option<ObservedObject> {
+        for attempt in 0..2 {
+            match self
+                .client
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(head) => {
+                    return Some(ObservedObject {
+                        size: head.content_length(),
+                        etag: head.e_tag().and_then(|raw| raw.parse().ok()),
+                        content_type: head.content_type().map(str::to_owned),
+                        storage_class: head.storage_class().map_or_else(standard_class, |class| {
+                            ObjectStorageClass::from(class.as_str().to_owned())
+                        }),
+                        meta: ObjMeta {
+                            cache_control: head.cache_control().map(str::to_owned),
+                            content_disposition: head.content_disposition().map(str::to_owned),
+                            content_encoding: head.content_encoding().map(str::to_owned),
+                            content_language: head.content_language().map(str::to_owned),
+                            metadata: head.metadata().cloned(),
+                        },
+                    });
+                }
+                Err(e) if attempt == 0 => {
+                    tracing::debug!("metadata HEAD of {bucket}/{key} failed, retrying: {e}");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "metadata HEAD of {bucket}/{key} failed twice ({e}); indexing the key \
+                         without a size — LIST for the bucket and HEAD for the key fall \
+                         through to the origin until a response completes the entry"
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// Serve an int-range GET by promoting the whole object into the tiered cache (one
@@ -387,17 +597,14 @@ impl CachingProxy {
         // large enough that keeping it on the stack trips clippy's `large_futures`.
         let fetched = Box::pin(self.obj_cache.get_or_fetch(ckey, origin)).await;
         match fetched {
+            // A range starting past the end is refused by the origin with a shape only
+            // the origin knows (AWS sends `Content-Range: bytes */<size>`, MinIO sends
+            // none), so it is not synthesized here — it falls through and the origin's
+            // own 416 is what the client sees, whichever origin is behind us.
             Ok(obj) => {
                 self.metrics.range_promote();
-                Some(obj.to_get_range(first, last).map_or_else(
-                    || {
-                        Err(s3s::s3_error!(
-                            InvalidRange,
-                            "range start past end of object"
-                        ))
-                    },
-                    |out| Ok(S3Response::new(out)),
-                ))
+                let out = obj.to_get_range(first, last)?;
+                Some(Ok(S3Response::new(out)))
             }
             Err(e) => {
                 // Self-heal a lying index entry so this object stops
@@ -408,7 +615,7 @@ impl CachingProxy {
                     .and_then(|n| n.parse::<i64>().ok())
                     && sz >= 0
                 {
-                    self.index_insert(&ckey.0, &ckey.1, sz);
+                    self.index_size_only(&ckey.0, &ckey.1, sz);
                 }
                 self.metrics.range_promote_reject();
                 tracing::warn!(
@@ -429,158 +636,45 @@ impl CachingProxy {
             .is_some_and(|b| b.synced)
     }
 
-    /// Build a `ListObjectsV2` response from this bucket's index. See
-    /// [`list_objects_v2_from_index`] for the algorithm.
-    fn list_from_index(&self, inp: &ListObjectsV2Input) -> ListObjectsV2Output {
+    /// Build a `ListObjectsV2` response from this bucket's index; `None` when the index
+    /// cannot answer without inventing a value. See [`list_objects_v2_from_index`].
+    fn list_from_index(&self, inp: &ListObjectsV2Input) -> Option<ListObjectsV2Output> {
         let g = self.state.read().unwrap();
         list_objects_v2_from_index(g.get(inp.bucket.as_str()).map(|b| &b.keys), inp)
     }
 
-    /// Build a `HeadObject` response from this bucket's index; `None` when the key is
-    /// not indexed (see [`head_object_from_index`]).
-    fn head_from_index(&self, bucket: &str, key: &str) -> Option<HeadObjectOutput> {
+    /// What this bucket's index can say about a key's HEAD (see
+    /// [`head_object_from_index`]).
+    fn head_from_index(&self, bucket: &str, key: &str) -> IndexedHead {
         let g = self.state.read().unwrap();
         head_object_from_index(g.get(bucket).map(|b| &b.keys), key)
     }
-}
 
-#[async_trait]
-impl s3s::S3 for CachingProxy {
-    // LIST served from the index when the bucket is synced; else passthrough.
-    async fn list_objects_v2(
-        &self,
-        req: S3Request<ListObjectsV2Input>,
-    ) -> S3Result<S3Response<ListObjectsV2Output>> {
-        if self.is_synced(req.input.bucket.as_str())
-            && self.read_barrier(&req.headers).await == ReadRoute::Local
-        {
-            self.metrics.list_from_index();
-            let out = self.list_from_index(&req.input);
-            return Ok(S3Response::new(out));
-        }
-        self.metrics.list_passthrough();
-        self.inner.list_objects_v2(req).await
+    /// Whether an index miss may be answered as an authoritative 404. Single-node — no
+    /// write feed — always: the sole writer's index is the truth. With gossip, only once
+    /// the cluster view has held still long enough that no peer can be holding a write
+    /// this node has not seen (see [`WriteSync::settled`]); inside that window the
+    /// origin answers instead, which is slower and never wrong.
+    fn index_404_trustworthy(&self) -> bool {
+        self.sync.as_ref().is_none_or(|sync| sync.settled())
     }
 
-    // Writes: forward (write-through), then update the index from the result.
-    async fn put_object(
-        &self,
-        req: S3Request<PutObjectInput>,
-    ) -> S3Result<S3Response<PutObjectOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let size = req.input.content_length.unwrap_or(0);
-        let mut resp = self.inner.put_object(req).await?;
-        // The origin's ETag rides back on the response, so the index learns it here
-        // rather than paying a HEAD for what a later HEAD will want to report.
-        let etag = resp.output.e_tag.clone();
-        let token = self
-            .record_put(IndexedWrite::Put, &bucket, &key, size, etag)
-            .await;
-        self.obj_cache.invalidate(&(bucket, key)).await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
-    }
-
-    async fn delete_object(
-        &self,
-        req: S3Request<DeleteObjectInput>,
-    ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let mut resp = self.inner.delete_object(req).await?;
-        let token = self.record_del(&bucket, &key).await;
-        self.obj_cache.invalidate(&(bucket, key)).await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
-    }
-
-    async fn delete_objects(
-        &self,
-        req: S3Request<DeleteObjectsInput>,
-    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let bucket = req.input.bucket.clone();
-        let keys: Vec<String> = req
-            .input
-            .delete
-            .objects
-            .iter()
-            .map(|o| o.key.clone())
-            .collect();
-        let mut resp = self.inner.delete_objects(req).await?;
-        let mut token = None;
-        for k in keys {
-            // Keep the newest token: it covers the whole batch (one writer,
-            // ordered feed).
-            token = self.record_del(&bucket, &k).await.or(token);
-            self.obj_cache.invalidate(&(bucket.clone(), k)).await;
-        }
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
-    }
-
-    async fn complete_multipart_upload(
-        &self,
-        req: S3Request<CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let mut resp = self.inner.complete_multipart_upload(req).await?;
-        // Multipart is how the big objects arrive, and indexing them at a
-        // placeholder size poisoned the range-promotion decision (a "0-byte"
-        // entry promoted a multi-GB fetch). One HEAD learns the real size.
-        let (size, head_etag) = self.upstream_meta(&bucket, &key).await;
-        let etag = resp.output.e_tag.clone().or(head_etag);
-        let token = self
-            .record_put(
-                IndexedWrite::MultipartComplete,
-                &bucket,
-                &key,
-                size.unwrap_or(0),
-                etag,
-            )
-            .await;
-        self.obj_cache.invalidate(&(bucket, key)).await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
-    }
-
-    async fn copy_object(
-        &self,
-        req: S3Request<CopyObjectInput>,
-    ) -> S3Result<S3Response<CopyObjectOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let mut resp = self.inner.copy_object(req).await?;
-        let (size, head_etag) = self.upstream_meta(&bucket, &key).await;
-        let etag = resp
-            .output
-            .copy_object_result
-            .as_ref()
-            .and_then(|result| result.e_tag.clone())
-            .or(head_etag);
-        let token = self
-            .record_put(IndexedWrite::Copy, &bucket, &key, size.unwrap_or(0), etag)
-            .await;
-        self.obj_cache.invalidate(&(bucket, key)).await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
-    }
-
-    // GET: cacheable (no part/conditional) small objects are served from the tiered
-    // cache; a miss buffers the body and caches it. Ranged reads of cacheable-size
-    // objects are served by slicing the cached whole object, promoted on first touch.
-    // Oversized/unknown-size ranges and conditional requests stream straight through.
-    async fn get_object(
+    /// The GET decision tree, with the per-request `response-*` overrides already lifted
+    /// off `req`: every copy this serves or fills is of the object as the origin stores
+    /// it, so one client's formatting is never handed to the next and the caller puts
+    /// the overrides back on the way out.
+    async fn serve_get(
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         // Requests whose response the cache can't faithfully reproduce must go to the
-        // origin: a specific version, origin-computed checksums, or SSE-C (whose bytes
-        // must never be served without the caller's key).
+        // origin: a specific version, origin-computed checksums, SSE-C (whose bytes must
+        // never be served without the caller's key), or a bucket-owner guard, which is
+        // the origin's to evaluate and would be skipped by a locally-served answer.
         let origin_only = req.input.version_id.is_some()
             || req.input.checksum_mode.is_some()
-            || req.input.sse_customer_key.is_some();
+            || req.input.sse_customer_key.is_some()
+            || req.input.expected_bucket_owner.is_some();
         let unconditional = !origin_only
             && req.input.part_number.is_none()
             && req.input.if_match.is_none()
@@ -623,7 +717,8 @@ impl s3s::S3 for CachingProxy {
             {
                 return resp;
             }
-            // Big, not-yet-indexed, unverified-token, or a failed promote: stream through.
+            // Big, not-yet-indexed, unverified-token, a failed promote, or a range that
+            // starts past the end (whose 416 shape is the origin's): stream through.
             self.metrics.get_bypass();
             return self.inner.get_object(req).await;
         }
@@ -645,10 +740,14 @@ impl s3s::S3 for CachingProxy {
                 Some(bytes) => {
                     self.obj_cache
                         .insert(
-                            ckey,
+                            ckey.clone(),
                             Arc::new(CachedObject::from_get(&resp.output, bytes.clone())),
                         )
                         .await;
+                    // The whole of what a HEAD reports is in hand, so the index entry is
+                    // completed here too — a body fill is the cheapest place to turn a
+                    // skeletal entry faithful, and it costs the origin nothing extra.
+                    self.observe(&ckey.0, &ckey.1, &observed!(&resp.output));
                     self.metrics.get_miss();
                     resp.output.body =
                         Some(StreamingBlob::wrap(futures::stream::once(async move {
@@ -668,15 +767,9 @@ impl s3s::S3 for CachingProxy {
         Ok(resp)
     }
 
-    // HEAD served from the object cache when the body is already cached, and from the
-    // LIST index when it is not: on a synced bucket the index is authoritative for
-    // existence (the property LIST-from-index already rests on) and carries the size,
-    // mtime and ETag a HEAD reports — so a HEAD of an uncached object costs nothing,
-    // and a HEAD of an absent key is a local 404. Requests that need the origin pass
-    // through: a range or part, a specific version, checksums, SSE-C, and — as on the
-    // GET path — anything conditional, since the origin is the authority on whether a
-    // precondition holds. So does any bucket whose index has not finished warming.
-    async fn head_object(
+    /// The HEAD decision tree, with the `response-*` overrides already lifted off `req`
+    /// (see [`serve_get`](Self::serve_get)).
+    async fn serve_head(
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
@@ -685,27 +778,318 @@ impl s3s::S3 for CachingProxy {
             && req.input.version_id.is_none()
             && req.input.checksum_mode.is_none()
             && req.input.sse_customer_key.is_none()
+            && req.input.expected_bucket_owner.is_none()
             && req.input.if_match.is_none()
             && req.input.if_none_match.is_none()
             && req.input.if_modified_since.is_none()
             && req.input.if_unmodified_since.is_none();
+        let ckey = (req.input.bucket.clone(), req.input.key.clone());
         if cache_eligible && self.read_barrier(&req.headers).await == ReadRoute::Local {
-            let ckey = (req.input.bucket.clone(), req.input.key.clone());
             if let Some(obj) = self.obj_cache.get(&ckey).await {
                 self.metrics.head_hit();
                 return Ok(S3Response::new(obj.to_head()));
             }
             if self.is_synced(&ckey.0) {
-                let Some(out) = self.head_from_index(&ckey.0, &ckey.1) else {
-                    self.metrics.head_404();
-                    return Err(s3s::s3_error!(NoSuchKey, "the key does not exist"));
-                };
-                self.metrics.head_index();
-                return Ok(S3Response::new(out));
+                match self.head_from_index(&ckey.0, &ckey.1) {
+                    IndexedHead::Faithful(out) => {
+                        self.metrics.head_index();
+                        return Ok(S3Response::new(*out));
+                    }
+                    // A key the index does not hold does not exist — but only once no
+                    // peer can still be holding a write this node has not seen.
+                    IndexedHead::Absent if self.index_404_trustworthy() => {
+                        self.metrics.head_404();
+                        return Err(s3s::s3_error!(NoSuchKey, "the key does not exist"));
+                    }
+                    IndexedHead::Absent | IndexedHead::Incomplete => {}
+                }
             }
         }
         self.metrics.head_miss();
-        self.inner.head_object(req).await
+        let resp = self.inner.head_object(req).await?;
+        // This answer is exactly what the entry was missing, so fold it in: the key's
+        // next HEAD is local *and* identical to this one, which is the whole point of
+        // forwarding a skeletal entry's first. Only for a plain HEAD — a conditional or
+        // version-scoped answer describes something other than the current object.
+        if cache_eligible {
+            self.observe(&ckey.0, &ckey.1, &observed!(&resp.output));
+        }
+        Ok(resp)
+    }
+}
+
+#[async_trait]
+impl s3s::S3 for CachingProxy {
+    // LIST served from the index when the bucket is synced; else passthrough.
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        // Three things the index cannot answer without guessing at the origin's own
+        // wire format or authorisation, so they are forwarded verbatim:
+        //   * `encoding-type` — percent-encoding is per-origin (MinIO escapes a space
+        //     as `+` and leaves `/*-_.` alone; AWS and R2 differ in the margins), and a
+        //     client that decodes what it asked for corrupts every key we guessed at.
+        //   * `fetch-owner` — the Owner element is the origin's, and no write path
+        //     carries it.
+        //   * `x-amz-expected-bucket-owner` — a guard only the origin can evaluate; an
+        //     answer served locally would skip a check the origin would have failed.
+        let origin_only = req.input.encoding_type.is_some()
+            || req.input.fetch_owner.unwrap_or(false)
+            || req.input.expected_bucket_owner.is_some();
+        if !origin_only
+            && self.is_synced(req.input.bucket.as_str())
+            && self.read_barrier(&req.headers).await == ReadRoute::Local
+            && let Some(out) = self.list_from_index(&req.input)
+        {
+            self.metrics.list_from_index();
+            return Ok(S3Response::new(out));
+        }
+        self.metrics.list_passthrough();
+        self.inner.list_objects_v2(req).await
+    }
+
+    // Writes: forward (write-through), then update the index from the result.
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        // Everything a HEAD of this object will report, straight off the request that
+        // created it — no HEAD needed to learn what we were just told. Except the
+        // Content-Type: with none set the origin invents one, and an entry claiming to
+        // know it would answer HEADs the origin answers differently, so such an entry
+        // stays skeletal until a forwarded HEAD completes it.
+        let faithful = req.input.content_type.is_some();
+        let meta = ObjMeta {
+            cache_control: req.input.cache_control.clone(),
+            content_disposition: req.input.content_disposition.clone(),
+            content_encoding: req.input.content_encoding.clone(),
+            content_language: req.input.content_language.clone(),
+            // `x-amz-meta-*` names are HTTP header names, so the origin reports them
+            // lowercased whatever case they were sent in; capturing them verbatim would
+            // make a HEAD off this entry differ from the origin's in the key casing.
+            metadata: req.input.metadata.as_ref().map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+                    .collect()
+            }),
+        };
+        let mut entry = ObjEntry {
+            // A PUT with no Content-Length leaves the size unknown rather than zero: a
+            // fabricated `0` is served as an authoritative Content-Length forever.
+            size: req.input.content_length,
+            last_modified: SystemTime::UNIX_EPOCH, // stamped by `record_put`
+            etag: None,
+            storage_class: write_storage_class(req.input.storage_class.as_ref()),
+            content_type: req.input.content_type.clone(),
+            meta: faithful.then(|| Box::new(meta)),
+        };
+        let mut resp = self.inner.put_object(req).await?;
+        // Drop this node's own copy the instant the origin has the new bytes — before
+        // the cluster-ack round the index update pays for. Otherwise the writing node
+        // is the one node in the fleet still serving the old body.
+        self.obj_cache
+            .invalidate(&(bucket.clone(), key.clone()))
+            .await;
+        // The origin's ETag rides back on the response, so the index learns it here
+        // rather than paying a HEAD for what a later HEAD will want to report.
+        entry.etag = resp.output.e_tag.clone();
+        let token = self
+            .record_put(IndexedWrite::Put, &bucket, &key, entry)
+            .await;
+        Self::attach_token(&mut resp.headers, token);
+        Ok(resp)
+    }
+
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let versioned = req.input.version_id.is_some();
+        let mut resp = self.inner.delete_object(req).await?;
+        self.obj_cache
+            .invalidate(&(bucket.clone(), key.clone()))
+            .await;
+        // A version-scoped delete removes one version, not the key: the current object
+        // may be untouched, or may now be a different version entirely. Only the local
+        // body copy is provably stale — what the key resolves to stays the origin's to
+        // report, so no tombstone is recorded and the entry is left for a HEAD or the
+        // next sync to correct.
+        let token = if versioned {
+            None
+        } else {
+            let receipt = self.record_del(&bucket, &key).await;
+            self.await_cluster(receipt, &bucket, &key).await
+        };
+        Self::attach_token(&mut resp.headers, token);
+        Ok(resp)
+    }
+
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let bucket = req.input.bucket.clone();
+        let quiet = req.input.delete.quiet.unwrap_or(false);
+        let requested: Vec<(String, bool)> = req
+            .input
+            .delete
+            .objects
+            .iter()
+            .map(|o| (o.key.clone(), o.version_id.is_some()))
+            .collect();
+        let mut resp = self.inner.delete_objects(req).await?;
+        // `DeleteObjects` is partial-failure by contract: the call succeeds while
+        // individual keys are refused (a legal hold, a retention lock, a permission).
+        // Unindexing every *requested* key makes a key the origin still holds vanish
+        // cluster-wide — LIST loses it and HEAD 404s — until the next resync, so the
+        // applied set is read off the response. In quiet mode the origin omits the
+        // Deleted half, and what was asked for minus what was refused is the same set.
+        let refused: BTreeSet<&str> = resp
+            .output
+            .errors
+            .iter()
+            .flatten()
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        let deleted: BTreeSet<&str> = resp
+            .output
+            .deleted
+            .iter()
+            .flatten()
+            .filter_map(|d| d.key.as_deref())
+            .collect();
+        let mut receipt = None;
+        for (key, versioned) in &requested {
+            let applied = if quiet {
+                !refused.contains(key.as_str())
+            } else {
+                deleted.contains(key.as_str())
+            };
+            if !applied {
+                continue;
+            }
+            self.obj_cache
+                .invalidate(&(bucket.clone(), key.clone()))
+                .await;
+            if *versioned {
+                continue; // one version, not the key — see `delete_object`
+            }
+            // Keep the newest receipt: its token covers the whole batch (one writer,
+            // ordered feed), so the cluster round is paid once rather than per key —
+            // a 1000-key batch of 2s waits is half an hour of held response.
+            receipt = self.record_del(&bucket, key).await.or(receipt);
+        }
+        let token = self.await_cluster(receipt, &bucket, "<batch delete>").await;
+        Self::attach_token(&mut resp.headers, token);
+        Ok(resp)
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let mut resp = self.inner.complete_multipart_upload(req).await?;
+        self.obj_cache
+            .invalidate(&(bucket.clone(), key.clone()))
+            .await;
+        // Multipart is how the big objects arrive, and indexing them at a placeholder
+        // size poisoned the range-promotion decision (a "0-byte" entry promoted a
+        // multi-GB fetch). One HEAD learns the real size — and, since it is being paid
+        // for anyway, everything else a HEAD of the assembled object reports.
+        let observed = self.upstream_meta(&bucket, &key).await;
+        let mut entry = observed_entry(observed.as_ref());
+        entry.etag = resp.output.e_tag.clone().or(entry.etag);
+        let token = self
+            .record_put(IndexedWrite::MultipartComplete, &bucket, &key, entry)
+            .await;
+        Self::attach_token(&mut resp.headers, token);
+        Ok(resp)
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let mut resp = self.inner.copy_object(req).await?;
+        self.obj_cache
+            .invalidate(&(bucket.clone(), key.clone()))
+            .await;
+        // A copy's metadata is the source's (or the request's, per the directive) and
+        // its size is whatever the origin assembled, neither of which the response
+        // carries: one HEAD is what tells us what we just created.
+        let observed = self.upstream_meta(&bucket, &key).await;
+        let mut entry = observed_entry(observed.as_ref());
+        entry.etag = resp
+            .output
+            .copy_object_result
+            .as_ref()
+            .and_then(|result| result.e_tag.clone())
+            .or(entry.etag);
+        let token = self
+            .record_put(IndexedWrite::Copy, &bucket, &key, entry)
+            .await;
+        Self::attach_token(&mut resp.headers, token);
+        Ok(resp)
+    }
+
+    // GET: cacheable (no part/conditional) small objects are served from the tiered
+    // cache; a miss buffers the body and caches it. Ranged reads of cacheable-size
+    // objects are served by slicing the cached whole object, promoted on first touch.
+    // Oversized/unknown-size ranges and conditional requests stream straight through.
+    // The per-request `response-*` overrides are lifted off the request first and put
+    // back on the answer last, so they neither reach the cached copy nor go missing on
+    // a hit (see [`ResponseOverrides`]).
+    async fn get_object(
+        &self,
+        mut req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let overrides = take_overrides!(&mut req.input);
+        let mut resp = self.serve_get(req).await?;
+        apply_overrides!(&overrides, &mut resp.output);
+        Ok(resp)
+    }
+
+    // HEAD served from the object cache when the body is already cached, and from the
+    // LIST index when it is not: on a synced bucket the index is authoritative for
+    // existence (the property LIST-from-index already rests on) and a *faithful* entry
+    // carries everything a HEAD reports — so a HEAD of an uncached object costs nothing,
+    // and a HEAD of an absent key is a local 404. A skeletal entry (a bootstrap LIST
+    // row, a peer's feed event) is forwarded once and completed from the answer, so the
+    // next HEAD of that key is local and identical. Requests that need the origin pass
+    // through: a range or part, a specific version, checksums, SSE-C, a bucket-owner
+    // guard, and — as on the GET path — anything conditional, since the origin is the
+    // authority on whether a precondition holds. So does any bucket whose index has not
+    // finished warming.
+    async fn head_object(
+        &self,
+        mut req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let overrides = take_overrides!(&mut req.input);
+        let mut resp = self.serve_head(req).await?;
+        apply_overrides!(&overrides, &mut resp.output);
+        Ok(resp)
+    }
+
+    async fn delete_bucket(
+        &self,
+        req: S3Request<s3s::dto::DeleteBucketInput>,
+    ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
+        let bucket = req.input.bucket.clone();
+        let resp = self.inner.delete_bucket(req).await?;
+        // The bucket is gone; its index is not, and would go on answering LIST from a
+        // key set the origin no longer has — and HEADs of those keys as authoritative
+        // 404s of the wrong kind. Dropping the state returns the name to passthrough.
+        self.state.write().unwrap().remove(&bucket);
+        Ok(resp)
     }
 
     // Full S3 passthrough: every other op forwards to the upstream so any S3
@@ -741,12 +1125,6 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<s3s::dto::CreateSessionInput>,
     ) -> S3Result<S3Response<s3s::dto::CreateSessionOutput>> {
         self.inner.create_session(req).await
-    }
-    async fn delete_bucket(
-        &self,
-        req: S3Request<s3s::dto::DeleteBucketInput>,
-    ) -> S3Result<S3Response<s3s::dto::DeleteBucketOutput>> {
-        self.inner.delete_bucket(req).await
     }
     async fn delete_bucket_analytics_configuration(
         &self,

@@ -102,9 +102,15 @@ async fn ranged_reads_slice_the_cached_body_locally() {
     );
 }
 
-/// Issue #1: a HEAD of an object whose body was never fetched is answered from the LIST
-/// index — size, mtime and the origin's `ETag`, with the origin never asked — and a HEAD
-/// of a key absent from a synced bucket is an authoritative local 404.
+/// Issue #1: repeated HEADs of an object whose body was never fetched cost the origin
+/// nothing, and a HEAD of a key absent from a synced bucket is an authoritative local
+/// 404 that costs nothing either.
+///
+/// The bootstrap LIST that warmed the index proves the key exists and carries its size,
+/// mtime and `ETag`, but says nothing about its `Content-Type` or user metadata — so the
+/// *first* HEAD is forwarded rather than answered from a record that would differ from
+/// the origin's, and its answer completes the entry. Every HEAD after that is local. The
+/// pattern the issue was about — one key, HEAD after HEAD — costs exactly one.
 #[tokio::test]
 async fn head_is_answered_from_the_index_without_touching_the_origin() {
     let origin = Origin::start("e2e-head").await;
@@ -116,11 +122,26 @@ async fn head_is_answered_from_the_index_without_touching_the_origin() {
     let out = head(&proxy, bucket, "obj").await.expect("the key exists");
     assert_eq!(out.content_length, Some(12));
     assert_eq!(
-        out.e_tag.map(ETag::into_value),
-        origin.etag("obj").await,
-        "the index carries the origin's own ETag"
+        origin.ops.head(),
+        1,
+        "the first HEAD completed the bootstrap entry"
     );
-    assert!(out.last_modified.is_some(), "and its last-modified time");
+
+    for _ in 0..3 {
+        let out = head(&proxy, bucket, "obj").await.expect("the key exists");
+        assert_eq!(out.content_length, Some(12));
+        assert_eq!(
+            out.e_tag.map(ETag::into_value),
+            origin.etag("obj").await,
+            "the index carries the origin's own ETag"
+        );
+        assert!(out.last_modified.is_some(), "and its last-modified time");
+        assert!(
+            out.content_type.is_some(),
+            "the completed entry carries the Content-Type the bootstrap row did not"
+        );
+        assert_eq!(out.accept_ranges.as_deref(), Some("bytes"));
+    }
 
     let err = head(&proxy, bucket, "ghost")
         .await
@@ -130,8 +151,8 @@ async fn head_is_answered_from_the_index_without_touching_the_origin() {
 
     assert_eq!(
         origin.ops.head(),
-        0,
-        "neither answer cost the origin a HEAD — the whole point of the issue"
+        1,
+        "no HEAD after the first cost the origin anything — the point of the issue"
     );
 }
 
@@ -155,6 +176,7 @@ async fn a_write_through_lands_upstream_and_folds_into_the_index() {
     assert_eq!(origin.ops.put(), 1, "exactly one upstream write");
 
     assert_eq!(list(&proxy, bucket).await, ["fresh"]);
+    assert_eq!(origin.ops.list(), lists, "LIST came out of the index");
     let out = head(&proxy, bucket, "fresh").await.expect("indexed");
     assert_eq!(out.content_length, Some(15));
     assert_eq!(
@@ -162,7 +184,24 @@ async fn a_write_through_lands_upstream_and_folds_into_the_index() {
         origin.etag("fresh").await,
         "the write path captured the origin's ETag"
     );
-    assert_eq!((origin.ops.list(), origin.ops.head()), (lists, heads));
+    // This write set no Content-Type, so the origin picked one and the index entry does
+    // not know which: rather than answer a HEAD that differs from the origin's, the
+    // first HEAD is forwarded and completes the entry. A write that *does* carry a
+    // Content-Type is HEAD-able locally straight away — see `tests/differential.rs`.
+    assert_eq!(origin.ops.head(), heads + 1);
+    let heads = origin.ops.head();
+    assert_eq!(
+        head(&proxy, bucket, "fresh")
+            .await
+            .expect("indexed")
+            .content_length,
+        Some(15)
+    );
+    assert_eq!(
+        origin.ops.head(),
+        heads,
+        "and every HEAD after it is answered from the completed entry"
+    );
 
     // A write is not a fill: the body still comes from the origin, once.
     assert_eq!(get(&proxy, bucket, "fresh").await, "written through");
