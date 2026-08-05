@@ -23,6 +23,8 @@
 
 #![allow(dead_code)] // each test binary drives a different subset of the harness
 
+pub mod diff;
+
 use bytes::Bytes;
 use http::{Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -197,6 +199,39 @@ impl Origin {
         client_for(&self.counted_endpoint)
     }
 
+    /// The origin as a **plain `s3s` route** — the reference leg of a differential row.
+    ///
+    /// It is the same `s3s_aws::Proxy` translation the cache itself uses for passthrough,
+    /// so every artefact of that layer (DTO mapping, error conversion) cancels out and a
+    /// difference between the two legs can only come from a decision the cache made. It
+    /// rides the uncounted client, so the reference leg never moves the counters that
+    /// judge the proxy leg.
+    #[must_use]
+    pub fn direct_route(&self) -> s3s_aws::Proxy {
+        s3s_aws::Proxy::from(self.direct.clone())
+    }
+
+    /// Create another bucket in this origin — for tests that need a second keyspace
+    /// (a copy's destination, say) without a second container. `object_lock` also turns
+    /// on versioning, which is what lets a test make one key of a batch delete fail.
+    pub async fn make_bucket(&self, bucket: &str, object_lock: bool) {
+        self.direct
+            .create_bucket()
+            .bucket(bucket)
+            .set_object_lock_enabled_for_bucket(object_lock.then_some(true))
+            .send()
+            .await
+            .expect("create an extra test bucket");
+    }
+
+    /// The origin's own S3 client, uncounted — for the few assertions that need the raw
+    /// HTTP answer rather than the `s3s` view of it (an error's response headers, which
+    /// `s3s-aws` does not carry over).
+    #[must_use]
+    pub fn client(&self) -> aws_sdk_s3::Client {
+        self.direct.clone()
+    }
+
     /// Seed an object straight into the origin, so a test's fixtures never move the
     /// counters it is about to assert on.
     pub async fn seed(&self, key: &str, body: &[u8]) {
@@ -205,6 +240,32 @@ impl Origin {
             .bucket(&self.bucket)
             .key(key)
             .body(body.to_vec().into())
+            .send()
+            .await
+            .expect("seed the origin");
+    }
+
+    /// Seed an object carrying the response metadata a client would set on it — the
+    /// fields a bare [`Origin::seed`] leaves at the origin's defaults.
+    pub async fn seed_rich(
+        &self,
+        key: &str,
+        body: &[u8],
+        content_type: &str,
+        metadata: &[(&str, &str)],
+    ) {
+        self.direct
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(body.to_vec().into())
+            .content_type(content_type)
+            .set_metadata(Some(
+                metadata
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            ))
             .send()
             .await
             .expect("seed the origin");
@@ -408,7 +469,7 @@ fn free_udp_port() -> u16 {
 
 /// A request carrying nothing but its input — no signing, region or session state, the
 /// shape the S3 service hands the proxy for an ordinary request.
-fn request<T>(input: T) -> S3Request<T> {
+pub fn request<T>(input: T) -> S3Request<T> {
     S3Request {
         input,
         method: Method::GET,
@@ -422,7 +483,7 @@ fn request<T>(input: T) -> S3Request<T> {
     }
 }
 
-fn body_blob(bytes: Bytes) -> StreamingBlob {
+pub fn body_blob(bytes: Bytes) -> StreamingBlob {
     StreamingBlob::wrap(futures::stream::once(async move {
         Ok::<Bytes, std::io::Error>(bytes)
     }))
