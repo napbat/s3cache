@@ -35,7 +35,7 @@ use groupnet::transport::udp::UdpTransport;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::index::{BucketState, apply_del, apply_put};
+use crate::index::{BucketState, ObjEntry, apply_del, apply_put};
 use crate::metrics::Metrics;
 use crate::tier::LocalCache;
 
@@ -45,7 +45,7 @@ const FEED_CAPACITY: usize = 4096;
 
 /// How much coherence the cluster pays for.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Consistency {
+pub enum Consistency {
     /// Indistinguishable from a single S3 node with zero client
     /// cooperation: writes wait for every alive peer to apply their
     /// invalidation, and a node whose membership view is not fully alive
@@ -61,6 +61,30 @@ pub(crate) enum Consistency {
     /// uniformly: a bounded node never acks, so strong writers would wait
     /// out their ack timeout on every write (loud, not stale).
     Bounded,
+}
+
+impl Consistency {
+    /// Read the `S3CACHE_CONSISTENCY` spelling, defaulting (loudly, for anything
+    /// unrecognised) to the safe mode.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "strong" => Self::Strong,
+            "bounded" => Self::Bounded,
+            other => {
+                warn!("unknown S3CACHE_CONSISTENCY `{other}`; using strong");
+                Self::Strong
+            }
+        }
+    }
+
+    /// The mode's name, for logs.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Strong => "strong",
+            Self::Bounded => "bounded",
+        }
+    }
 }
 
 /// A published write: the raw token (for the cluster-wide ack wait) and its
@@ -308,7 +332,16 @@ impl WriteSync {
                         let ts = from_millis(event.ts_ms);
                         match event.op {
                             IndexOp::Put { size } => {
-                                apply_put(&state, &event.bucket, &event.key, size, ts);
+                                // No ETag on the wire: the feed's event format is the
+                                // cross-version contract between nodes, and existence +
+                                // size is what coherence needs. Peer-folded entries get
+                                // their ETag at the next origin sync (see `ObjEntry`).
+                                let entry = ObjEntry {
+                                    size,
+                                    last_modified: ts,
+                                    etag: None,
+                                };
+                                apply_put(&state, &event.bucket, &event.key, entry);
                             }
                             IndexOp::Del => {
                                 apply_del(&state, &event.bucket, &event.key, ts);
@@ -367,85 +400,120 @@ impl WriteSync {
     }
 }
 
+/// Everything the gossip layer needs, independent of where it came from.
+/// [`from_env`] fills it from `S3CACHE_GOSSIP_*`; anything driving two nodes in
+/// one process (tests) constructs it directly, since mutating the environment
+/// to configure a node is neither safe nor parallel-friendly in edition 2024.
+pub struct SyncConfig {
+    /// UDP address to bind the gossip transport to (`S3CACHE_GOSSIP_BIND`).
+    pub bind: String,
+    /// The address peers should reach this node on; the bound address when
+    /// `None` (`S3CACHE_GOSSIP_ADVERTISE`).
+    pub advertise: Option<String>,
+    /// Statically-addressed peers as `(node id, host:port)`. Every other peer
+    /// resolves itself through gossiped advertisements, so only seeds need
+    /// static addressing (`S3CACHE_GOSSIP_SEEDS`).
+    pub seeds: Vec<(String, String)>,
+    /// This node's identity in the cluster (the pod name, in the chart).
+    pub node_id: String,
+    /// How much coherence the cluster pays for (`S3CACHE_CONSISTENCY`).
+    pub consistency: Consistency,
+}
+
+impl WriteSync {
+    /// Bind the gossip transport, join the cluster group and attach the write
+    /// feed. `None` when the bind address is unusable — gossip is optional, and
+    /// a node that cannot join is a strict single node, not a dead one.
+    /// Start the apply loop with [`start_apply`](Self::start_apply) once the
+    /// local cache exists (the proxy does this in `start_coherence`).
+    pub async fn new(cfg: SyncConfig) -> Option<Self> {
+        let me = NodeId::new(cfg.node_id.as_str());
+        let transport = match UdpTransport::bind(me.clone(), cfg.bind.as_str()).await {
+            Ok(transport) => transport,
+            Err(error) => {
+                let bind = &cfg.bind;
+                warn!("gossip disabled: cannot bind `{bind}`: {error}");
+                return None;
+            }
+        };
+        let advertise = cfg
+            .advertise
+            .or_else(|| transport.local_addr().ok().map(|addr| addr.to_string()));
+        let mut builder = Node::builder(me.clone(), transport.clone());
+        if let Some(advertise) = advertise {
+            builder = builder.advertise_addr(advertise);
+        }
+        let node = builder.spawn();
+        let group = node.join_group("s3cache");
+        // Seeds resolve off the startup path (DNS for a just-starting peer may
+        // lag, and a slow resolver must not delay serving): each one registers
+        // with the transport and joins via `add_peer` once its address is known.
+        for (id, addr) in cfg.seeds {
+            if id == cfg.node_id {
+                continue; // a pod seeding itself (uniform config) is a no-op
+            }
+            let (transport, group) = (transport.clone(), group.clone());
+            tokio::spawn(async move {
+                let mut registered: Option<std::net::SocketAddr> = None;
+                loop {
+                    match resolve_seed(&addr).await {
+                        Some(sock) if registered != Some(sock) => {
+                            if registered.is_some() {
+                                info!("gossip seed `{id}` moved to {sock}; re-registering");
+                            }
+                            transport.register_peer(NodeId::new(id.as_str()), sock);
+                            group.add_peer(NodeId::new(id.as_str()));
+                            registered = Some(sock);
+                        }
+                        None if registered.is_none() => {
+                            warn!("gossip seed `{id}={addr}` not resolving yet; will keep trying");
+                        }
+                        Some(_) | None => {}
+                    }
+                    tokio::time::sleep(SEED_REFRESH).await;
+                }
+            });
+        }
+        let (bind, node_id, mode) = (&cfg.bind, &cfg.node_id, cfg.consistency.label());
+        info!("gossip coherence bound on `{bind}` as `{node_id}` (consistency: {mode})");
+        Some(WriteSync::attach(group, me, cfg.consistency, Some(node)))
+    }
+}
+
 /// Build the gossip node and write feed from `S3CACHE_GOSSIP_*`, or `None`
 /// when `S3CACHE_GOSSIP_BIND` is unset (single-node: the sole writer is
-/// already strict). Seeds are comma-separated `id=host:port` pairs; every
-/// other peer resolves itself through gossiped advertisements, so only seeds
-/// need static addressing.
+/// already strict). A thin read of the environment over [`WriteSync::new`].
 pub async fn from_env(node_name: &str) -> Option<WriteSync> {
-    let bind = std::env::var("S3CACHE_GOSSIP_BIND").ok()?;
-    let consistency = match std::env::var("S3CACHE_CONSISTENCY")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "" | "strong" => Consistency::Strong,
-        "bounded" => Consistency::Bounded,
-        other => {
-            warn!("unknown S3CACHE_CONSISTENCY `{other}`; using strong");
-            Consistency::Strong
-        }
+    let cfg = SyncConfig {
+        bind: env_var("S3CACHE_GOSSIP_BIND")?,
+        advertise: env_var("S3CACHE_GOSSIP_ADVERTISE"),
+        seeds: parse_seeds(&env_var("S3CACHE_GOSSIP_SEEDS").unwrap_or_default()),
+        node_id: node_name.to_owned(),
+        consistency: Consistency::parse(&env_var("S3CACHE_CONSISTENCY").unwrap_or_default()),
     };
-    let me = NodeId::new(node_name);
-    let transport = match UdpTransport::bind(me.clone(), bind.as_str()).await {
-        Ok(transport) => transport,
-        Err(error) => {
-            warn!("gossip disabled: cannot bind `{bind}`: {error}");
-            return None;
-        }
-    };
-    let advertise = std::env::var("S3CACHE_GOSSIP_ADVERTISE")
-        .ok()
-        .or_else(|| transport.local_addr().ok().map(|addr| addr.to_string()));
-    let mut builder = Node::builder(me.clone(), transport.clone());
-    if let Some(advertise) = advertise {
-        builder = builder.advertise_addr(advertise);
-    }
-    let node = builder.spawn();
-    let group = node.join_group("s3cache");
-    // Seeds resolve off the startup path (DNS for a just-starting peer may
-    // lag, and a slow resolver must not delay serving): each one registers
-    // with the transport and joins via `add_peer` once its address is known.
-    let seeds = std::env::var("S3CACHE_GOSSIP_SEEDS").unwrap_or_default();
-    for seed in seeds.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let Some((id, addr)) = seed.split_once('=') else {
-            warn!("ignoring malformed gossip seed `{seed}` (want id=host:port)");
-            continue;
-        };
-        if id == node_name {
-            continue; // a pod seeding itself (uniform config) is a no-op
-        }
-        let (id, addr) = (id.to_owned(), addr.to_owned());
-        let (transport, group) = (transport.clone(), group.clone());
-        tokio::spawn(async move {
-            let mut registered: Option<std::net::SocketAddr> = None;
-            loop {
-                match resolve_seed(&addr).await {
-                    Some(sock) if registered != Some(sock) => {
-                        if registered.is_some() {
-                            info!("gossip seed `{id}` moved to {sock}; re-registering");
-                        }
-                        transport.register_peer(NodeId::new(id.as_str()), sock);
-                        group.add_peer(NodeId::new(id.as_str()));
-                        registered = Some(sock);
-                    }
-                    None if registered.is_none() => {
-                        warn!("gossip seed `{id}={addr}` not resolving yet; will keep trying");
-                    }
-                    Some(_) | None => {}
-                }
-                tokio::time::sleep(SEED_REFRESH).await;
-            }
-        });
-    }
-    let mode = if consistency == Consistency::Strong {
-        "strong"
-    } else {
-        "bounded"
-    };
-    info!("gossip coherence bound on `{bind}` as `{node_name}` (consistency: {mode})");
-    Some(WriteSync::attach(group, me, consistency, Some(node)))
+    WriteSync::new(cfg).await
+}
+
+/// An environment variable, treating "set but empty" as unset — a Helm value
+/// that renders to `""` (an unset optional knob) must read as absent.
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
+/// Comma-separated `id=host:port` seeds; malformed entries are dropped loudly
+/// rather than taking gossip down.
+fn parse_seeds(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|seed| !seed.is_empty())
+        .filter_map(|seed| {
+            let Some((id, addr)) = seed.split_once('=') else {
+                warn!("ignoring malformed gossip seed `{seed}` (want id=host:port)");
+                return None;
+            };
+            Some((id.to_owned(), addr.to_owned()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -459,7 +527,9 @@ mod tests {
     use groupnet::transport::mem::{MemTransport, Network};
     use s3s::dto::GetObjectOutput;
 
-    use super::{Consistency, IndexEvent, IndexOp, WriteSync, decode_event, encode_event};
+    use super::{
+        Consistency, IndexEvent, IndexOp, WriteSync, decode_event, encode_event, parse_seeds,
+    };
     use crate::index::BucketState;
     use crate::metrics::Metrics;
     use crate::tier::{CachedObject, TieredCache};
@@ -515,6 +585,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting for: {what}");
+    }
+
+    /// The env spellings [`WriteSync::new`] is configured through: seeds split on the
+    /// first `=` (host:port may not contain one), blanks and malformed entries drop,
+    /// and an unknown consistency mode falls back to the safe one.
+    #[test]
+    fn env_spellings_parse_into_a_config() {
+        assert_eq!(
+            parse_seeds("a=host-a:1, b=host-b:2 ,,"),
+            [
+                ("a".to_owned(), "host-a:1".to_owned()),
+                ("b".to_owned(), "host-b:2".to_owned())
+            ]
+        );
+        assert!(parse_seeds("").is_empty());
+        assert!(parse_seeds("no-equals-sign").is_empty(), "malformed drops");
+        assert!(Consistency::parse("") == Consistency::Strong);
+        assert!(Consistency::parse(" Bounded ") == Consistency::Bounded);
+        assert!(
+            Consistency::parse("eventual") == Consistency::Strong,
+            "an unknown mode falls back to strong"
+        );
     }
 
     #[test]

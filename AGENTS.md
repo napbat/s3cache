@@ -52,19 +52,28 @@ scripts/
 Dockerfile
 ```
 
-Integration tests live in `tests/` and exercise the public library surface — most
-importantly the hot→warm rollover (objects evicted from the in-memory tier are still
-served from disk) and warm-tier restart survival.
+Integration tests live in `tests/` and exercise the public library surface:
+`tier_cache.rs` (hot→warm rollover and warm-tier restart survival), `e2e.rs` and
+`coherence.rs` (the whole proxy against a real MinIO origin, single- and dual-node),
+`metrics_endpoint.rs` (the Prometheus listener), with the shared origin/counter harness
+in `common/mod.rs`.
 
 ## Build, test, lint
 
 ```sh
 cargo build
-cargo test                          # unit + integration tests
+cargo test                          # unit + integration tests (needs a Docker daemon, see below)
 cargo clippy --all-targets          # clippy::pedantic is DENIED (Cargo.toml) — must be clean
+cargo fmt --check
 helm lint deploy/helm/s3cache       # after chart changes
 helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com   # render check
 ```
+
+`tests/e2e.rs` and `tests/coherence.rs` start **MinIO** through testcontainers (one
+container per test, torn down on drop), so `cargo test` needs a reachable Docker
+daemon. The proxy reaches MinIO through a transparent counting forwarder in
+`tests/common/mod.rs`, which is what lets a test assert that an answer cost the origin
+*nothing*. The image (`minio/minio:latest`) is pulled once.
 
 ## Conventions
 
@@ -91,6 +100,7 @@ helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com   
 | `S3CACHE_GOSSIP_BIND` / `_ADVERTISE` / `_SEEDS` | empty (disabled) | Gossip write feed for cross-node coherence |
 | `S3CACHE_CONSISTENCY` | `strong` | `strong` or `bounded` |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval |
+| `S3CACHE_METRICS_LISTEN` | empty (disabled) | Bind address for the Prometheus text endpoint (`GET /metrics`) |
 
 ## Helm chart knobs (deploy/helm/s3cache/values.yaml)
 
@@ -100,3 +110,5 @@ helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com   
   the warm disk tier that hot-tier evictions roll over into.
 - `replicaCount` — the one scaling knob; every pod is a gossip cluster member.
 - `upstream.endpoint` (required) / `upstream.buckets`.
+- `metrics.enabled` / `metrics.port` — the Prometheus text endpoint
+  (`S3CACHE_METRICS_LISTEN`) on a named `metrics` container port.
