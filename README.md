@@ -135,6 +135,12 @@ Requests the cache cannot reproduce faithfully — a specific `versionId`,
 
 ### Client cookbook: tokens and cross-node OCC
 
+Nothing in this section is required. In the default `strong` mode there is no client
+cooperation to opt into — every client is strict automatically, tokens are redundant.
+Tokens matter only if you switch to `bounded`, and even there an unaware client is
+fresh within ~one push hop and never *silently* stale; the token upgrades one client
+to read-its-own-writes strictness without paying strong's per-write ack round.
+
 **Getting / using the session token** (opt-in; standard SDKs work fine without it):
 
 ```python
