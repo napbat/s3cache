@@ -17,6 +17,13 @@ upstream:
   endpoint: ""            # e.g. https://<acct>.r2.cloudflarestorage.com  (required)
   buckets: ""             # comma-separated buckets to index eagerly
 
+# Hot (in-memory) tier — always on. `bytes` is the heap budget and the rollover point:
+# objects evicted from here are still served from the disk (warm) tier when enabled.
+# `maxObjectBytes` caps what gets cached at all; bigger objects stream straight through.
+memoryCache:
+  bytes: 268435456          # 256 MiB (S3CACHE_CACHE_BYTES)
+  maxObjectBytes: 8388608   # 8 MiB (S3CACHE_MAX_OBJECT_BYTES)
+
 # Object-body cache: hot (in-memory) is always on. An optional node-local disk (warm)
 # tier holds more and survives restarts (a fresh pod comes up warm). Mount a volume at
 # diskCache.path; a persistentVolumeClaim survives pod reschedules, emptyDir only restarts.

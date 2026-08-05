@@ -40,11 +40,19 @@ spec:
               value: {{ required "upstream.endpoint is required" .Values.upstream.endpoint | quote }}
             - name: S3CACHE_BUCKETS
               value: {{ .Values.upstream.buckets | quote }}
+            # Hot-tier sizing: the in-memory budget objects roll over from (into the
+            # warm disk tier when enabled) and the per-object cacheability cap.
+            # int64 before quote: Helm's YAML round-trip makes big numbers float64,
+            # which would render "2.68e+08" and fail the binary's integer parse.
+            - name: S3CACHE_CACHE_BYTES
+              value: {{ .Values.memoryCache.bytes | int64 | quote }}
+            - name: S3CACHE_MAX_OBJECT_BYTES
+              value: {{ .Values.memoryCache.maxObjectBytes | int64 | quote }}
             {{- if .Values.diskCache.enabled }}
             - name: S3CACHE_DISK_CACHE
               value: {{ .Values.diskCache.path | quote }}
             - name: S3CACHE_DISK_CACHE_BYTES
-              value: {{ .Values.diskCache.bytes | quote }}
+              value: {{ .Values.diskCache.bytes | int64 | quote }}
             {{- end }}
             # Pod name = gossip node id (HOSTNAME is set by the kubelet). Pod-0 is the
             # only static seed; the rest resolves via gossiped advertisements. The
