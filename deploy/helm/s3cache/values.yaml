@@ -31,6 +31,11 @@ diskCache:
   enabled: false
   path: /var/cache/s3cache
   bytes: 10737418240        # 10 GiB
+  # Prefer volumeClaimTemplate for anything that should survive a deploy: the
+  # StatefulSet's delete-then-recreate update deletes the pod (and any emptyDir)
+  # on every rollout, while a claim template gives each ordinal its own PVC that
+  # persists across deploys and reschedules. When set, it wins over `volume`.
+  volumeClaimTemplate: {}   # a PVC spec, e.g. {accessModes: [ReadWriteOnce], resources: {requests: {storage: 25Gi}}}
   volume:                   # any pod-volume spec backing diskCache.path
     emptyDir: {}
 

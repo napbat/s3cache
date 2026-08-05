@@ -118,8 +118,16 @@ spec:
             - name: disk-cache
               mountPath: {{ .Values.diskCache.path }}
           {{- end }}
-      {{- if .Values.diskCache.enabled }}
+      {{- if and .Values.diskCache.enabled (not .Values.diskCache.volumeClaimTemplate) }}
       volumes:
         - name: disk-cache
           {{- toYaml .Values.diskCache.volume | nindent 10 }}
       {{- end }}
+  {{- if and .Values.diskCache.enabled .Values.diskCache.volumeClaimTemplate }}
+  # Per-ordinal PVCs: the warm tier survives deploys (delete-then-recreate kills
+  # emptyDirs) and reschedules, and scaling replicas mints one claim per pod.
+  volumeClaimTemplates:
+    - metadata:
+        name: disk-cache
+      spec: {{- toYaml .Values.diskCache.volumeClaimTemplate | nindent 8 }}
+  {{- end }}
