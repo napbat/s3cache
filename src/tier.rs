@@ -27,12 +27,12 @@ use tierstore_moka::MokaTier;
 use crate::metrics::Metrics;
 
 /// `(bucket, key)` — the cache's addressing unit.
-pub(crate) type CacheKey = (String, String);
+pub type CacheKey = (String, String);
 
 /// A cached object body plus the response metadata needed to reconstruct a GET/HEAD.
 /// `Serialize`/`Deserialize` so the warm disk tier can round-trip it.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct CachedObject {
+pub struct CachedObject {
     body: Bytes,
     content_length: Option<i64>,
     content_type: Option<String>,
@@ -46,9 +46,33 @@ pub(crate) struct CachedObject {
     metadata: Option<Metadata>,
 }
 
+/// Replays the cached response fields into `$out`, defaulting the rest. `GetObjectOutput`
+/// and `HeadObjectOutput` spell these fields identically, so one list drives both: a
+/// cached HEAD reports exactly what a cached GET does, and neither can drift from the
+/// other as fields are added.
+macro_rules! replay_meta {
+    ($src:expr, $out:ident) => {{
+        let src = $src;
+        $out {
+            content_length: src.content_length,
+            content_type: src.content_type.clone(),
+            e_tag: src.e_tag.clone(),
+            last_modified: src.last_modified.clone(),
+            cache_control: src.cache_control.clone(),
+            content_encoding: src.content_encoding.clone(),
+            content_language: src.content_language.clone(),
+            content_disposition: src.content_disposition.clone(),
+            accept_ranges: src.accept_ranges.clone(),
+            metadata: src.metadata.clone(),
+            ..Default::default()
+        }
+    }};
+}
+
 impl CachedObject {
     /// Capture a GET response's metadata alongside its (already-buffered) body.
-    pub(crate) fn from_get(out: &GetObjectOutput, body: Bytes) -> Self {
+    #[must_use]
+    pub fn from_get(out: &GetObjectOutput, body: Bytes) -> Self {
         Self {
             body,
             content_length: out.content_length,
@@ -71,27 +95,25 @@ impl CachedObject {
         }))
     }
 
+    /// The cached response metadata as a body-less GET — the base every GET-shaped
+    /// response fills in.
+    fn meta_get(&self) -> GetObjectOutput {
+        replay_meta!(self, GetObjectOutput)
+    }
+
     /// Reconstruct a full-body GET response from the cached copy.
-    pub(crate) fn to_get(&self) -> GetObjectOutput {
+    #[must_use]
+    pub fn to_get(&self) -> GetObjectOutput {
         GetObjectOutput {
             body: Some(self.body_blob()),
-            content_length: self.content_length,
-            content_type: self.content_type.clone(),
-            e_tag: self.e_tag.clone(),
-            last_modified: self.last_modified.clone(),
-            cache_control: self.cache_control.clone(),
-            content_encoding: self.content_encoding.clone(),
-            content_language: self.content_language.clone(),
-            content_disposition: self.content_disposition.clone(),
-            accept_ranges: self.accept_ranges.clone(),
-            metadata: self.metadata.clone(),
-            ..Default::default()
+            ..self.meta_get()
         }
     }
 
     /// A 206-shaped GET for an inclusive byte range sliced out of the cached body
     /// (clamped at EOF). `None` when the range start is past the object.
-    pub(crate) fn to_get_range(&self, first: u64, last: Option<u64>) -> Option<GetObjectOutput> {
+    #[must_use]
+    pub fn to_get_range(&self, first: u64, last: Option<u64>) -> Option<GetObjectOutput> {
         let total = self.body.len() as u64;
         if first >= total {
             return None;
@@ -107,39 +129,19 @@ impl CachedObject {
             }))),
             content_length: Some(i64::try_from(len).unwrap_or(i64::MAX)),
             content_range: Some(format!("bytes {first}-{last_incl}/{total}")),
-            content_type: self.content_type.clone(),
-            e_tag: self.e_tag.clone(),
-            last_modified: self.last_modified.clone(),
-            cache_control: self.cache_control.clone(),
-            content_encoding: self.content_encoding.clone(),
-            content_language: self.content_language.clone(),
-            content_disposition: self.content_disposition.clone(),
-            accept_ranges: self.accept_ranges.clone(),
-            metadata: self.metadata.clone(),
-            ..Default::default()
+            ..self.meta_get()
         })
     }
 
     /// Reconstruct a HEAD response from the cached metadata.
-    pub(crate) fn to_head(&self) -> HeadObjectOutput {
-        HeadObjectOutput {
-            content_length: self.content_length,
-            content_type: self.content_type.clone(),
-            e_tag: self.e_tag.clone(),
-            last_modified: self.last_modified.clone(),
-            cache_control: self.cache_control.clone(),
-            content_encoding: self.content_encoding.clone(),
-            content_language: self.content_language.clone(),
-            content_disposition: self.content_disposition.clone(),
-            accept_ranges: self.accept_ranges.clone(),
-            metadata: self.metadata.clone(),
-            ..Default::default()
-        }
+    #[must_use]
+    pub fn to_head(&self) -> HeadObjectOutput {
+        replay_meta!(self, HeadObjectOutput)
     }
 }
 
 /// Drain a streamed body into memory, bailing (`None`) past `cap` bytes or on error.
-pub(crate) async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
+pub async fn buffer_body(blob: StreamingBlob, cap: usize) -> Option<Bytes> {
     let mut blob = std::pin::pin!(blob);
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = blob.next().await {
@@ -164,11 +166,11 @@ fn warm_key(bucket: &str, key: &str) -> String {
 /// The warm tier: typed objects over a byte-budgeted, restart-surviving mmap-disk store,
 /// with the blocking file I/O on a dedicated worker pool. The codec embeds the cache key
 /// in the encoding, so entries the disk tier evicts decode back fully typed.
-pub(crate) type WarmTier = OffloadTier<CodecTier<Arc<MmapDiskTier>, CacheKey, Arc<CachedObject>>>;
+pub type WarmTier = OffloadTier<CodecTier<Arc<MmapDiskTier>, CacheKey, Arc<CachedObject>>>;
 
 /// A warm tier plus a maintenance handle to its underlying disk store (for
 /// [`LocalCache::flush`] — the tier stack has no whole-cache clear).
-pub(crate) type WarmPair = (WarmTier, Arc<MmapDiskTier>);
+pub type WarmPair = (WarmTier, Arc<MmapDiskTier>);
 
 /// Worker threads for the warm tier's blocking file I/O.
 const WARM_IO_THREADS: usize = 4;
@@ -177,11 +179,11 @@ const WARM_IO_THREADS: usize = 4;
 /// files already present are re-indexed so the cache survives restarts. Objects whose
 /// encoding exceeds `max_obj_bytes` are rejected by the codec — under the cache's
 /// best-effort write policy that skips the disk fill without failing the hot one.
-pub(crate) fn open_warm(
-    dir: PathBuf,
-    disk_bytes: u64,
-    max_obj_bytes: usize,
-) -> anyhow::Result<WarmPair> {
+///
+/// # Errors
+///
+/// The I/O error from creating or re-indexing `dir`.
+pub fn open_warm(dir: PathBuf, disk_bytes: u64, max_obj_bytes: usize) -> anyhow::Result<WarmPair> {
     let budget = NonZeroU64::new(disk_bytes.max(1)).unwrap_or(NonZeroU64::MIN);
     let disk = Arc::new(MmapDiskTier::open_bounded(dir, budget)?);
     let codec = CodecTier::new(
@@ -274,7 +276,7 @@ impl Core {
 }
 
 /// The layered object-body cache handle held by the proxy.
-pub(crate) struct TieredCache {
+pub struct TieredCache {
     core: Arc<Core>,
 }
 
@@ -283,7 +285,7 @@ impl TieredCache {
     /// optional warm disk tier. Fill singleflight is handled here (probe-then-gate), so
     /// the tierstore-level gate is disabled.
     #[must_use]
-    pub(crate) fn new(cache_bytes: u64, warm: Option<WarmPair>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(cache_bytes: u64, warm: Option<WarmPair>, metrics: Arc<Metrics>) -> Self {
         let hot = Arc::new(MokaTier::bounded_weighted(
             cache_bytes,
             |_key: &CacheKey, obj: &Arc<CachedObject>| {
@@ -317,24 +319,24 @@ impl TieredCache {
 
     /// A handle the commit-log consumer uses to invalidate this node's local copies.
     #[must_use]
-    pub(crate) fn local(&self) -> LocalCache {
+    pub fn local(&self) -> LocalCache {
         LocalCache {
             core: Arc::clone(&self.core),
         }
     }
 
     /// Look up a whole cached object: hot, then warm disk (a disk hit promotes to hot).
-    pub(crate) async fn get(&self, key: &CacheKey) -> Option<Arc<CachedObject>> {
+    pub async fn get(&self, key: &CacheKey) -> Option<Arc<CachedObject>> {
         self.core.lookup(key).await
     }
 
     /// Store into hot and (inclusively) the warm disk tier, best-effort.
-    pub(crate) async fn insert(&self, key: CacheKey, obj: Arc<CachedObject>) {
+    pub async fn insert(&self, key: CacheKey, obj: Arc<CachedObject>) {
         self.core.insert(key, obj).await;
     }
 
     /// Drop an object from every local tier.
-    pub(crate) async fn invalidate(&self, key: &CacheKey) {
+    pub async fn invalidate(&self, key: &CacheKey) {
         self.core.invalidate(key).await;
     }
 
@@ -344,7 +346,11 @@ impl TieredCache {
     /// singleflight: hot hits never touch the gate; concurrent misses for one key share a
     /// single origin round-trip (followers re-probe under the gate and reuse the leader's
     /// fill). Errors are not cached.
-    pub(crate) async fn get_or_fetch<Fut>(
+    ///
+    /// # Errors
+    ///
+    /// Exactly `origin`'s error, when the object was not cached and the fetch failed.
+    pub async fn get_or_fetch<Fut>(
         &self,
         key: &CacheKey,
         origin: Fut,
@@ -372,19 +378,19 @@ impl TieredCache {
 /// A cloneable handle to this node's local tiers for the commit-log consumer to
 /// invalidate on a peer's write.
 #[derive(Clone)]
-pub(crate) struct LocalCache {
+pub struct LocalCache {
     core: Arc<Core>,
 }
 
 impl LocalCache {
     /// Drop a key from every node-local tier so a peer's overwrite is never read stale.
-    pub(crate) async fn invalidate(&self, key: &CacheKey) {
+    pub async fn invalidate(&self, key: &CacheKey) {
         self.core.invalidate(key).await;
     }
 
     /// Drop every node-local copy (see [`Core::flush`]) — used when peers'
     /// writes were provably missed and the stale subset is unknowable.
-    pub(crate) async fn flush(&self) {
+    pub async fn flush(&self) {
         self.core.flush().await;
     }
 }

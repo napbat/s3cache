@@ -156,7 +156,7 @@ fn decode_event(bytes: &[u8]) -> Option<IndexEvent> {
 }
 
 /// The publishing half of the write feed, plus the barrier view.
-pub(crate) struct WriteSync {
+pub struct WriteSync {
     feed: WriteFeed<IndexEvent>,
     group: Group,
     me: NodeId,
@@ -372,7 +372,7 @@ impl WriteSync {
 /// already strict). Seeds are comma-separated `id=host:port` pairs; every
 /// other peer resolves itself through gossiped advertisements, so only seeds
 /// need static addressing.
-pub(crate) async fn from_env(node_name: &str) -> Option<WriteSync> {
+pub async fn from_env(node_name: &str) -> Option<WriteSync> {
     let bind = std::env::var("S3CACHE_GOSSIP_BIND").ok()?;
     let consistency = match std::env::var("S3CACHE_CONSISTENCY")
         .unwrap_or_default()
