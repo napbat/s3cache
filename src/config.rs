@@ -5,12 +5,12 @@
 //! fall back to their defaults rather than refusing to start: a typo must not take the
 //! proxy down, and the value it lands on is the documented one. The gossip knobs are
 //! read separately, where the transport that needs them is built (see
-//! [`crate::sync::from_env`]).
+//! [`crate::sync::config::from_env`]).
 
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::cache::CacheConfig;
+use crate::cache::proxy::CacheConfig;
 
 /// Bind address for the S3 API when `S3CACHE_LISTEN` is unset.
 const DEFAULT_LISTEN: &str = "0.0.0.0:8014";

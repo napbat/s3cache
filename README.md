@@ -7,24 +7,6 @@ while cutting request costs for chatty clients.
 It is a *service that speaks S3* — not a client library. Set the client's S3
 endpoint to this proxy; no client code changes.
 
-> ## ⚠️ DO NOT SHIP THIS TREE — it does not build anywhere but one workstation
->
-> `Cargo.toml` carries a `[patch."https://github.com/napbat/groupnet"]` section pointing
-> at a **local** `../groupnet` checkout. The lease tier this branch is built on
-> (`consistency-leases`, groupnet milestones M0–M6) is not pushed to GitHub yet, so
-> **every non-local build is structurally broken**: CI, the Dockerfile image build, and
-> anyone cloning this repo resolve `../groupnet` and find nothing.
->
-> Release order, no steps skipped:
->
-> 1. push groupnet `main` to `github.com/napbat/groupnet`;
-> 2. delete the `[patch]` section from `Cargo.toml`;
-> 3. `cargo update -p groupnet`;
-> 4. run the whole gate — `cargo build`, `cargo test`, `cargo clippy --all-targets`,
->    `cargo fmt --check`, `helm lint`, `helm template`.
->
-> Until step 2 lands, treat this branch as unmergeable and unreleasable.
-
 ## What it does
 
 - **LIST and HEAD from an in-memory key index.** Because every request funnels through
@@ -283,22 +265,23 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
 
 ### Testing coherence and parity
 
-- **Unit / protocol tests** (`cargo test`): fully in-process — real groupnet nodes over
-  an in-memory transport, no external services. They cover peer-write index folding +
-  hot invalidation, out-of-order LWW convergence (tombstones, delete-wins-ties,
-  no-resurrection), the freshness barrier, the gap path, and the staged lapse recovery —
-  what it retains, and every way it falls back.
-- **Integration tests** (`cargo test`, needs a Docker daemon): `tests/e2e.rs` and
-  `tests/coherence.rs` run the real `CachingProxy` against a **real MinIO origin**
-  (testcontainers) reached through a transparent request counter, so every claim is
-  asserted twice — what the client saw, and what the origin was asked for. LIST/HEAD
-  from the index cost the origin nothing; a GET misses once; over-cap objects bypass;
-  ranges slice the cached body; conditional writes (`If-None-Match: *`, `If-Match`)
-  keep the origin's 412 semantics and leave the index and cache consistent with the
-  outcome. `tests/coherence.rs` does the same with two nodes gossiping over loopback
-  UDP: a write on A is in B's index by the time it returns, an overwrite on A drops B's
-  cached body, a delete on A makes B's HEAD a local 404, and a contested
-  create-if-absent is arbitrated by the origin.
+- **Unit / protocol tests** (included in
+  `cargo test --locked --workspace --all-features`): the unit cases are fully
+  in-process — real groupnet nodes over an in-memory transport, no external services.
+  They cover peer-write index folding + hot invalidation, out-of-order LWW convergence
+  (tombstones, delete-wins-ties, no-resurrection), the freshness barrier, the gap path,
+  and the staged lapse recovery — what it retains, and every way it falls back.
+- **Integration tests** (`cargo test --locked --workspace --all-features`, needs a
+  Docker daemon): `tests/e2e.rs` and `tests/coherence.rs` run the real `CachingProxy`
+  against a **real MinIO origin** (testcontainers) reached through a transparent
+  request counter, so every claim is asserted twice — what the client saw, and what the
+  origin was asked for. LIST/HEAD from the index cost the origin nothing; a GET misses
+  once; over-cap objects bypass; ranges slice the cached body; conditional writes
+  (`If-None-Match: *`, `If-Match`) keep the origin's 412 semantics and leave the index
+  and cache consistent with the outcome. `tests/coherence.rs` does the same with two
+  nodes gossiping over loopback UDP: a write on A is in B's index by the time it
+  returns, an overwrite on A drops B's cached body, a delete on A makes B's HEAD a
+  local 404, and a contested create-if-absent is arbitrated by the origin.
 - **Differential tests** (`tests/differential.rs`, same Docker origin): every row asks
   one question twice — once through the proxy, once straight at MinIO — and asserts a
   client could not tell which answered, over the status, the body and the headers it
@@ -321,6 +304,39 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
     down, a node's PUT/GET/LIST stay correct and fast (the barrier never waits on a dead
     peer), and coherence resumes both ways after the peer restarts — including the
     fresh-epoch gap path (distrust + origin resync), exercised end to end.
+
+## Development and release checks
+
+Dependencies are pinned by the committed `Cargo.lock`. Run the locked core gate after
+Rust or dependency changes and before a release:
+
+```sh
+cargo metadata --locked --no-deps --format-version 1
+cargo fmt --all --check
+cargo build --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-features
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
+```
+
+The integration tests start MinIO through testcontainers and require a reachable Docker
+daemon. After Helm chart changes, lint and render with the required upstream value:
+
+```sh
+helm lint deploy/helm/s3cache --set upstream.endpoint=https://example.com
+helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com
+```
+
+After dependency, Dockerfile/`.dockerignore`, or release changes, build the same
+container locally:
+
+```sh
+docker build --tag s3cache:check .
+```
+
+The `.dockerignore` allowlist limits application build inputs to `Cargo.toml`,
+`Cargo.lock`, and `src/`. Add any new required input to that allowlist deliberately.
+Unrelated documentation-only edits do not require a container build.
 
 ## Config (env)
 

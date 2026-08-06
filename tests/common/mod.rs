@@ -32,9 +32,10 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use s3cache::cache::{CacheConfig, CachingProxy};
+use s3cache::cache::proxy::{CacheConfig, CachingProxy};
 use s3cache::metrics::Metrics;
-use s3cache::sync::{Consistency, SyncConfig, WriteSync};
+use s3cache::sync::coherence::{Consistency, DEFAULT_LEASE_MS, WriteSync};
+use s3cache::sync::config::SyncConfig;
 use s3cache::tier::{buffer_body, open_warm};
 use s3s::dto::{
     DeleteObjectInput, ETag, ETagCondition, GetObjectInput, GetObjectOutput, HeadObjectInput,
@@ -540,7 +541,7 @@ fn sync_config(id: &str, port: u16, peers: &[(&str, u16)]) -> SyncConfig {
             .collect(),
         node_id: id.to_owned(),
         consistency: Consistency::Strong,
-        lease_ms: s3cache::sync::DEFAULT_LEASE_MS,
+        lease_ms: DEFAULT_LEASE_MS,
     }
 }
 

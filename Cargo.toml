@@ -1,65 +1,89 @@
-[package]
-name = "s3cache"
+[workspace]
+members = ["."]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 description = "Transparent S3 caching proxy — serves LIST and HEAD from an in-memory key index and GET from a tiered hot (heap) / warm (disk) / cold (origin) object cache, write-through (fill-on-write) to an upstream S3. Cuts S3 request costs for chatty clients."
 license = "MIT"
 
-[dependencies]
-s3s = "0.14.0"
-s3s-aws = "0.14.0"
+[workspace.dependencies]
+anyhow = "1"
 async-trait = "0.1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
 aws-credential-types = "1"
-tokio = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
+aws-sdk-s3 = "1"
+bincode = "1"
+blake3 = "1.8.5"
+bytes = { version = "1", features = ["serde"] }
+futures = "0.3"
+groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency-leases", "udp"] }
+http = "1"
+http-body-util = "0.1"
 # Already under hyper-util/s3s; direct so the metrics endpoint can build its own responses.
 hyper = { version = "1", features = ["server", "http1"] }
-http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
+rlimit = "0.10"
+s3s = "0.14.0"
+s3s-aws = "0.14.0"
+serde = { version = "1.0.228", features = ["derive"] }
+# A real S3 origin (MinIO) for the end-to-end tests — conditional writes, ETags and
+# error codes are the upstream's semantics, so the tests put the real thing behind us.
+testcontainers = { version = "0.27.3", features = ["http_wait"] }
 tierstore = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-mmap = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-moka = { git = "https://github.com/napbat/tierstore", branch = "main" }
-groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency-leases", "udp"] }
-bytes = { version = "1", features = ["serde"] }
-http = "1"
-futures = "0.3"
+tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rlimit = "0.10"
-anyhow = "1"
-serde = { version = "1.0.228", features = ["derive"] }
-bincode = "1"
-blake3 = "1.8.5"
 
-# ############################################################################
-# TEMPORARY — DO NOT MERGE PAST THE GROUPNET PUSH. DO NOT SHIP.
-#
-# The APIs this crate now builds against (capability advertisement,
-# `applied_by_selected`, `Config::detection_window_ms`, the lease tier) live on
-# local groupnet main (651bdeb, milestones M0–M6) and are NOT yet pushed to
-# github. While this section exists, EVERY non-local build is structurally
-# broken: CI, the Dockerfile image build, and anyone cloning this repo all
-# resolve `../groupnet` and find nothing. Only this workstation builds.
-#
-# Release steps, in this order:
-#   1. push groupnet main to github.com/napbat/groupnet
-#   2. delete this `[patch]` section
-#   3. cargo update -p groupnet
-#   4. run the full gate (build, test, clippy --all-targets, fmt --check)
-# ############################################################################
-[patch."https://github.com/napbat/groupnet"]
-groupnet = { path = "../groupnet/crates/groupnet" }
+[workspace.lints.rust]
+unused_imports = "deny"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
+
+[package]
+name = "s3cache"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-s3.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+futures.workspace = true
+groupnet.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rlimit.workspace = true
+s3s.workspace = true
+s3s-aws.workspace = true
+serde.workspace = true
+tierstore.workspace = true
+tierstore-mmap.workspace = true
+tierstore-moka.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [profile.release]
 opt-level = 2
 
 [dev-dependencies]
-# A real S3 origin (MinIO) for the end-to-end tests — conditional writes, ETags and
-# error codes are the upstream's semantics, so the tests put the real thing behind us.
-testcontainers = { version = "0.27.3", features = ["http_wait"] }
+testcontainers.workspace = true
 # The tests' counting forwarder needs hyper's client half; the binary only ever serves.
-hyper = { version = "1", features = ["client"] }
+hyper = { workspace = true, features = ["client"] }

@@ -2,7 +2,7 @@
 //! coherence claims checked as a client would experience them.
 //!
 //! Both nodes run the production wiring — their own index, their own body cache, a
-//! [`WriteSync`](s3cache::sync::WriteSync) over loopback UDP seeded with the other, in
+//! [`WriteSync`](s3cache::sync::coherence::WriteSync) over loopback UDP seeded with the other, in
 //! strong mode — and every request that reaches the origin is counted, so "node B knew
 //! without asking" is a fact rather than a hope.
 
@@ -14,7 +14,7 @@ use common::{
     Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, gossip_pair, head, list,
     list_entry, proxy_over, put, put_conditional, put_typed, wait_for_index, warm_proxy_over,
 };
-use s3cache::cache::CachingProxy;
+use s3cache::cache::proxy::CachingProxy;
 use s3cache::metrics::Metrics;
 use s3s::S3ErrorCode;
 use s3s::dto::{ETag, ETagCondition};

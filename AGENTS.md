@@ -10,15 +10,6 @@ serves GET/HEAD from a tiered object-body cache: **hot** (in-memory heap) → **
 (node-local disk, optional) → **cold** (the S3 origin). Writes go through to the
 upstream. Cross-node coherence rides a gossip write feed (`groupnet`).
 
-## ⚠️ DO NOT SHIP THIS TREE — it builds on exactly one workstation
-
-`Cargo.toml` carries a `[patch."https://github.com/napbat/groupnet"]` pointing at a
-**local** `../groupnet` checkout, because the coherence-lease tier this branch is built
-on (`consistency-leases`) is not pushed to GitHub yet. CI, the Dockerfile image build,
-and any fresh clone all resolve `../groupnet`, find nothing, and fail. Release order:
-push groupnet `main`, delete the `[patch]` section, `cargo update -p groupnet`, then run
-the whole gate below. Do not merge, tag, or build an image before that.
-
 ## Agent workflow: Fable orchestrator, Opus 5 implementer
 
 Work in this repo uses a two-tier agent setup:
@@ -37,28 +28,41 @@ Rules of engagement:
 - Give the implementer the **whole task spec in one brief** — files to touch, the
   crate/chart conventions below, and the verification commands. Don't drip-feed.
 - The implementer reports facts (test output, clippy status), not intentions.
-- The orchestrator verifies independently (`cargo test`, `helm template`) before
-  declaring work done.
+- The orchestrator independently runs the applicable locked core, chart, and
+  container gates below before declaring work done.
 
 ## Project layout
 
 Follows the standard [Cargo project layout](https://doc.rust-lang.org/cargo/guide/project-layout.html):
 
 ```
-Cargo.toml
+Cargo.toml      # workspace manifest: shared package metadata, dependencies, and lints
+Cargo.lock      # committed; dependency-resolving Cargo gates use --locked
 src/
-  lib.rs        # library crate: public modules (cache, config, index, metrics, sync, tier)
+  lib.rs        # crate link point: module docs and declarations only
   main.rs       # thin binary: wires Config::from_env() into the lib, runs the server
-  config.rs     # all S3CACHE_* env parsing (pure, unit-tested seams)
-  cache.rs      # the S3 proxy: LIST-from-index + tiered body cache + write-through
+  config.rs     # S3 API/cache/metrics env parsing (pure, unit-tested seams)
+  cache/
+    mod.rs      # cache link point: module docs and declarations only
+    proxy.rs    # cache types and core tier/index helpers
+    service.rs  # the S3 service implementation and write-through paths
+    tests.rs    # cache unit tests
   index.rs      # in-memory LIST key index
   tier.rs       # hot (moka heap) / warm (mmap disk) tiered object-body cache
-  sync.rs       # cross-node coherence: gossip write feed (groupnet)
+  sync/
+    mod.rs       # sync link point: module docs and declarations only
+    coherence.rs # gossip write-feed and coherence core
+    config.rs    # gossip env/config parsing and node construction
+    recovery.rs  # staged lease-lapse recovery and its correctness argument
+    wire.rs      # write-event and session-token codec
+    tests.rs     # coherence unit tests
   metrics.rs    # counters + periodic stats logging
 tests/          # integration tests (link against the library crate)
 deploy/helm/s3cache/   # Helm chart
 scripts/
 Dockerfile
+.dockerignore   # image context allowlist: manifests, lockfile, and src only
+.github/workflows/build.yml   # locked Rust/docs/chart gate, image push, Fleet bump
 ```
 
 Integration tests live in `tests/` and exercise the public library surface:
@@ -70,28 +74,65 @@ locally), `metrics_endpoint.rs` (the Prometheus listener), with the shared
 origin/counter harness in `common/mod.rs` and the differential comparator in
 `common/diff.rs`.
 
-## Build, test, lint
+## Repository and module invariants
+
+- `src/lib.rs`, `src/cache/mod.rs`, and `src/sync/mod.rs` are link points: keep only
+  module documentation and declarations there, never substantive implementation.
+- Link modules do not provide facade re-exports. Public code names the owning modules
+  directly: `cache::proxy`, `sync::coherence`, and `sync::config`.
+- Extracted modules declare explicit `crate::...` dependencies rather than collecting
+  `use super::...` import bags. Keep production files near the current roughly
+  1,000-line scale and split them by responsibility before they become monoliths.
+- Declare every direct package dependency once in `[workspace.dependencies]`; package
+  dependency tables use `workspace = true`, and package metadata and lints are
+  workspace-inherited. Commit `Cargo.lock`, and use `--locked` in every build gate.
+- `groupnet` comes from its GitHub `main` branch and is pinned to the resolved revision
+  by `Cargo.lock`. Local `[patch]` or path overrides are forbidden in shippable changes.
+  A deliberate `cargo update -p groupnet` must be followed by the full locked gate and
+  a review that every groupnet lock entry has the intended Git source and revision.
+- `.dockerignore` is an allowlist. Any new Docker build input must be added there
+  deliberately.
+
+## Verification gates
+
+Run the core locked gate after Rust or dependency changes and before a release:
 
 ```sh
-cargo build
-cargo test                          # unit + integration tests (needs a Docker daemon, see below)
-cargo clippy --all-targets          # clippy::pedantic is DENIED (Cargo.toml) — must be clean
-cargo fmt --check
-helm lint deploy/helm/s3cache       # after chart changes
-helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com   # render check
+cargo metadata --locked --no-deps --format-version 1
+cargo fmt --all --check
+cargo build --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --all-features
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
+```
+
+After chart changes, run both chart checks with the required example upstream:
+
+```sh
+helm lint deploy/helm/s3cache --set upstream.endpoint=https://example.com
+helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com
+```
+
+After dependency, Dockerfile/`.dockerignore`, or release changes, verify the container:
+
+```sh
+docker build --tag s3cache:check .
 ```
 
 `tests/e2e.rs` and `tests/coherence.rs` start **MinIO** through testcontainers (one
-container per test, torn down on drop), so `cargo test` needs a reachable Docker
-daemon. The proxy reaches MinIO through a transparent counting forwarder in
-`tests/common/mod.rs`, which is what lets a test assert that an answer cost the origin
-*nothing*. The image (`minio/minio:latest`) is pulled once.
+container per test, torn down on drop), so the locked workspace test command needs a
+reachable Docker daemon. The proxy reaches MinIO through a transparent counting
+forwarder in `tests/common/mod.rs`, which is what lets a test assert that an answer cost
+the origin *nothing*. The image (`minio/minio:latest`) is pulled once. Chart and
+container checks are conditional on the changes above; an unrelated documentation-only
+edit does not require an image build.
 
 ## Conventions
 
 - **Line endings: LF everywhere**, enforced by `.gitattributes`. Never commit CRLF.
-- Rust edition 2024; `clippy::pedantic` at deny level — public items need `# Errors` /
-  `# Panics` doc sections where applicable.
+- Rust edition 2024; `clippy::pedantic` and Rust's `unused_imports` are denied
+  workspace-wide — public items need `# Errors` / `# Panics` doc sections where
+  applicable.
 - Comments state constraints the code can't show; match the existing density and voice.
 - The chart's env-var names are the contract with `src/main.rs` (`S3CACHE_*`). Change
   them in both places or not at all.
@@ -151,16 +192,19 @@ do not restate them loosely, and do not add a mode without answering
 
 Losing the read-side licence is a **latch**, so every way of losing it needs a way back,
 and the two ways are deliberately priced differently. A write-feed gap is proof that
-specific events were missed: the apply loop's `sync::remediate` stands the licence down,
+specific events were missed: the apply loop's `sync::recovery::remediate` stands the
+licence down,
 **distrusts** every cached body (the trust generation moves; nothing is dropped) and
 re-LISTs the index, so each copy proves itself against that index on its next read or is
-evicted then. A lapse with no gap behind it is *not* that proof, so `sync::watch_lapses`
+evicted then. A lapse with no gap behind it is *not* that proof, so
+`sync::recovery::watch_lapses`
 (strong only) runs a staged recovery on the same `ResyncGate` generation — every granter
 re-grants (per granter, *not* off the roster-wide min), settle, no-peer-vanished, barrier
-on every advertised feed head, no-peer-vanished again — and keeps the cache whole when the
-barrier proves it (`lapse_barrier_retains`), falling back to `remediate` whenever a stage
-cannot get its proof (`lapse_barrier_fallbacks` / `lease_lapse_resyncs`).
+on every advertised feed head, no-peer-vanished again — and keeps the cache whole when
+the barrier proves it (`lapse_barrier_retains`), falling back to `remediate` whenever a
+stage cannot get its proof (`lapse_barrier_fallbacks` / `lease_lapse_resyncs`).
 `LocalCache::flush` survives only as an escape hatch; no remediation path calls it. The
-correctness argument for the barrier is in `src/sync.rs`'s module docs — it has two
-checked hinges and one named residual; read it before touching the stages. A planned stop calls `WriteSync::leave` from the binary's signal
-path so peers do not wait out a lease of a pod that is leaving on purpose.
+correctness argument for the barrier is in `src/sync/recovery.rs`'s module docs — it has
+two checked hinges and one named residual; read it before touching the stages. A planned
+stop calls `WriteSync::leave` from the binary's signal path so peers do not wait out a
+lease of a pod that is leaving on purpose.

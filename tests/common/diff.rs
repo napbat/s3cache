@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use s3cache::cache::CachingProxy;
+use s3cache::cache::proxy::CachingProxy;
 use s3cache::tier::buffer_body;
 use s3s::dto::{
     GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input,

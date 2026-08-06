@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // the LIST index and invalidate local body copies at network latency; strict reads
     // barrier on feed heads. Set S3CACHE_GOSSIP_BIND (and S3CACHE_GOSSIP_SEEDS as
     // comma-separated id=host:port pairs) to enable; single-node needs none of it.
-    let write_sync = sync::from_env(&cfg.node_name).await.map(Arc::new);
+    let write_sync = sync::config::from_env(&cfg.node_name).await.map(Arc::new);
     info!("gossip coherence (write feed): {}", write_sync.is_some());
     // Kept for the shutdown path: a planned stop retracts this node's serve-lease
     // instead of letting peers wait it out (see `WriteSync::leave`).
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     // Object-body cache: hot (node-local heap) in front of the optional disk tier (warm),
     // in front of the S3 origin (cold). Always layered — no mode to pick.
-    let cp = cache::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters);
+    let cp = cache::proxy::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters);
     cp.start_coherence(&cfg.buckets);
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 /// `kubectl delete pod` all send, and Kubernetes follows it with `SIGKILL` at the end of
 /// the grace period. Catching it is what turns a planned stop into a *planned* stop:
 /// connections drain, and the coherence lease is retracted rather than left for peers to
-/// wait out (see [`sync::WriteSync::leave`]).
+/// wait out (see [`sync::coherence::WriteSync::leave`]).
 ///
 /// A platform without `SIGTERM` (a developer's Windows workstation) keeps `ctrl_c`,
 /// which is the only stop it can send.

@@ -526,7 +526,7 @@ impl LocalCache {
         self.core.suspect_gen.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Drop every node-local copy (see [`Core::flush`]) — the escape hatch, for a stale
+    /// Drop every node-local copy (see `Core::flush`) — the escape hatch, for a stale
     /// set that cannot be revalidated at all. It is strictly more expensive than
     /// [`distrust_all`](Self::distrust_all) and never more correct, so a remediation
     /// reaches for it only when there is nothing left to revalidate *against*.

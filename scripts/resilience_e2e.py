@@ -55,11 +55,11 @@ WARM_BODY = b"cached-before-the-outage"
 
 # The lease duration `D` these nodes actually run with: `h.start_node` passes the ambient
 # environment through, so reading the variable the binary reads is the number the binary
-# uses. 2000ms is the binary's own default (src/sync.rs `DEFAULT_LEASE_MS`).
+# uses. 2000ms is the binary's own default (`sync::coherence::DEFAULT_LEASE_MS`).
 LEASE_MS = int(os.environ.get("S3CACHE_LEASE_MS") or 2000)
 
 # Budget for the first write after the peer dies. The wait itself is one lease remainder
-# (≤ D); the engine gives it a deadline of D + 1s (src/sync.rs `WRITE_WAIT_SLACK`), past
+# (≤ D); the sync layer gives it a deadline of D + 1s (`WRITE_WAIT_SLACK`), past
 # which the write ends with no guarantee at all — so D + 1s is the ceiling being asserted
 # and the second second is harness slack: the origin PUT round-trip plus scheduling.
 FIRST_WRITE_MS = LEASE_MS + 2000
@@ -75,10 +75,11 @@ FAST_MS = 500
 # Below that it is correct but origin-served, which is exactly what the polls tolerate.
 REJOIN_SETTLE_S = LEASE_MS / 1000.0 + 1.0
 
-# The membership timeout the binary actually runs: `max(D, 2s)`, because src/sync.rs
-# floors the tuned `dead_timeout_ms` at DEAD_TIMEOUT_FLOOR_MS. Deriving the horizon from
-# `D` alone would undershoot the real one on any run with a small `D` — and a budget
-# below the true horizon fails the test on timing the binary never promised.
+# The membership timeout the binary actually runs: `max(D, 2s)`, because
+# `WriteSync::new` floors the tuned `dead_timeout_ms` at `DEAD_TIMEOUT_FLOOR_MS`.
+# Deriving the horizon from `D` alone would undershoot the real one on any run with a
+# small `D` — and a budget below the true horizon fails the test on timing the binary
+# never promised.
 DEAD_TIMEOUT_MS = max(LEASE_MS, 2000)
 
 # The rejoin budgets. Nothing here is a latency claim — they are ceilings on *membership*,

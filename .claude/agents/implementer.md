@@ -12,9 +12,26 @@ conventions, and the env-var contract between the Helm chart and `src/main.rs`.
 
 Non-negotiables:
 
-- `cargo test` and `cargo clippy --all-targets` must pass before you report back.
-  `clippy::pedantic` is at deny level; public items need `# Errors` / `# Panics`
-  docs where applicable.
+- Run the complete core gate before reporting back:
+
+  ```sh
+  cargo metadata --locked --no-deps --format-version 1
+  cargo fmt --all --check
+  cargo build --locked --workspace --all-targets --all-features
+  cargo clippy --locked --workspace --all-targets --all-features
+  cargo test --locked --workspace --all-features
+  RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-deps
+  ```
+
+  `clippy::pedantic` and Rust's `unused_imports` lint are denied workspace-wide;
+  public items need `# Errors` / `# Panics` docs where applicable.
+- After chart changes, run `helm lint` and `helm template` with
+  `--set upstream.endpoint=https://example.com`. After dependency, Docker, or release
+  changes, run `docker build --tag s3cache:check .`.
+- Preserve the module-boundary and dependency invariants in `AGENTS.md`: link-point
+  modules stay declarative, public APIs use their real named paths, extracted modules
+  use explicit crate dependencies, and package dependencies, metadata, and lints stay
+  workspace-inherited.
 - LF line endings only (enforced by `.gitattributes`).
 - Match the existing code's comment density and voice — comments state constraints
   the code can't show, nothing else.

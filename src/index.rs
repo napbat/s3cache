@@ -7,7 +7,7 @@
 //! (a bootstrap LIST row, a peer's feed event) proves the key exists and carries what
 //! LIST reports, but not the `Content-Type` or the user metadata a HEAD does; it never
 //! answers a HEAD locally. The first HEAD that forwards completes it in place
-//! ([`complete_entry`]), so the second HEAD of that key is local *and* identical to the
+//! (`complete_entry`), so the second HEAD of that key is local *and* identical to the
 //! origin's.
 //!
 //! Sizes are never fabricated. A path that could not learn one (a metadata HEAD that

@@ -927,7 +927,7 @@ fn overriding(bucket: &str, key: &str) -> GetObjectInput {
 /// `content-type: proxy=Some("text/x-fixture") origin=Some("application/x-override")`,
 /// `content-disposition: proxy=None origin=Some("attachment; filename=\"override.txt\"")`,
 /// `cache-control: proxy=None origin=Some("max-age=99")` — `CachingProxy::get_object`
-/// (src/cache.rs) never looked at the `response_*` fields, so an overriding request was
+/// never looked at the `response_*` fields, so an overriding request was
 /// served from the cache as if it had asked for nothing. They are now lifted off the
 /// request on the way in and applied to the answer on the way out, whichever tier
 /// produced it.
@@ -1161,7 +1161,7 @@ async fn an_unsatisfiable_range_reports_content_range_like_the_origin() {
 /// does not contradict the origin. What makes it hold the day the origin (R2, AWS) does
 /// enforce it is that a request carrying the header is no longer eligible for a local
 /// answer at all: it is in the `origin_only` set on GET, out of `cache_eligible` on
-/// HEAD, and out of the index-served LIST path (src/cache.rs), so the origin evaluates
+/// HEAD, and out of the index-served LIST path, so the origin evaluates
 /// the guard on every one.
 #[tokio::test]
 async fn expected_bucket_owner_is_honoured_like_the_origin() {
@@ -1206,7 +1206,7 @@ async fn expected_bucket_owner_is_honoured_like_the_origin() {
 ///
 /// Was: after the origin refused to delete a version under a legal hold,
 /// `keys: proxy=[] origin=["held"]` and the HEAD was `status: proxy=Some(404)
-/// origin=Some(200)` — `CachingProxy::delete_objects` (src/cache.rs) recorded a delete
+/// origin=Some(200)` — `CachingProxy::delete_objects` recorded a delete
 /// for every key in the *request*, never reading the `Errors` half of the response, so a
 /// key the origin still held disappeared from LIST and 404ed until the next resync. The
 /// applied set now comes off the response (`Deleted`, or requested-minus-`Errors` under
