@@ -149,8 +149,18 @@ after a death) are in the README's Consistency section and in groupnet's own hon
 do not restate them loosely, and do not add a mode without answering
 `Consistency::{acks, leases, capabilities}` explicitly — they are exhaustive on purpose.
 
-Losing the read-side licence is a **latch**, so every way of losing it needs a way back:
-a write-feed gap has the apply loop's remediation, and a lapse with no gap behind it has
-`sync::watch_lapses` (strong only), which runs the same remediation on the same
-`ResyncGate` generation. A planned stop calls `WriteSync::leave` from the binary's
-signal path so peers do not wait out a lease of a pod that is leaving on purpose.
+Losing the read-side licence is a **latch**, so every way of losing it needs a way back,
+and the two ways are deliberately priced differently. A write-feed gap is proof that
+specific events were missed: the apply loop's `sync::remediate` stands the licence down,
+**distrusts** every cached body (the trust generation moves; nothing is dropped) and
+re-LISTs the index, so each copy proves itself against that index on its next read or is
+evicted then. A lapse with no gap behind it is *not* that proof, so `sync::watch_lapses`
+(strong only) runs a staged recovery on the same `ResyncGate` generation — every granter
+re-grants (per granter, *not* off the roster-wide min), settle, no-peer-vanished, barrier
+on every advertised feed head, no-peer-vanished again — and keeps the cache whole when the
+barrier proves it (`lapse_barrier_retains`), falling back to `remediate` whenever a stage
+cannot get its proof (`lapse_barrier_fallbacks` / `lease_lapse_resyncs`).
+`LocalCache::flush` survives only as an escape hatch; no remediation path calls it. The
+correctness argument for the barrier is in `src/sync.rs`'s module docs — it has two
+checked hinges and one named residual; read it before touching the stages. A planned stop calls `WriteSync::leave` from the binary's signal
+path so peers do not wait out a lease of a pod that is leaving on purpose.

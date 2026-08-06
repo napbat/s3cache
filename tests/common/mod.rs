@@ -35,13 +35,14 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3cache::cache::{CacheConfig, CachingProxy};
 use s3cache::metrics::Metrics;
 use s3cache::sync::{Consistency, SyncConfig, WriteSync};
-use s3cache::tier::buffer_body;
+use s3cache::tier::{buffer_body, open_warm};
 use s3s::dto::{
     DeleteObjectInput, ETag, ETagCondition, GetObjectInput, GetObjectOutput, HeadObjectInput,
     HeadObjectOutput, ListObjectsV2Input, PutObjectInput, Range, StreamingBlob,
 };
 use s3s::{S3, S3Request, S3Result};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use testcontainers::core::wait::HttpWaitStrategy;
@@ -61,6 +62,9 @@ const SECRET_KEY: &str = "minioadmin";
 
 /// Room for anything a test caches, so the hot tier is never the thing under test.
 const HOT_BYTES: u64 = 32 * 1024 * 1024;
+/// The same for the warm tier: a test that opts into disk is testing what survives on it,
+/// never its budget (`tests/tier_cache.rs` owns that).
+const WARM_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Polls `$cond` (an expression that may `.await`) until it holds or the deadline
 /// passes, then panics naming `$what`. Deadline-polling, never a bare sleep: the
@@ -426,6 +430,91 @@ pub fn proxy_over(
     )
 }
 
+/// A scratch directory for one test's warm (disk) tier, removed on the way out —
+/// including on a panic, so a failure never leaves the next run a dirty tier to re-index.
+///
+/// It outlives the proxy that fills it on purpose: a node's disk tier is the only thing
+/// that crosses a restart, so a test stages one by handing the same directory to a second
+/// [`warm_proxy_over`].
+pub struct WarmDir(PathBuf);
+
+impl WarmDir {
+    /// A directory of this test's own, unique per process and per call.
+    #[must_use]
+    pub fn new(tag: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("s3cache-e2e-{tag}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Self(dir)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        self.0.clone()
+    }
+
+    /// How many bodies the tier is holding: one file per key, so this is what a restart
+    /// would find waiting for it.
+    #[must_use]
+    pub fn files(&self) -> usize {
+        std::fs::read_dir(&self.0)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .count()
+    }
+}
+
+impl Drop for WarmDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// [`proxy_over`] with a **warm (disk) tier** at `dir` and the caller's `metrics`.
+///
+/// Both extras are for the same kind of test: the warm tier is what a node comes back to
+/// after a restart, and the counters are how a test tells *which* local answer it got —
+/// a body served off disk and proved against the index (`warm_hit` + `body_revalidations`)
+/// reads exactly like a hot hit from outside.
+#[must_use]
+pub fn warm_proxy_over(
+    client: &aws_sdk_s3::Client,
+    max_obj_bytes: usize,
+    sync: Option<Arc<WriteSync>>,
+    dir: &WarmDir,
+    metrics: &Arc<Metrics>,
+) -> CachingProxy {
+    let warm = open_warm(dir.path(), WARM_BYTES, max_obj_bytes, Arc::clone(metrics))
+        .expect("the warm tier opens");
+    CachingProxy::new(
+        s3s_aws::Proxy::from(client.clone()),
+        client.clone(),
+        CacheConfig {
+            cache_bytes: HOT_BYTES,
+            max_obj_bytes,
+        },
+        Some(warm),
+        sync,
+        Arc::clone(metrics),
+    )
+}
+
+/// One counter's current value, by its exposition name — the same view the Prometheus
+/// endpoint serves, which is the only public one the counters have.
+#[must_use]
+pub fn counter(metrics: &Metrics, name: &str) -> u64 {
+    let text = metrics.prometheus_text();
+    let prefix = format!("s3cache_{name} ");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{name} is not exposed:\n{text}"))
+}
+
 /// A proxy in front of `origin`, indexing its bucket in the background — the
 /// single-node stack. Build it *after* seeding, so the warm-up sync sees the fixtures
 /// (the proxy is the only writer in production; a test that seeds behind its back is
@@ -437,23 +526,33 @@ pub fn node(origin: &Origin, max_obj_bytes: usize) -> CachingProxy {
     proxy
 }
 
+/// What one loopback test node runs with: strong mode, the binary's own lease duration,
+/// and `peers` as its statically-addressed seeds. A seed's address is registered lazily
+/// and re-checked (see `WriteSync::new`), so naming a peer that has not bound yet is a
+/// node joining a cluster over time rather than a misconfiguration.
+fn sync_config(id: &str, port: u16, peers: &[(&str, u16)]) -> SyncConfig {
+    SyncConfig {
+        bind: format!("127.0.0.1:{port}"),
+        advertise: Some(format!("127.0.0.1:{port}")),
+        seeds: peers
+            .iter()
+            .map(|(peer, peer_port)| ((*peer).to_owned(), format!("127.0.0.1:{peer_port}")))
+            .collect(),
+        node_id: id.to_owned(),
+        consistency: Consistency::Strong,
+        lease_ms: s3cache::sync::DEFAULT_LEASE_MS,
+    }
+}
+
 /// A pair of gossiping [`WriteSync`]s on loopback UDP, each seeded with the other, in
 /// strong mode. Ports are grabbed from the OS and released a moment before the
 /// transports claim them; a lost race just means another attempt.
 pub async fn gossip_pair(a: &str, b: &str) -> (Arc<WriteSync>, Arc<WriteSync>) {
     for _ in 0..10 {
         let (port_a, port_b) = (free_udp_port(), free_udp_port());
-        let config = |me: &str, my_port: u16, peer: &str, peer_port: u16| SyncConfig {
-            bind: format!("127.0.0.1:{my_port}"),
-            advertise: Some(format!("127.0.0.1:{my_port}")),
-            seeds: vec![(peer.to_owned(), format!("127.0.0.1:{peer_port}"))],
-            node_id: me.to_owned(),
-            consistency: Consistency::Strong,
-            lease_ms: s3cache::sync::DEFAULT_LEASE_MS,
-        };
         let (Some(sync_a), Some(sync_b)) = (
-            WriteSync::new(config(a, port_a, b, port_b)).await,
-            WriteSync::new(config(b, port_b, a, port_a)).await,
+            WriteSync::new(sync_config(a, port_a, &[(b, port_b)])).await,
+            WriteSync::new(sync_config(b, port_b, &[(a, port_a)])).await,
         ) else {
             continue;
         };
@@ -462,8 +561,26 @@ pub async fn gossip_pair(a: &str, b: &str) -> (Arc<WriteSync>, Arc<WriteSync>) {
     panic!("could not bind a pair of loopback gossip ports");
 }
 
+/// One gossip node on a port the caller chose, seeded with `peers` — [`gossip_pair`] for
+/// a cluster that is *not* built all at once.
+///
+/// The port has to be the caller's because the interesting case is a node that joins
+/// **after** something has already happened: its peer is running, and has to have been
+/// seeded with an address this node had not bound yet. That is what a node coming back
+/// from a restart looks like to the peers that stayed up.
+pub async fn gossip_node(id: &str, port: u16, peers: &[(&str, u16)]) -> Arc<WriteSync> {
+    for _ in 0..10 {
+        if let Some(sync) = WriteSync::new(sync_config(id, port, peers)).await {
+            return Arc::new(sync);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("could not bind gossip node `{id}` on 127.0.0.1:{port}");
+}
+
 /// A port the OS just handed out and nobody holds any more.
-fn free_udp_port() -> u16 {
+#[must_use]
+pub fn free_udp_port() -> u16 {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a free UDP port");
     socket.local_addr().expect("bound address").port()
 }

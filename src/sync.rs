@@ -11,8 +11,9 @@
 //! one key through different nodes resolve by timestamp (deletes win ties)
 //! and the origin — which serves conditional (OCC) writes untouched — stays
 //! the authority the index is a cache of. Provably-missed events (ring
-//! overflow, a peer restart) surface as a gap: the local tiers flush and the
-//! LIST index resyncs from the origin. The strict-LIST barrier
+//! overflow, a peer restart) surface as a gap: every local body is *distrusted*
+//! and the LIST index resyncs from the origin, so a copy is served again only
+//! once that index has proved it current. The strict-LIST barrier
 //! ([`WriteSync::await_fresh`]) waits until every peer's currently-advertised
 //! feed head has been applied locally — freshness bounded by one push/gossip
 //! hop, degrading to serving current state on timeout.
@@ -27,17 +28,79 @@
 //! [`Consistency::Strong`] and groupnet's `consistency::lease` honesty box.
 //! Losing that licence is a latch, so every way of losing it needs a way back:
 //! a gap has the apply loop, and a lapse with no gap behind it — a peer scaled
-//! in, lost, or restarted quietly — has [`watch_lapses`], which runs the same
-//! remediation on the same generation.
+//! in, lost, or restarted quietly — has [`watch_lapses`], which recovers on the
+//! same generation.
+//!
+//! # Why a lapse can end without throwing the cache away
+//!
+//! A gap is proof that specific events were missed, and the only honest answer
+//! is to stop trusting what they might have invalidated. A **lapse** is not
+//! that proof: it says this node's licence expired, not that anything actually
+//! changed underneath it. The recovery [`watch_lapses`] runs turns that
+//! difference into a real argument rather than an optimism.
+//!
+//! A write `W` by peer `P` completed only after every lease-holder had either
+//! applied it or lapsed in `P`'s engine. If we applied it, our [`Frontier`]
+//! covers it and the apply loop already evicted the key. If it proceeded via
+//! *our* lapse, then `W` was in `P`'s ring before `P`'s wait resolved, so `P`'s
+//! advertised head is `≥ token(W)` from completion onward. And `P` adopts our
+//! post-lapse renewal strictly *after* resolving every wait against our old
+//! entry — so `P`'s feed frame containing every lapse-era `W` was authored
+//! before the grant our new confirmation rests on. The settle window (`2 ×`
+//! [`Config::anti_entropy_interval_ms`], the same bound the lease shell's own
+//! warm-up uses for entry propagation) is the fabric's bound for that frame
+//! reaching us.
+//!
+//! Hence: a head sampled after the confirmation moves *plus* the settle window
+//! dominates every lapse-era completed write, and [`FrontierView::reached`] on
+//! that head means the apply loop has evicted exactly the keys that changed.
+//! Every other body is provably untouched and keeps its proof — no flush, no
+//! re-LIST, no distrust.
+//!
+//! The argument has two hinges, and both are checked rather than assumed.
+//!
+//! **The vanished peer.** A peer that was alive when the lapse landed and is
+//! **gone from membership** before this recovery affirms took its feed frame
+//! with it (a reap drops the entries), so there is no head left to sample and
+//! no way to tell whether it wrote. Those force the fallback — the gap's
+//! remediation, distrust and re-LIST — unless they were provably non-writers
+//! for the whole window, which here means non-`Alive` since before the lapse.
+//! The check runs **twice**, before the barrier and again immediately before
+//! the affirmation, because the barrier waits and a peer can be reaped inside
+//! that wait.
+//!
+//! **Every granter re-granting.** The frame-ordering step above is licensed by
+//! "`P` adopted our post-lapse renewal", so that has to be established for each
+//! `P` separately — and [`Leases::confirmed`] cannot establish it. It is a
+//! **min** over the roster, and a min advances when the member pinning it
+//! *leaves*: reap a dead granter and the confirmation jumps up to the next
+//! granter's sequence while that granter's grant is frozen exactly where it
+//! was. With two granters those are the same event; with three they are not,
+//! and the frozen one is the worst case there is — a partitioned peer, whose
+//! advertised head is frozen too, so the barrier passes on it vacuously while
+//! its via-lapse writes are precisely the ones we cannot see. So stage 1 reads
+//! each granter's grant on its own ([`Leases::granted_by`]) and requires every
+//! one of them to advance, or that granter to have left the roster — where a
+//! reap hands it straight to the first hinge.
+//!
+//! Every other unprovable case (a grant that never moves, a head never being
+//! reached) lands in the same place, because the fallback is always available
+//! and always correct. What none of this bounds is the residual groupnet's own
+//! honesty box names, and which this crate inherits rather than fixes: a peer
+//! this node **reaps** while it is in fact still writing. `LapseWatch::exempt`
+//! is where that residual is taken deliberately — a peer non-`Alive` since
+//! before the lapse is *assumed* a non-writer for the lapse era, because
+//! without the assumption every scale-in would force the expensive arm forever.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use groupnet::consistency::{
-    AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, LeaseConfig, LeaseView, Leases,
-    PeerWrite, PeerWrites, WriteFeed, WriteToken, advertised_head, applied_by_selected,
+    AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, FrontierView, LeaseConfig,
+    LeaseView, Leases, PeerWrite, PeerWrites, RenewalId, WriteFeed, WriteToken, advertised_head,
+    applied_by_selected,
 };
 use groupnet::core::{Config, NodeId, Status};
 use groupnet::runtime::{Group, Node};
@@ -51,7 +114,8 @@ use crate::metrics::Metrics;
 use crate::tier::LocalCache;
 
 /// Ring capacity: a peer that falls further behind than this many writes
-/// gets a gap (flush + origin resync) instead of per-event application.
+/// gets a gap (distrust every body + origin resync, see [`remediate`]) instead
+/// of per-event application.
 const FEED_CAPACITY: usize = 4096;
 
 /// How much coherence the cluster pays for.
@@ -187,11 +251,23 @@ const WRITE_WAIT_SLACK: Duration = Duration::from_secs(1);
 /// How often a pending affirmation retries while the lease declines it.
 const AFFIRM_POLL: Duration = Duration::from_millis(50);
 
-/// How long an affirmation keeps trying before giving up **loudly**. Generous
-/// on purpose: the two things that decline it — this node's own warm-up window
-/// and a frozen confirmation behind an unreaped granter — both clear on their
-/// own, the second only at the reap horizon. Giving up leaves the node serving
-/// via the origin, which is correct and slow, never stale.
+/// How long an affirmation keeps trying before giving up **loudly**, and the same
+/// budget the staged recovery's stage 1 gives its granters. Generous on purpose:
+/// the two things that decline it — this node's own warm-up window and a frozen
+/// confirmation behind an unreaped granter — both clear on their own, the second
+/// only at the reap horizon. Giving up leaves the node serving via the origin,
+/// which is correct and slow, never stale.
+///
+/// It is a **fixed** minute against a reap horizon that scales with the lease: `2 ×
+/// dead_timeout` past the `Dead` verdict, itself up to one detection window past the
+/// silence, and `dead_timeout` is `max(D, 2s)` (see [`WriteSync::new`]). Past roughly
+/// `D = 25s` the horizon outruns this, and then a dead granter's reap always arrives
+/// after the deadline: the recovery's cheap arm stops existing — every lapse takes
+/// the fallback, and every affirmation gives up before the confirmation it is waiting
+/// on can come back. That direction is fail-closed (a slow, correct, origin-served
+/// node, and a cache thrown away for nothing), but it is silent, so it is stated here
+/// rather than discovered. A fleet running a lease that long wants this scaled with
+/// it; nothing in the shipped envelope — `D = 2s` by default — comes near.
 const AFFIRM_DEADLINE: Duration = Duration::from_mins(1);
 
 /// A published write: the raw token (for the cluster-wide ack wait) and its
@@ -465,9 +541,10 @@ struct GateState {
     /// The resync generation an affirmation must speak for.
     generation: u64,
     /// The value of [`LeaseView::lapses`] when the newest remediation stood the
-    /// lease down. Every lapse counted at or below it is *covered*: the flush
+    /// lease down. Every lapse counted at or below it is *covered*: the distrust
     /// and the origin re-LIST that follow the stand-down happen after it, so
-    /// nothing that lapse could have made stale survives them.
+    /// nothing that lapse could have made stale is served again without proving
+    /// itself against that re-LISTed index.
     covered_lapses: u64,
 }
 
@@ -565,22 +642,43 @@ impl ResyncGate {
 /// The remediation for proof that this node's local state may have missed
 /// invalidations, in the one order that is safe.
 ///
-/// The licence goes **first**, before any remediation: this node must not answer
-/// one more read from local state under a window it no longer deserves. Then the
-/// flush — with every local copy gone (and the index bucket back to passthrough)
-/// there is nothing stale left to serve even while the origin re-LIST runs — and
-/// then `resync`, which owns the affirmation that puts this node back in service
-/// under the generation this stand-down just started (see
-/// `CachingProxy::gap_resync_handle`).
+/// The licence goes **first**: this node must not answer one more read from
+/// local state under a window it no longer deserves. Then every cached body is
+/// *distrusted* rather than dropped — the trust generation moves on, so each
+/// copy has to prove itself against the LIST index before it is served again —
+/// and then `resync`, which re-LISTs that index from the origin and owns the
+/// affirmation that puts this node back in service under the generation this
+/// stand-down just started (see `CachingProxy::gap_resync_handle`).
 ///
-/// Both triggers run exactly this: a write-feed [`PeerWrite::Gap`] and a lease
-/// lapse with no gap behind it ([`watch_lapses`]). They are the same proof —
-/// "writes happened that this node cannot account for" — arriving by different
-/// routes, and a difference in remediation between them would be a difference in
-/// what a reader may serve afterwards.
-async fn remediate(gate: &ResyncGate, local: &LocalCache, resync: &Arc<dyn Fn() + Send + Sync>) {
+/// **Distrust, not flush**, and nothing weaker than the flush it replaces. The
+/// three modes reach the same closed door by their own routes:
+///
+/// * `strong` never consults a body at all while this runs. The stand-down is a
+///   latch on the read-side licence, so every read is origin-served from the
+///   first line of this function until the affirmation lands — the re-LIST has
+///   the whole window to itself, exactly as it did behind a flush.
+/// * `strong-acks` and `bounded` hold no such latch, and are closed by the
+///   *unsynced-bucket* rule in `CachingProxy::validated_get`: `resync` puts
+///   every bucket back to passthrough before its first LIST, and a suspect body
+///   in a bucket that cannot arbitrate is dropped rather than served. That
+///   reproduces the flush's window one key at a time, and only for the keys
+///   that are actually read.
+///
+/// What survives is the difference: once the index is back, a body the index
+/// confirms costs one lookup instead of an origin GET, and a body the index
+/// contradicts is dropped then — which is what a flush did to *every* copy,
+/// correct ones included. [`LocalCache::flush`] stays as the escape hatch for a
+/// stale set that cannot be revalidated at all; no path here reaches for it.
+///
+/// Both triggers run exactly this: a write-feed [`PeerWrite::Gap`], and a lease
+/// lapse with no gap behind it whose staged recovery could not prove the cache
+/// ([`watch_lapses`]). They are the same proof — "writes happened that this node
+/// cannot account for" — arriving by different routes, and a difference in
+/// remediation between them would be a difference in what a reader may serve
+/// afterwards.
+fn remediate(gate: &ResyncGate, local: &LocalCache, resync: &Arc<dyn Fn() + Send + Sync>) {
     gate.require_resync();
-    local.flush().await;
+    local.distrust_all();
     resync();
 }
 
@@ -595,8 +693,433 @@ fn lapse_poll(duration: Duration) -> Duration {
     (duration / 4).max(LAPSE_POLL_FLOOR)
 }
 
-/// Watch this node's own serve-lease and remediate a lapse that arrives with **no**
-/// write-feed gap behind it. `strong` only — nothing else holds a lease to lapse.
+/// How many times the barrier will re-run against a moved head before it stops
+/// chasing and proceeds. Three is enough for a head that advanced *because* the
+/// barrier's own wait let the apply loop catch up; past that the writer is simply
+/// writing, and post-confirmation writes need no chasing — the renewal ticker and
+/// the apply loop never stopped, so those writes wait on this node's acks exactly
+/// as they would on any healthy reader.
+const BARRIER_ROUNDS: u32 = 3;
+
+/// What one stage of the staged recovery decided.
+enum Step {
+    /// The stage held. Carry on.
+    Go,
+    /// A newer generation owns the recovery now — a gap landed, and its own
+    /// remediation covers everything this one was going to prove. Yield without
+    /// touching the licence, the cache, or the counters.
+    Yield,
+    /// The proof is unavailable. Take the fallback: the gap's remediation.
+    Fall,
+}
+
+/// Everything the lapse watcher needs to run the staged recovery, in one place so
+/// the stages read as stages rather than as an argument list.
+struct LapseWatch {
+    gate: Arc<ResyncGate>,
+    /// **Weak on purpose.** The watch outlives every request and is owned by a task
+    /// the [`WriteSync`] itself spawned; a strong handle would be a cycle that keeps
+    /// the feed, the lease set and the gossip node alive for the process lifetime.
+    /// A failed upgrade is this node shutting down, and every stage treats it as
+    /// [`Step::Yield`].
+    sync: Weak<WriteSync>,
+    local: LocalCache,
+    /// The apply loop's own frontier view — the barrier's whole instrument.
+    frontier: FrontierView,
+    group: Group,
+    me: NodeId,
+    resync: Arc<dyn Fn() + Send + Sync>,
+    metrics: Arc<Metrics>,
+    /// The lease duration `D`: the watch cadence and the barrier's deadline both
+    /// come off it.
+    lease: Duration,
+}
+
+impl LapseWatch {
+    /// How often the lapse itself is looked for, and the staleness bound on the
+    /// exemption snapshot: a peer non-`Alive` for at least this long was already
+    /// non-`Alive` when the previous look happened.
+    fn poll(&self) -> Duration {
+        lapse_poll(self.lease)
+    }
+
+    /// The fabric's bound for one peer's entry to reach this node once gossip is
+    /// flowing again — `2 ×` the anti-entropy interval, read off the group's
+    /// *effective* config, and the same number the lease shell's own warm-up guard
+    /// budgets for entry propagation. See the module docs for why the frame this
+    /// waits for was authored before the grant that ends stage 1.
+    fn settle(&self) -> Duration {
+        Duration::from_millis(
+            self.group
+                .config()
+                .anti_entropy_interval_ms
+                .saturating_mul(2),
+        )
+    }
+
+    /// Whether this recovery still owns the gate. Checked between every stage and
+    /// inside the two that wait: a gap arriving mid-recovery starts a generation of
+    /// its own, and that generation's remediation supersedes everything here.
+    fn owns(&self, generation: u64) -> bool {
+        self.gate.generation() == generation
+    }
+
+    /// The peers this node currently sees as `Alive` (never itself).
+    fn alive(&self) -> HashSet<NodeId> {
+        self.group
+            .statuses()
+            .into_iter()
+            .filter(|(peer, status)| *peer != self.me && *status == Status::Alive)
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
+    /// The peers a vanishing cannot indict: non-`Alive`, and held that way for at
+    /// least one watch interval — long enough that they were *already* non-`Alive`
+    /// when this watch last looked, which is before the lapse could have been picked
+    /// up. A peer this node has not considered live since before the lapse is taken
+    /// as a non-writer for the lapse era, and its later reap proves nothing about
+    /// this cache.
+    ///
+    /// This is the recovery's one **policy** decision rather than a deduction, and
+    /// it is the same residual groupnet's own honesty box names: a peer this node
+    /// reaps while it is in fact still writing is outside what any of this bounds.
+    /// Without the exemption every scale-in would force the expensive arm forever,
+    /// because a departed peer always eventually vanishes.
+    ///
+    /// The boundary is drawn at one watch interval and **everything on the near side
+    /// of it counts** — a peer whose down-verdict is younger than that was live too
+    /// recently to be proved a non-writer, so it stays in the set stage 3 tests
+    /// rather than falling into a gap between "alive" and "provably gone". That is
+    /// why `seen` is seeded from every member rather than from the `Alive` ones:
+    /// membership status at the instant of the snapshot is not the question, and
+    /// erring towards an extra fallback is the only direction that is safe.
+    fn exempt(&self) -> HashSet<NodeId> {
+        let floor = self.poll();
+        self.group
+            .statuses_held()
+            .into_iter()
+            .filter(|(peer, status, held)| {
+                *peer != self.me && *status != Status::Alive && *held >= floor
+            })
+            .map(|(peer, _, _)| peer)
+            .collect()
+    }
+
+    /// Every member this node still knows of, at any status. A reaped peer is
+    /// absent from this and *only* from this, which is exactly what stage 3 asks.
+    fn present(&self) -> HashSet<NodeId> {
+        self.group
+            .statuses()
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
+    /// The peers whose grants this node's confirmation is a min over: every member it
+    /// still knows of — `Suspect` and `Dead`-but-unreaped included, because either may
+    /// still be writing — that advertises [`CAP_LEASE`].
+    ///
+    /// Derived the same way the lease shell's own ingest derives it, off
+    /// [`Group::statuses`] rather than the not-`Dead` set, so that a granter leaving
+    /// this set means exactly one thing: it was **reaped**, or it stopped advertising
+    /// that it grants at all. Stage 1 needs that distinction, because "left the roster"
+    /// is the one way past its per-granter check.
+    fn roster(&self) -> HashSet<NodeId> {
+        self.group
+            .statuses()
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .filter(|peer| *peer != self.me && self.group.node_has_capability(peer, CAP_LEASE))
+            .collect()
+    }
+
+    /// What `granter` currently advertises having adopted of this node's serve-lease —
+    /// the per-granter reading stage 1 checks. `None` while this node is on its way out.
+    fn granted_by(&self, granter: &NodeId) -> Option<RenewalId> {
+        self.sync.upgrade()?.lease_granted_by(granter)
+    }
+
+    /// **Stage 3's question**, asked before the barrier and again after it: the peers
+    /// this recovery counted that are gone from membership now, named for the log.
+    /// `None` when everything it has to answer for is still there.
+    ///
+    /// A peer that was live when the lapse landed and has since been reaped took its
+    /// feed frame with it, so nothing left can say whether it wrote — see the module
+    /// docs. Asked twice because stages 4 and 5 *wait*, and a reap horizon can fall
+    /// inside that wait: the pre-barrier answer says nothing about the post-barrier one.
+    fn unaccounted(&self, seen: &HashSet<NodeId>, exempt: &HashSet<NodeId>) -> Option<String> {
+        let present = self.present();
+        let vanished: Vec<NodeId> = seen
+            .iter()
+            .filter(|peer| !present.contains(*peer) && !exempt.contains(*peer))
+            .cloned()
+            .collect();
+        (!vanished.is_empty()).then(|| node_names(&vanished))
+    }
+
+    /// One advertised head per peer this node still knows of — `Alive`, `Suspect`
+    /// and `Dead`-but-unreaped alike, which is why this sweeps
+    /// [`Group::statuses`] rather than `members()`: a peer whose tombstone is still
+    /// standing has an entry, may have written before it went quiet, and is
+    /// precisely the one worth barriering on. A peer with no decodable feed has
+    /// published nothing and is skipped.
+    fn heads(&self) -> HashMap<NodeId, WriteToken> {
+        self.group
+            .statuses()
+            .into_iter()
+            .filter(|(peer, _)| *peer != self.me)
+            .filter_map(|(peer, _)| advertised_head(&self.group, &peer).map(|head| (peer, head)))
+            .collect()
+    }
+
+    /// The newest renewal every granter has confirmed, or `None` while the
+    /// confirmation is frozen (or this node is on its way out).
+    fn confirmed(&self) -> Option<RenewalId> {
+        self.sync.upgrade()?.lease_confirmed()
+    }
+
+    /// **Stage 1.** Wait until every granter this recovery has to answer for has
+    /// adopted a renewal published after the one it had adopted when the recovery
+    /// started — the event that proves it has resolved every wait it was holding
+    /// against the entry this node lapsed out of.
+    ///
+    /// **Per granter, not on [`WriteSync::lease_confirmed`] alone.** That is a min
+    /// over the roster, and a min advances when the member pinning it *leaves*: reap
+    /// a dead granter and it jumps to the next granter's sequence while a partitioned
+    /// granter's grant sits frozen exactly where it was, its via-lapse writes still
+    /// unaccounted for. The confirmation moving is kept as a coarse gate — this node
+    /// has to hold a live window again for any of this to matter — but the proof is
+    /// `grants`.
+    ///
+    /// A granter may **leave the roster** instead of advancing, and that is a
+    /// deferral rather than a proof: reaped, it is in `seen` and stage 3 refuses the
+    /// cheap arm on its behalf; still a member but no longer advertising
+    /// [`CAP_LEASE`], it is still swept by [`heads`](Self::heads) and the barrier
+    /// covers it like any other member.
+    ///
+    /// `seen` and `grants` both grow while this waits. A peer that comes up
+    /// mid-recovery is one whose writes the barrier must cover and whose grant this
+    /// must therefore watch too — entered at what it advertises *now*, so it has to
+    /// re-grant after being noticed. A peer that goes down is removed from neither,
+    /// because going down is what stage 3 is looking for.
+    async fn await_confirmation(
+        &self,
+        generation: u64,
+        seen: &mut HashSet<NodeId>,
+        grants: &mut HashMap<NodeId, Option<RenewalId>>,
+        exempt: &HashSet<NodeId>,
+    ) -> Step {
+        let before = self.confirmed();
+        let deadline = Instant::now() + AFFIRM_DEADLINE;
+        loop {
+            if !self.owns(generation) {
+                return Step::Yield;
+            }
+            let roster = self.roster();
+            seen.extend(
+                self.alive()
+                    .into_iter()
+                    .filter(|peer| !exempt.contains(peer)),
+            );
+            for granter in roster.iter().filter(|peer| !exempt.contains(*peer)) {
+                if !grants.contains_key(granter) {
+                    grants.insert(granter.clone(), self.granted_by(granter));
+                }
+            }
+            let pending: Vec<NodeId> = grants
+                .iter()
+                .filter(|(granter, at_start)| {
+                    roster.contains(*granter)
+                        && !self
+                            .granted_by(granter)
+                            .is_some_and(|now| at_start.is_none_or(|at_start| now > at_start))
+                })
+                .map(|(granter, _)| granter.clone())
+                .collect();
+            if pending.is_empty()
+                && self
+                    .confirmed()
+                    .is_some_and(|now| before.is_none_or(|before| now > before))
+            {
+                return Step::Go;
+            }
+            if Instant::now() >= deadline {
+                let why = if pending.is_empty() {
+                    "the confirmation never moved".to_owned()
+                } else {
+                    format!("{} never re-granted", node_names(&pending))
+                };
+                warn!(
+                    "coherence lease never re-confirmed after a lapse ({why}); falling back \
+                     to the full remediation (a granter may neither publish nor get reaped)"
+                );
+                return Step::Fall;
+            }
+            tokio::time::sleep(AFFIRM_POLL).await;
+        }
+    }
+
+    /// **Stage 4.** Wait until every sampled head has been applied locally, which is
+    /// the whole proof: past it, the apply loop has evicted exactly the keys the
+    /// lapse era changed and every body still held is provably untouched.
+    ///
+    /// The deadline is one lease duration plus [`WRITE_WAIT_SLACK`] — the same
+    /// budget a leased *write* gets, because it is bounded by the same thing: the
+    /// longest a peer can be behind and still be somebody this node has to wait
+    /// for. Running out means the proof did not arrive, not that it failed.
+    async fn barrier(&self, heads: &HashMap<NodeId, WriteToken>, generation: u64) -> Step {
+        let deadline = Instant::now() + self.lease + WRITE_WAIT_SLACK;
+        for (peer, head) in heads {
+            if !self.owns(generation) {
+                return Step::Yield;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let reached = tokio::time::timeout(remaining, self.frontier.reached(peer, *head)).await;
+            // `Err` is out of time; `Ok(false)` is the apply loop being gone, so
+            // nothing is being applied at all. Neither yields a proof.
+            if !matches!(reached, Ok(true)) {
+                warn!(
+                    "lapse recovery could not reach `{peer}`'s advertised feed head in \
+                     time; falling back to the full remediation"
+                );
+                return Step::Fall;
+            }
+        }
+        if self.owns(generation) {
+            Step::Go
+        } else {
+            Step::Yield
+        }
+    }
+
+    /// The expensive arm: exactly the gap's remediation, on the generation stage 0
+    /// already started — [`remediate`] starts one of its own, which is right. This
+    /// recovery is abandoning its proof, so the affirmation it would have owned must
+    /// never land, and `resync` reads the *current* generation for itself (see
+    /// `CachingProxy::gap_resync_handle`). One resync, one affirmation, whichever
+    /// generation is live when it runs.
+    fn fall_back(&self) {
+        self.metrics.lapse_barrier_fallback();
+        self.metrics.lease_lapse_resync();
+        remediate(&self.gate, &self.local, &self.resync);
+    }
+
+    /// The staged recovery, stage by stage. See the module docs for why the
+    /// barrier is a proof rather than a hope, and [`watch_lapses`] for what it is
+    /// recovering from.
+    async fn recover(&self) {
+        // Stage 0. The licence goes down first and unconditionally: whatever this
+        // recovery concludes, it must not conclude it while still serving. Then the
+        // accounting: every member this recovery has to answer for (`seen`), the ones
+        // it does not (`exempt` — see there for where that line is drawn), and what
+        // each granter has adopted of this node's lease so far, which is the baseline
+        // stage 1 needs each of them to move off.
+        self.gate.require_resync();
+        let generation = self.gate.generation();
+        let started = Instant::now();
+        let exempt = self.exempt();
+        let mut seen: HashSet<NodeId> = self
+            .present()
+            .into_iter()
+            .filter(|peer| *peer != self.me && !exempt.contains(peer))
+            .collect();
+        let mut grants: HashMap<NodeId, Option<RenewalId>> = self
+            .roster()
+            .into_iter()
+            .filter(|granter| !exempt.contains(granter))
+            .map(|granter| {
+                let at_start = self.granted_by(&granter);
+                (granter, at_start)
+            })
+            .collect();
+        warn!(
+            "coherence lease lapsed with no write-feed gap (a peer stopped granting): \
+             holding reads at the origin while the retention barrier runs"
+        );
+
+        // Stage 1: every granter re-grants. Stage 2: the fabric's own bound for the
+        // feed frame behind those grants to arrive.
+        match self
+            .await_confirmation(generation, &mut seen, &mut grants, &exempt)
+            .await
+        {
+            Step::Go => {}
+            Step::Yield => return,
+            Step::Fall => return self.fall_back(),
+        }
+        tokio::time::sleep(self.settle()).await;
+        if !self.owns(generation) {
+            return;
+        }
+
+        // Stage 3, the first hinge: a peer that was live when the lapse landed and is
+        // now gone from membership took its feed frame with it, so nothing can say
+        // whether it wrote.
+        if let Some(who) = self.unaccounted(&seen, &exempt) {
+            warn!(
+                "lapse recovery cannot account for {who} (live at the lapse, gone before it \
+                 could affirm); falling back to the full remediation"
+            );
+            return self.fall_back();
+        }
+
+        // Stages 4 and 5: barrier on every advertised head, and re-sample. A head
+        // that moved while the barrier waited gets barriered again, up to
+        // BARRIER_ROUNDS — then this proceeds, because a head still moving is a
+        // writer writing now, and those writes wait on this node's acks normally.
+        let mut heads = self.heads();
+        for _ in 0..BARRIER_ROUNDS {
+            match self.barrier(&heads, generation).await {
+                Step::Go => {}
+                Step::Yield => return,
+                Step::Fall => return self.fall_back(),
+            }
+            let resampled = self.heads();
+            if !advanced(&heads, &resampled) {
+                break;
+            }
+            heads = resampled;
+        }
+
+        // Stage 3 again, on the same accounting. Stages 4 and 5 waited — up to a lease
+        // duration per round — and a reap horizon can fall inside that wait, so the
+        // answer from before the barrier says nothing about the answer now. This is the
+        // last look before the licence goes back on.
+        if let Some(who) = self.unaccounted(&seen, &exempt) {
+            warn!(
+                "lapse recovery cannot account for {who} (live at the lapse, gone during the \
+                 barrier); falling back to the full remediation"
+            );
+            return self.fall_back();
+        }
+
+        // Stage 6. No flush, no re-LIST, no resync: every body still held was
+        // proved untouched by the barrier, and the ones that were not are already
+        // gone — the apply loop evicted them on the way past.
+        self.metrics.lapse_barrier_retain();
+        let elapsed = started.elapsed();
+        info!(
+            "lapse recovery kept the body cache: every lapse-era write applied, \
+             licence re-affirmed after {elapsed:?}"
+        );
+        if let Some(sync) = self.sync.upgrade() {
+            sync.affirm_resynced(generation).await;
+        }
+    }
+}
+
+/// Whether any peer's head moved between two samples — including a peer that had
+/// no decodable feed the first time and has one now.
+fn advanced(before: &HashMap<NodeId, WriteToken>, after: &HashMap<NodeId, WriteToken>) -> bool {
+    after
+        .iter()
+        .any(|(peer, head)| before.get(peer).is_none_or(|seen| seen < head))
+}
+
+/// Watch this node's own serve-lease and recover from a lapse that arrives with
+/// **no** write-feed gap behind it. `strong` only — nothing else holds a lease to
+/// lapse.
 ///
 /// A gap is not the only way this node loses its licence, and the other ways carry
 /// no event: a peer scaled in or lost for good, a partition that heals without the
@@ -607,45 +1130,56 @@ fn lapse_poll(duration: Duration) -> Duration {
 /// ever triggered. That is permanent origin-serving for a node whose peers are
 /// perfectly healthy: correct, and wrong about the price.
 ///
-/// So the lapse gets the gap's remediation, and gets it exactly: the generation
-/// bump, the flush, the origin re-LIST, and the affirmation the re-LIST owns. The
-/// affirmation is what recovers the node, and it recovers at the moment the lease
-/// can be confirmed again — the reap horizon, for a peer that is never coming back.
+/// So the lapse gets a recovery, and it is a **staged** one rather than the gap's:
 ///
-/// **The interlock**: a gap racing the same lapse must not buy a second
-/// remediation. [`ResyncGate::require_resync`] records the lapse count it covers
-/// while it stands the lease down, so whichever trigger arrives first owns every
-/// lapse observed before it and this watch yields (see
-/// [`ResyncGate::lapse_uncovered`]). The reverse — this watch remediating first and
-/// a gap then arriving — is not deduplicated and must not be: a gap is independent
-/// proof of missed writes, and it is entitled to its own resync.
+/// 0. Stand the licence down and start a generation, exactly as a gap does. Snapshot
+///    which peers were live, which were already down long enough not to count, and
+///    what each granter has so far adopted of this node's lease.
+/// 1. Wait for **every** granter to adopt a renewal published after that snapshot, so
+///    every wait held against the old entry is resolved. Per granter, not on the
+///    roster-wide min — see the module docs for what a min cannot tell apart.
+/// 2. Settle: `2 × anti_entropy_interval`, the fabric's bound for the feed frames
+///    behind those grants to arrive.
+/// 3. Refuse the cheap arm if any peer that was live at the lapse has vanished from
+///    membership since — its frame went with it.
+/// 4. Barrier on every peer's advertised head.
+/// 5. Re-sample; a head that moved gets barriered again, a few times over.
+/// 6. Re-run stage 3 — the barrier waits, and a peer can be reaped inside that wait —
+///    then affirm. No flush, no re-LIST, no resync; see the module docs for why that
+///    is a proof and not an optimism.
 ///
-/// One lapse is one remediation, and that is also the residual: a stand-down
-/// latches, so no *further* lapse edge can fire until an affirmation lifts it. If
-/// that affirmation gives up at [`AFFIRM_DEADLINE`] — a granter that neither
-/// publishes nor gets reaped, the fail-slow shape the lease tier names — this node
-/// stays origin-serving until the next gap, exactly as it would after a gap whose
+/// Any stage that cannot get its proof falls back to [`remediate`], which is the
+/// gap's answer and always available. The fallback is the *only* thing the two
+/// triggers still share, and that is the point: a gap knows something was missed,
+/// a lapse only knows it stopped being allowed to serve.
+///
+/// **The interlock**: a gap racing the same lapse must not buy a second remediation.
+/// [`ResyncGate::require_resync`] records the lapse count it covers while it stands
+/// the lease down, so whichever trigger arrives first owns every lapse observed
+/// before it and this watch yields (see [`ResyncGate::lapse_uncovered`]). A gap that
+/// lands *during* the staged recovery is handled by the generation checks threaded
+/// through every stage: the gap's own remediation is strictly stronger than
+/// anything this was about to conclude, so the recovery abandons its proof rather
+/// than racing it. The reverse — this watch recovering first and a gap then
+/// arriving — is not deduplicated and must not be: a gap is independent proof of
+/// missed writes, and it is entitled to its own resync.
+///
+/// One lapse is one recovery, and that is also the residual: a stand-down latches,
+/// so no *further* lapse edge can fire until an affirmation lifts it. If that
+/// affirmation gives up at [`AFFIRM_DEADLINE`] — a granter that neither publishes
+/// nor gets reaped, the fail-slow shape the lease tier names — this node stays
+/// origin-serving until the next gap, exactly as it would after a gap whose
 /// affirmation gave up. The remedy for that one is operational, and the warning
 /// [`WriteSync::affirm_resynced`] logs is where it is stated.
-fn watch_lapses(
-    gate: Arc<ResyncGate>,
-    local: LocalCache,
-    resync: Arc<dyn Fn() + Send + Sync>,
-    metrics: Arc<Metrics>,
-    poll: Duration,
-) {
+fn watch_lapses(watch: LapseWatch) {
+    let poll = watch.poll();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(poll).await;
-            if !gate.lapse_uncovered() {
+            if !watch.gate.lapse_uncovered() {
                 continue;
             }
-            warn!(
-                "coherence lease lapsed with no write-feed gap (a peer stopped granting): \
-                 flushing tiers, resyncing index"
-            );
-            metrics.lease_lapse_resync();
-            remediate(&gate, &local, &resync).await;
+            watch.recover().await;
         }
     });
 }
@@ -933,6 +1467,42 @@ impl WriteSync {
     #[cfg(test)]
     pub(crate) fn require_resync(&self) {
         self.resync.require_resync();
+    }
+
+    /// The newest renewal of this node's serve-lease that **every** granter in its
+    /// roster has confirmed — a **min** over that roster — or `None` in any mode
+    /// holding no lease, and `None` before the first renewal this epoch is confirmed
+    /// by everyone (a fresh boot, or a granter that has never granted).
+    ///
+    /// A mid-life freeze does not read as `None`: a granter that goes silent stops
+    /// *advancing* the min, it does not remove itself from it, so this keeps
+    /// answering `Some` with the stale value it was frozen at until membership reaps
+    /// the granter. Movement, not `Some`-ness, is the signal.
+    ///
+    /// And movement is a weaker signal than it looks, which is why the staged lapse
+    /// recovery does not rest on it alone: a min advances when the member *pinning*
+    /// it leaves, so reaping a dead granter moves this while another granter's grant
+    /// is still frozen. [`lease_granted_by`](Self::lease_granted_by) is the per-granter
+    /// reading that answers the question this one only approximates.
+    pub(crate) fn lease_confirmed(&self) -> Option<RenewalId> {
+        self.leases.as_ref().and_then(Leases::confirmed)
+    }
+
+    /// The newest renewal of **this** node's serve-lease that `granter` advertises
+    /// having adopted, read straight off `granter`'s published grant map. `None` in
+    /// any mode holding no lease, and for a granter advertising no grant of this
+    /// node's lease at all (never granted, or reaped and its entries dropped).
+    ///
+    /// This is the reading [`lease_confirmed`](Self::lease_confirmed) is a min over,
+    /// and the one the staged recovery's stage 1 actually checks: [`RenewalId`] is
+    /// epoch-major and ordered, so a value strictly above an earlier one proves *this
+    /// granter* has adopted a renewal published after the earlier one — and so has
+    /// resolved every wait it was holding against the entry this node lapsed out of.
+    /// The min proves that of nobody in particular.
+    pub(crate) fn lease_granted_by(&self, granter: &NodeId) -> Option<RenewalId> {
+        self.leases
+            .as_ref()
+            .and_then(|leases| leases.granted_by(granter))
     }
 
     /// How many times this node's own serve-lease has lapsed — groupnet's monotone
@@ -1227,30 +1797,39 @@ impl WriteSync {
     }
 
     /// Spawn the apply loop: peers' events fold into the LIST index and drop
-    /// the local body copies; a gap flushes every local tier and triggers
+    /// the local body copies; a gap distrusts every local body and triggers
     /// `resync` (an origin re-LIST) since the stale subset is unknowable.
     ///
     /// In `strong` this also spawns [`watch_lapses`], because a gap is not the only
     /// way this node loses its right to serve and the others arrive as no event at
-    /// all. Both live here for the same reason: this is where the two things a
-    /// remediation needs — the local tiers and the origin re-LIST — first exist.
+    /// all. Both live here for the same reason: this is where everything a recovery
+    /// needs — the local tiers, the applied-write frontier, and the origin re-LIST —
+    /// first exists at once.
+    ///
+    /// Takes `self` as an [`Arc`] because the lapse watch holds a [`Weak`] back to
+    /// it: the recovery has to read this node's own lease confirmation, and a strong
+    /// handle in a task this object spawned would be a cycle.
     pub(crate) fn start_apply(
-        &self,
+        self: &Arc<Self>,
         local: LocalCache,
         state: Arc<RwLock<HashMap<String, BucketState>>>,
         resync: Arc<dyn Fn() + Send + Sync>,
         metrics: Arc<Metrics>,
     ) {
         let (frontier, view) = Frontier::new();
-        let _ = self.view.set(view);
+        let _ = self.view.set(view.clone());
         if let Some(leases) = &self.leases {
-            watch_lapses(
-                Arc::clone(&self.resync),
-                local.clone(),
-                Arc::clone(&resync),
-                Arc::clone(&metrics),
-                lapse_poll(leases.config().duration),
-            );
+            watch_lapses(LapseWatch {
+                gate: Arc::clone(&self.resync),
+                sync: Arc::downgrade(self),
+                local: local.clone(),
+                frontier: view,
+                group: self.group.clone(),
+                me: self.me.clone(),
+                resync: Arc::clone(&resync),
+                metrics: Arc::clone(&metrics),
+                lease: leases.config().duration,
+            });
         }
         // Bounded mode publishes no acks (that is its point at scale); both strong
         // spellings do, and say so through their capability advertisement.
@@ -1314,16 +1893,18 @@ impl WriteSync {
                         peer,
                         missed_through,
                     } => {
-                        warn!("write-feed gap from `{peer}`: flushing tiers, resyncing index");
-                        // Stand the licence down, flush, re-LIST — see `remediate`,
-                        // which is also what a lapse with no gap behind it runs. The
-                        // node stays out of service until the resync affirms catch-up
-                        // for *this* generation: a reader that missed invalidations
-                        // missed exactly the ones whose writers proceeded because it
-                        // had. With every local copy gone (and the index bucket back
-                        // to passthrough), acking the gap is truthful even while the
-                        // origin re-LIST is still running.
-                        remediate(&gate, &local, &resync).await;
+                        warn!("write-feed gap from `{peer}`: distrusting bodies, resyncing index");
+                        // Stand the licence down, distrust, re-LIST — see
+                        // `remediate`, which is also the fallback of a lapse with no
+                        // gap behind it. The node stays out of service until the
+                        // resync affirms catch-up for *this* generation: a reader
+                        // that missed invalidations missed exactly the ones whose
+                        // writers proceeded because it had. Acking the gap is
+                        // truthful the moment this returns even though the bodies are
+                        // still here: `strong` serves none of them while the licence
+                        // is down, and the other modes refuse a suspect body in a
+                        // bucket the re-LIST has put back to passthrough.
+                        remediate(&gate, &local, &resync);
                         if disturbs {
                             stability.disturb();
                         }
@@ -1414,10 +1995,11 @@ impl WriteSync {
     ///
     /// What it costs is the other end of the same horizon: `2 × dead_timeout_ms` is also
     /// how long a returning node's entries stay recoverable by a digest, so a partition
-    /// outliving ~4s lands on the write-feed **gap** path instead of reconciling — flush
-    /// the tiers, re-LIST from the origin. That is not a regression to work around; the
-    /// origin is the authority this index caches, and the gap path is s3cache's standing
-    /// remedy for "this node provably missed writes". Trading a rare, loud, correct
+    /// outliving ~4s lands on the write-feed **gap** path instead of reconciling —
+    /// distrust every cached body, re-LIST from the origin. That is not a regression to
+    /// work around; the origin is the authority this index caches, and the gap path is
+    /// s3cache's standing remedy for "this node provably missed writes". Trading a rare,
+    /// loud, correct
     /// resync for 16s off every unreaped-granter freeze is the right side of that deal
     /// for a cache.
     pub async fn new(cfg: SyncConfig) -> Option<Self> {
@@ -1553,7 +2135,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant, SystemTime};
 
-    use groupnet::consistency::{CAP_LEASE, LeaseConfig};
+    use groupnet::consistency::{CAP_LEASE, LeaseConfig, WriteFeed};
     use groupnet::core::{Config, NodeId, Status};
     use groupnet::runtime::{Group, Node};
     use groupnet::transport::mem::{MemTransport, Network};
@@ -1561,9 +2143,10 @@ mod tests {
     use s3s::dto::GetObjectOutput;
 
     use super::{
-        CAP_ACKS, CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, IndexEvent, IndexEventV1, IndexOp,
-        IndexOpV1, V2_MAGIC, WriteSync, WriteWait, decode_event, encode_event, lapse_poll,
-        parse_lease_ms, parse_seeds, settle_window, waits_on, waits_on_unleased, wire_stamp,
+        AFFIRM_POLL, CAP_ACKS, CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, IndexEvent,
+        IndexEventV1, IndexOp, IndexOpV1, V2_MAGIC, WriteSync, WriteWait, decode_event,
+        encode_event, lapse_poll, parse_lease_ms, parse_seeds, settle_window, to_micros, waits_on,
+        waits_on_unleased, wire_stamp,
     };
     use crate::index::{BucketState, ObjEntry, standard_class};
     use crate::metrics::Metrics;
@@ -1738,6 +2321,79 @@ mod tests {
         ))
     }
 
+    fn ckey(key: &str) -> (String, String) {
+        ("bkt".to_owned(), key.to_owned())
+    }
+
+    /// Cache `body` under `key` the way a fill does: stamped current, so it is served
+    /// with no index consulted (see `CachingProxy::validated_get`).
+    async fn fill(cache: &TieredCache, key: &str, body: &'static [u8]) {
+        let obj = cached(body);
+        obj.mark_trusted(cache.suspect_gen());
+        cache.insert(ckey(key), obj).await;
+    }
+
+    /// What the tiers hold for `key`, in the three states a recovery can leave it in:
+    /// `None` gone, `Some(false)` present but **suspect** (held, and refused by
+    /// `validated_get` until the LIST index proves it), `Some(true)` present and proved
+    /// (served straight back).
+    async fn held(cache: &TieredCache, key: &str) -> Option<bool> {
+        let obj = cache.get(&ckey(key)).await?;
+        Some(obj.trusted(cache.suspect_gen()))
+    }
+
+    /// One counter's current value, by its exposition name.
+    fn counter(metrics: &Metrics, name: &str) -> u64 {
+        let text = metrics.prometheus_text();
+        let prefix = format!("s3cache_{name} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{name} is not exposed:\n{text}"))
+    }
+
+    /// A bare write feed on `group` at an explicit epoch — the seam for two things a
+    /// [`WriteSync`] cannot express: a write published by a peer whose lease shell has
+    /// already been dropped, and a **fresh-epoch** frame, which is what a writer restart
+    /// looks like to a subscriber and the one deterministic way to force a real
+    /// [`PeerWrite::Gap`].
+    fn raw_feed(group: &Group, epoch: u64) -> WriteFeed<IndexEvent> {
+        WriteFeed::new(
+            group.clone(),
+            std::num::NonZeroUsize::new(super::FEED_CAPACITY).expect("a non-zero ring"),
+            encode_event,
+        )
+        .with_epoch(epoch)
+    }
+
+    /// A feed whose payloads this node's decoder rejects, so its writes are skipped
+    /// while its **head still advances** — the one shape that makes an advertised head
+    /// unreachable rather than merely late. [`PeerWrites`] steps its cursor past an
+    /// undecodable entry without emitting anything, so no [`Frontier`] watermark ever
+    /// covers it: a peer publishing an envelope this build cannot read.
+    fn undecodable_feed(group: &Group) -> WriteFeed<IndexEvent> {
+        WriteFeed::new(
+            group.clone(),
+            std::num::NonZeroUsize::new(super::FEED_CAPACITY).expect("a non-zero ring"),
+            |_: &IndexEvent| vec![V2_MAGIC, V2_MAGIC],
+        )
+    }
+
+    /// The smallest event that indexes a key and invalidates a peer's copy of it.
+    fn put_event(key: &str) -> IndexEvent {
+        IndexEvent {
+            op: IndexOp::Put {
+                size: Some(1),
+                etag: None,
+                content_type: None,
+                storage_class: None,
+            },
+            bucket: "bkt".to_owned(),
+            key: key.to_owned(),
+            ts_us: to_micros(SystemTime::now()),
+        }
+    }
+
     fn indexed_size(state: &Index, bucket: &str, key: &str) -> Option<i64> {
         state
             .read()
@@ -1759,26 +2415,52 @@ mod tests {
 
     /// A fully-wired pair: node A publishes, node B applies into `state` and
     /// its local cache. Returns A's publisher, B's sync, and B's state and cache.
-    fn wired_pair(net: &Network) -> (WriteSync, WriteSync, Index, TieredCache) {
+    fn wired_pair(net: &Network) -> (WriteSync, Arc<WriteSync>, Index, TieredCache) {
         wired_pair_named(net, ("sync-a", "sync-b"), Consistency::Strong)
     }
 
     /// [`wired_pair`] with the gossip identities and the mode spelled out — unique ids
     /// per test, so parallel tests never share one.
+    ///
+    /// B comes back as an [`Arc`]: it is the node whose apply loop runs, and
+    /// [`WriteSync::start_apply`] hands the lapse watch a [`Weak`] back to it.
     fn wired_pair_named(
         net: &Network,
         ids: (&str, &str),
         consistency: Consistency,
-    ) -> (WriteSync, WriteSync, Index, TieredCache) {
+    ) -> (WriteSync, Arc<WriteSync>, Index, TieredCache) {
         let (a_id, _a_node, a_group) = spawn_node(net, ids.0, ids.1);
         let (b_id, _b_node, b_group) = spawn_node(net, ids.1, ids.0);
         let metrics = Arc::new(Metrics::default());
         let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
         let state: Index = Arc::new(RwLock::new(HashMap::new()));
-        let sync_b = attach(b_group, b_id, consistency);
+        let sync_b = Arc::new(attach(b_group, b_id, consistency));
         sync_b.start_apply(cache.local(), state.clone(), Arc::new(|| {}), metrics);
         let sync_a = attach(a_group, a_id, consistency);
         (sync_a, sync_b, state, cache)
+    }
+
+    /// Assert `peer` is on the far side of the exemption line — non-`Alive`, and held
+    /// that way for a full watch interval, so [`super::LapseWatch::exempt`] excludes it
+    /// and its later reap indicts nothing.
+    ///
+    /// Every test that leans on a peer being exempt asserts this rather than assuming
+    /// it: the exemption is a *timing* property (the detector reached its verdict before
+    /// the lease expired), and a test whose timing slipped would otherwise pass for a
+    /// reason it never meant to check.
+    fn assert_exempt(group: &Group, peer: &NodeId) {
+        let (status, for_how_long) = group
+            .status_held_for(peer)
+            .expect("the peer is still a member, tombstone and all");
+        assert_ne!(
+            status,
+            Status::Alive,
+            "the detector's verdict landed before the lease even expired"
+        );
+        assert!(
+            for_how_long >= lapse_poll(TEST_LEASE),
+            "and had been standing for a full watch interval ({for_how_long:?})"
+        );
     }
 
     async fn eventually(mut cond: impl FnMut() -> bool, what: &str) {
@@ -2414,11 +3096,14 @@ mod tests {
     /// peer all look like from A. A's confirmation freezes on B's silence, its lease
     /// lapses, and the lapse **latches**: the apply loop will never hear about it, so
     /// without a watcher A serves every read from the origin for the rest of its life.
-    /// With one, the lapse gets the gap's remediation — flush, origin re-LIST, affirm —
-    /// and A is back in service the moment membership reaps B and its lease can be
-    /// confirmed again.
+    ///
+    /// With one, the staged recovery runs — and what this test pins is everything it
+    /// does *not* do. B was already down when the lapse landed, so no live peer
+    /// vanished; nothing was written that A did not apply; the barrier proves the cache
+    /// untouched. The body survives with its proof intact and is served straight back
+    /// the moment the reap frees A's confirmation: no flush, no re-LIST, no distrust.
     #[tokio::test]
-    async fn a_lapse_with_no_gap_is_remediated_and_the_reader_recovers() {
+    async fn a_lapse_with_no_gap_keeps_the_cache_and_the_reader_recovers() {
         let net = Network::new();
         let (a_id, _a_node, a_group) = spawn_node(&net, "lapse-watch-a", "lapse-watch-b");
         let (b_id, _b_node, b_group, b_alive) =
@@ -2432,11 +3117,10 @@ mod tests {
         // warm-up window, and the boot affirmation.
         sync_a.affirm_resynced(sync_a.resync_gen()).await;
         assert!(sync_a.may_serve_local(), "A takes its serve-lease");
-        // A body copy, so the flush half of the remediation is observed rather than
-        // inferred from the licence coming back.
-        let key = ("bkt".to_owned(), "obj".to_owned());
-        cache.insert(key.clone(), cached(b"stale")).await;
-        assert!(cache.get(&key).await.is_some());
+        // A body copy, proved current — so what the recovery leaves behind is observed
+        // rather than inferred from the licence coming back.
+        fill(&cache, "obj", b"body").await;
+        assert_eq!(held(&cache, "obj").await, Some(true));
 
         b_alive.store(false, Ordering::Relaxed); // B dies. No gap, no event, no warning.
 
@@ -2451,13 +3135,14 @@ mod tests {
         );
 
         eventually(
-            || resyncs.load(Ordering::Relaxed) == 1,
-            "the watcher to run the gap remediation for the lapse",
+            || counter(&metrics, "lapse_barrier_retains") == 1,
+            "the staged recovery to prove the cache and keep it",
         )
         .await;
-        assert!(
-            cache.get(&key).await.is_none(),
-            "the remediation flushed every local copy, exactly as a gap would"
+        assert_eq!(
+            held(&cache, "obj").await,
+            Some(true),
+            "the body is still here AND still proved — served with no index lookup at all"
         );
         eventually(
             || sync_a.may_serve_local(),
@@ -2465,20 +3150,610 @@ mod tests {
         )
         .await;
 
-        let text = metrics.prometheus_text();
-        assert!(
-            text.contains("\ns3cache_lease_lapse_resyncs 1\n"),
-            "the read-side lapse is counted where an operator looks for it"
+        assert_eq!(
+            counter(&metrics, "lease_lapse_resyncs"),
+            0,
+            "the expensive arm never ran"
         );
-        assert!(
-            text.contains("\ns3cache_feed_gaps 0\n"),
+        assert_eq!(counter(&metrics, "lapse_barrier_fallbacks"), 0);
+        assert_eq!(
+            counter(&metrics, "feed_gaps"),
+            0,
             "and no write-feed gap was involved in any of it"
         );
         assert_eq!(
             resyncs.load(Ordering::Relaxed),
-            1,
-            "one lapse, one remediation — the watcher does not re-run while it waits"
+            0,
+            "nothing was re-LISTed from the origin: there was nothing to re-learn"
         );
+    }
+
+    /// The barrier is not just proving a quiet cluster quiet: a **live writer** writes
+    /// straight through the recovery.
+    ///
+    /// C stops granting, so A's lease lapses; B is healthy throughout and writes `k1`
+    /// during the lapse. The apply loop never stopped, so that invalidation lands as an
+    /// ordinary peer write — and the barrier is what turns the *ordering* into a
+    /// guarantee, because A does not serve again until B's advertised head has been
+    /// applied. The key B wrote is gone; the key it did not touch is still proved.
+    #[tokio::test]
+    async fn a_lapse_beside_a_live_writer_evicts_only_what_it_wrote() {
+        let net = Network::new();
+        let (a_id, _a_node, a_group) = spawn_node(&net, "live-a", "live-b");
+        let (b_id, _b_node, b_group) = spawn_node(&net, "live-b", "live-a");
+        let (c_id, _c_node, c_group, c_alive) = spawn_killable(&net, "live-c", "live-a");
+        let metrics = Arc::new(Metrics::default());
+        let (sync_a, cache, resyncs) = leased_reader(a_group, a_id, &metrics);
+        let sync_b = attach(b_group, b_id.clone(), Consistency::Strong);
+        let _sync_c = attach(c_group, c_id.clone(), Consistency::Strong);
+        let state = start_watching(&sync_a, &cache, &resyncs, &metrics);
+
+        // Both peers must be in A's granter roster *before* A affirms: one joining
+        // afterwards would freeze the confirmation until its first grant arrived, which
+        // is a lapse of its own and not the one under test.
+        eventually(
+            || sync_a.lease_holders().len() == 2,
+            "A to adopt both peers' serve-leases",
+        )
+        .await;
+        sync_a.affirm_resynced(sync_a.resync_gen()).await;
+        assert!(sync_a.may_serve_local(), "A takes its serve-lease");
+        assert_eq!(
+            sync_a.lease_lapses(),
+            0,
+            "and holds it over a converged roster"
+        );
+        fill(&cache, "k1", b"stale").await;
+        fill(&cache, "k2", b"untouched").await;
+
+        c_alive.store(false, Ordering::Relaxed);
+        eventually(
+            || sync_a.lease_lapses() == 1,
+            "A's lease to lapse on C's silence",
+        )
+        .await;
+
+        // A lapse-era write, from the peer that never stopped being healthy.
+        sync_b
+            .publish_put("bkt", "k1", &written(1), &Metrics::default())
+            .await;
+
+        eventually(
+            || counter(&metrics, "lapse_barrier_retains") == 1,
+            "the staged recovery to barrier on the live writer's head and keep the rest",
+        )
+        .await;
+        assert_eq!(
+            indexed_size(&state, "bkt", "k1"),
+            Some(1),
+            "B's lapse-era write was applied, not merely waited on"
+        );
+        assert_eq!(
+            held(&cache, "k1").await,
+            None,
+            "so the stale body went with it — the apply loop evicted exactly that key"
+        );
+        assert_eq!(
+            held(&cache, "k2").await,
+            Some(true),
+            "and every key the writer did not touch kept its proof"
+        );
+        assert_eq!(counter(&metrics, "lapse_barrier_fallbacks"), 0);
+        assert_eq!(counter(&metrics, "lease_lapse_resyncs"), 0);
+        assert_eq!(
+            resyncs.load(Ordering::Relaxed),
+            0,
+            "a live peer is exactly the case the cheap arm is for"
+        );
+    }
+
+    /// **The headline shape**: a partition that heals.
+    ///
+    /// A is cut off both ways — it hears nothing and is heard by nobody — so its
+    /// confirmation freezes and its lease lapses, while B writes `k1` on the other side.
+    /// The ring covers one write, so the heal produces no gap: this is a lapse and
+    /// nothing else, which is precisely the case that used to cost A its whole cache.
+    ///
+    /// After the heal the staged recovery waits for the confirmation to move, settles,
+    /// finds nobody vanished, and barriers on B's advertised head. That barrier is what
+    /// makes the answer safe: `k1`'s stale body is gone because the write it barriered
+    /// on evicted it, and `k2` — which nothing wrote — is still there and still proved.
+    #[tokio::test]
+    async fn a_healed_partition_evicts_what_changed_and_keeps_what_did_not() {
+        let net = Network::new();
+        let (a_id, _a_node, a_group, a_plugged) = spawn_killable(&net, "part-a", "part-b");
+        let (b_id, _b_node, b_group) = spawn_node(&net, "part-b", "part-a");
+        let metrics = Arc::new(Metrics::default());
+        let (sync_a, cache, resyncs) = leased_reader(a_group, a_id, &metrics);
+        let sync_b = attach(b_group, b_id.clone(), Consistency::Strong);
+        let state = start_watching(&sync_a, &cache, &resyncs, &metrics);
+
+        sync_a.affirm_resynced(sync_a.resync_gen()).await;
+        assert!(sync_a.may_serve_local(), "A takes its serve-lease");
+        fill(&cache, "k1", b"stale").await;
+        fill(&cache, "k2", b"untouched").await;
+
+        a_plugged.store(false, Ordering::Relaxed); // the partition
+        sync_b
+            .publish_put("bkt", "k1", &written(1), &Metrics::default())
+            .await;
+        eventually(
+            || sync_a.lease_lapses() == 1,
+            "A's lease to lapse behind the partition",
+        )
+        .await;
+        assert!(!sync_a.may_serve_local());
+        a_plugged.store(true, Ordering::Relaxed); // the heal
+
+        eventually(
+            || counter(&metrics, "lapse_barrier_retains") == 1,
+            "the staged recovery to complete on the far side of the heal",
+        )
+        .await;
+        assert_eq!(
+            counter(&metrics, "feed_gaps"),
+            0,
+            "the ring covered the partition, so this is a lapse and not a gap"
+        );
+        assert_eq!(
+            indexed_size(&state, "bkt", "k1"),
+            Some(1),
+            "B's partition-era write was applied before the licence came back"
+        );
+        assert_eq!(held(&cache, "k1").await, None, "so its stale body is gone");
+        assert_eq!(
+            held(&cache, "k2").await,
+            Some(true),
+            "and the key the partition did not touch survived, proof and all"
+        );
+        assert_eq!(counter(&metrics, "lapse_barrier_fallbacks"), 0);
+        assert_eq!(
+            resyncs.load(Ordering::Relaxed),
+            0,
+            "no origin re-LIST: the barrier proved what a flush would have thrown away"
+        );
+    }
+
+    /// A gap that lands **inside** the staged recovery supersedes it, and the two do not
+    /// each buy a remediation.
+    ///
+    /// B's lease shell dies while its process does not, which freezes A's confirmation
+    /// on a granter that is neither publishing nor reapable — so A's lease lapses and
+    /// the recovery parks in stage 1 with nothing to wait for. Then B's feed comes back
+    /// at a fresh epoch, which is exactly what a writer restart looks like to a
+    /// subscriber: a real [`PeerWrite::Gap`]. The gap's remediation is strictly stronger
+    /// than anything the recovery was about to conclude, so the recovery yields on the
+    /// generation check rather than racing it — and is counted as neither a retain nor a
+    /// fallback, because it concluded nothing.
+    #[tokio::test]
+    async fn a_gap_during_the_recovery_supersedes_it_and_remediates_once() {
+        let net = Network::new();
+        let (a_id, _a_node, a_group) = spawn_node(&net, "super-a", "super-b");
+        let (b_id, _b_node, b_group) = spawn_node(&net, "super-b", "super-a");
+        let metrics = Arc::new(Metrics::default());
+        let (sync_a, cache, resyncs) = leased_reader(a_group, a_id, &metrics);
+        let sync_b = attach(b_group.clone(), b_id.clone(), Consistency::Strong);
+        let state = start_watching(&sync_a, &cache, &resyncs, &metrics);
+
+        sync_a.affirm_resynced(sync_a.resync_gen()).await;
+        eventually(
+            || sync_a.lease_holders() == [b_id.clone()],
+            "A to adopt B's serve-lease",
+        )
+        .await;
+        assert!(sync_a.may_serve_local(), "A takes its serve-lease");
+        fill(&cache, "k1", b"body").await;
+
+        // B's first feed life, so A holds a cursor an epoch bump can invalidate.
+        raw_feed(&b_group, 1).publish(&put_event("seed")).await;
+        eventually(
+            || indexed_size(&state, "bkt", "seed") == Some(1),
+            "A to apply B's first-life write",
+        )
+        .await;
+
+        drop(sync_b); // B stops granting; B's process keeps gossiping.
+        eventually(
+            || sync_a.lease_lapses() == 1,
+            "A's lease to lapse on B's frozen grants",
+        )
+        .await;
+        // Give the watch its stage-0 look, so the gap lands *inside* the recovery rather
+        // than before it — the other order is the interlock test below.
+        tokio::time::sleep(lapse_poll(TEST_LEASE) * 3).await;
+        let staged = sync_a.resync_gen();
+        assert_eq!(
+            staged, 1,
+            "the recovery stood the licence down and owns one generation"
+        );
+
+        // The gap. A different key, so the body under test is left for the remediation
+        // to speak about rather than evicted by the write that triggered it.
+        raw_feed(&b_group, 2).publish(&put_event("restarted")).await;
+
+        eventually(
+            || counter(&metrics, "feed_gaps") == 1,
+            "the apply loop to see the fresh epoch as a gap",
+        )
+        .await;
+        eventually(
+            || resyncs.load(Ordering::Relaxed) == 1,
+            "the gap's remediation to run",
+        )
+        .await;
+        // Comfortably more than one stage-1 poll: long enough for the recovery to reach
+        // its next generation check and yield.
+        tokio::time::sleep(AFFIRM_POLL * 8).await;
+
+        assert_eq!(
+            sync_a.resync_gen(),
+            staged + 1,
+            "the gap started one generation of its own, and the recovery started none"
+        );
+        assert_eq!(
+            resyncs.load(Ordering::Relaxed),
+            1,
+            "one remediation for the two triggers, not two"
+        );
+        assert_eq!(
+            held(&cache, "k1").await,
+            Some(false),
+            "the gap kept every body and distrusted it: present in the tier, refused until \
+             the re-LISTed index proves it"
+        );
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_retains"),
+            0,
+            "the superseded recovery concluded nothing"
+        );
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_fallbacks"),
+            0,
+            "and yielded rather than falling back, so it is counted as neither"
+        );
+        assert_eq!(counter(&metrics, "lease_lapse_resyncs"), 0);
+    }
+
+    /// **The crux.** A peer that was `Alive` when the lapse landed and is *gone* by the
+    /// time the barrier runs took its feed frame with it — so there is no head to sample
+    /// and no way to tell whether it wrote. The cheap arm is refused.
+    ///
+    /// B's lease shell dies while its process stays up, which freezes A's confirmation
+    /// on a granter A still sees as perfectly `Alive` — that is what puts B in the
+    /// recovery's accounting instead of its exemption list. Only then does B really die,
+    /// having published a write A can never receive; membership reaps it, and with it
+    /// every trace of that write. The recovery finds a peer it cannot account for and
+    /// falls back to the full remediation, which is exactly the right answer: A's copy
+    /// of `k1` is stale, and only the re-LISTed index can say so.
+    #[tokio::test]
+    async fn a_peer_that_vanishes_between_the_lapse_and_the_barrier_forces_the_fallback() {
+        let net = Network::new();
+        let (a_id, _a_node, a_group) = spawn_node(&net, "crux-a", "crux-b");
+        let (b_id, _b_node, b_group, b_alive) = spawn_killable(&net, "crux-b", "crux-a");
+        let metrics = Arc::new(Metrics::default());
+        let (sync_a, cache, resyncs) = leased_reader(a_group.clone(), a_id, &metrics);
+        let sync_b = attach(b_group.clone(), b_id.clone(), Consistency::Strong);
+        let _state = start_watching(&sync_a, &cache, &resyncs, &metrics);
+
+        sync_a.affirm_resynced(sync_a.resync_gen()).await;
+        eventually(
+            || sync_a.lease_holders() == [b_id.clone()],
+            "A to adopt B's serve-lease",
+        )
+        .await;
+        assert!(sync_a.may_serve_local(), "A takes its serve-lease");
+        fill(&cache, "k1", b"stale").await;
+
+        drop(sync_b); // B stops granting; B's process keeps gossiping.
+        eventually(
+            || sync_a.lease_lapses() == 1,
+            "A's lease to lapse on B's frozen grants",
+        )
+        .await;
+        assert_eq!(
+            a_group.member_status(&b_id),
+            Some(Status::Alive),
+            "B is ALIVE when the lapse lands, so nothing exempts it from the accounting"
+        );
+        // Let the recovery take its stage-0 snapshot while B is still live.
+        tokio::time::sleep(lapse_poll(TEST_LEASE) * 3).await;
+
+        // Now B really dies — having published a write A can never receive.
+        b_alive.store(false, Ordering::Relaxed);
+        raw_feed(&b_group, 1).publish(&put_event("k1")).await;
+
+        eventually(
+            || counter(&metrics, "lapse_barrier_fallbacks") == 1,
+            "the vanished-peer check to refuse the cheap arm",
+        )
+        .await;
+        assert!(
+            !a_group.statuses().iter().any(|(peer, _)| *peer == b_id),
+            "B is gone from membership: reaped, feed frame and all"
+        );
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_retains"),
+            0,
+            "nothing was ever proved"
+        );
+        assert_eq!(
+            counter(&metrics, "lease_lapse_resyncs"),
+            1,
+            "the fallback IS the full remediation, and is counted as one"
+        );
+        assert_eq!(
+            resyncs.load(Ordering::Relaxed),
+            1,
+            "which re-LISTs the index exactly once"
+        );
+        assert_eq!(
+            counter(&metrics, "feed_gaps"),
+            0,
+            "and none of it arrived as a gap"
+        );
+        assert_eq!(
+            held(&cache, "k1").await,
+            Some(false),
+            "the body A could not account for is held and no longer proved — refused until \
+             the re-LISTed index says otherwise"
+        );
+        eventually(
+            || sync_a.may_serve_local(),
+            "A back in service once the reap frees its confirmation",
+        )
+        .await;
+        assert_eq!(
+            held(&cache, "k1").await,
+            Some(false),
+            "and it stays suspect after the licence returns: the licence is not the proof"
+        );
+    }
+
+    /// **The second hinge**, and the one a roster-wide min cannot see.
+    ///
+    /// Three nodes, so A's confirmation is a min over *two* granters. C dies first, which
+    /// freezes its grant and leaves B — still granting for a moment longer — strictly
+    /// above it. Then B's lease shell dies while B's process keeps gossiping, so B is a
+    /// granter that is `Alive`, in the roster, and frozen. A's lease lapses on the two of
+    /// them.
+    ///
+    /// What happens next is the test. Membership reaps C, and the **min moves** — up to
+    /// B's frozen grant — with nobody having re-granted anything. "The confirmation
+    /// advanced" is exactly the proof stage 1 used to rest on, and here it is false:
+    /// nothing else objects either, because C is exempt (down since before the lapse), B
+    /// is present, and a granter that has published no writes has no advertised head to
+    /// barrier on. The old stage 1 walked through all of that into a retain it had not
+    /// earned — while B, for all this node can tell, spent the lapse completing writes
+    /// against A's expired lease.
+    ///
+    /// Stage 1 now reads each granter's grant on its own, so it is still waiting on B
+    /// when B finally dies too; B's reap takes it out of the roster and hands it to stage
+    /// 3, which refuses the cheap arm for a peer that was live at the lapse and gone
+    /// before the affirmation.
+    ///
+    /// The discriminating assertion is the **negative** one in the middle: put stage 1
+    /// back on the min and `lapse_barrier_retains` is already 1 there.
+    #[tokio::test]
+    async fn a_granter_frozen_behind_a_reaped_min_holder_refuses_the_cheap_arm() {
+        let net = Network::new();
+        let (a_id, _a_node, a_group) = spawn_node(&net, "hinge-a", "hinge-b");
+        let (b_id, _b_node, b_group, b_alive) = spawn_killable(&net, "hinge-b", "hinge-a");
+        let (c_id, _c_node, c_group, c_alive) = spawn_killable(&net, "hinge-c", "hinge-a");
+        let metrics = Arc::new(Metrics::default());
+        let (sync_a, cache, resyncs) = leased_reader(a_group.clone(), a_id, &metrics);
+        let sync_b = attach(b_group.clone(), b_id.clone(), Consistency::Strong);
+        let _sync_c = attach(c_group, c_id.clone(), Consistency::Strong);
+        let _state = start_watching(&sync_a, &cache, &resyncs, &metrics);
+
+        // Two granters, both actually granting, before A affirms: a min over one is the
+        // shape this test exists to *not* be.
+        eventually(
+            || sync_a.lease_granted_by(&b_id).is_some() && sync_a.lease_granted_by(&c_id).is_some(),
+            "both peers to publish a grant of A's serve-lease",
+        )
+        .await;
+        sync_a.affirm_resynced(sync_a.resync_gen()).await;
+        assert!(sync_a.may_serve_local(), "A takes its serve-lease");
+        fill(&cache, "k1", b"stale").await;
+
+        // C dies: from here it is the min-holder, frozen at whatever it last adopted.
+        c_alive.store(false, Ordering::Relaxed);
+        eventually(
+            || sync_a.lease_granted_by(&b_id) > sync_a.lease_granted_by(&c_id),
+            "B's grant to outrun the dead C's — C pins the min, B sits above it",
+        )
+        .await;
+        assert_eq!(
+            sync_a.lease_lapses(),
+            0,
+            "B has to freeze before the lapse, so the recovery snapshots it already frozen"
+        );
+        drop(sync_b); // B stops granting; B's process keeps gossiping.
+
+        eventually(
+            || sync_a.lease_lapses() == 1,
+            "A's lease to lapse on two frozen granters",
+        )
+        .await;
+        // C's exemption is the precondition for the negative assertion below: an
+        // unexempt C would have its own reap refuse the cheap arm, and the test would
+        // prove nothing about the min.
+        assert_exempt(&a_group, &c_id);
+        // Past the watch's first look, so the recovery has taken its stage-0 snapshot and
+        // B's last in-flight grant map has landed. Nothing moves B's grant after this.
+        tokio::time::sleep(lapse_poll(TEST_LEASE) * 2).await;
+        let frozen = sync_a.lease_granted_by(&b_id);
+        assert!(
+            frozen.is_some(),
+            "B's grant is still standing in A's view — frozen, not gone"
+        );
+
+        eventually(
+            || !a_group.statuses().iter().any(|(peer, _)| *peer == c_id),
+            "membership to reap C — the event that moves the roster-wide min",
+        )
+        .await;
+        // Everything a min-based stage 1 waits for has now happened. Give a recovery
+        // resting on it every chance to settle, barrier on nothing, and conclude.
+        tokio::time::sleep(TEST_LEASE * 3).await;
+        assert_eq!(
+            sync_a.lease_granted_by(&b_id),
+            frozen,
+            "B never re-granted: the min moved because C left, not because B spoke"
+        );
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_retains"),
+            0,
+            "and a min that moved for a reap is not proof that every granter re-granted"
+        );
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_fallbacks"),
+            0,
+            "the recovery has concluded nothing either way — it is still waiting on B"
+        );
+        assert_eq!(resyncs.load(Ordering::Relaxed), 0);
+
+        // B goes too. Its grant never moved, so stage 1 is still on it, and the reap is
+        // what finally answers — by taking B out of the roster and handing it to stage 3.
+        b_alive.store(false, Ordering::Relaxed);
+        eventually(
+            || counter(&metrics, "lapse_barrier_fallbacks") == 1,
+            "the frozen granter's own reap to refuse the cheap arm",
+        )
+        .await;
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_retains"),
+            0,
+            "nothing was ever proved"
+        );
+        assert_eq!(
+            counter(&metrics, "lease_lapse_resyncs"),
+            1,
+            "the fallback IS the full remediation, and is counted as one"
+        );
+        assert_eq!(
+            resyncs.load(Ordering::Relaxed),
+            1,
+            "which re-LISTs the index exactly once"
+        );
+        assert_eq!(
+            counter(&metrics, "feed_gaps"),
+            0,
+            "and none of it arrived as a gap"
+        );
+        assert_eq!(
+            held(&cache, "k1").await,
+            Some(false),
+            "the body A could not account for is held and no longer proved"
+        );
+    }
+
+    /// **The barrier itself**, isolated: a peer whose advertised head this node can
+    /// never apply is a proof that never arrives, and the recovery must fall back rather
+    /// than wait forever or assume.
+    ///
+    /// B publishes an envelope A's decoder rejects while A is partitioned. The apply
+    /// loop steps its cursor past it — no event, no watermark — so B's head is
+    /// advertised and permanently unreachable. Nothing else in the recovery objects: the
+    /// confirmation moves on the heal, the settle passes, nobody vanished. Only stage 4
+    /// can catch this, and what it does about it is the fallback.
+    ///
+    /// This is also the test that *discriminates* the barrier: with stage 4 removed
+    /// every other lapse test still passes (the writes had already applied by the time
+    /// they looked), and this one retains a cache it never proved.
+    #[tokio::test]
+    async fn a_head_this_node_can_never_apply_times_the_barrier_out_into_the_fallback() {
+        let net = Network::new();
+        let (a_id, _a_node, a_group, a_plugged) = spawn_killable(&net, "unreach-a", "unreach-b");
+        let (b_id, _b_node, b_group) = spawn_node(&net, "unreach-b", "unreach-a");
+        let metrics = Arc::new(Metrics::default());
+        let (sync_a, cache, resyncs) = leased_reader(a_group, a_id, &metrics);
+        let _sync_b = attach(b_group.clone(), b_id.clone(), Consistency::Strong);
+        let _state = start_watching(&sync_a, &cache, &resyncs, &metrics);
+
+        sync_a.affirm_resynced(sync_a.resync_gen()).await;
+        assert!(sync_a.may_serve_local(), "A takes its serve-lease");
+        fill(&cache, "k1", b"stale").await;
+
+        a_plugged.store(false, Ordering::Relaxed); // the partition
+        undecodable_feed(&b_group).publish(&put_event("k1")).await;
+        eventually(
+            || sync_a.lease_lapses() == 1,
+            "A's lease to lapse behind the partition",
+        )
+        .await;
+        a_plugged.store(true, Ordering::Relaxed); // the heal
+
+        eventually(
+            || counter(&metrics, "lapse_barrier_fallbacks") == 1,
+            "the barrier to run out of time on a head it cannot reach",
+        )
+        .await;
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_retains"),
+            0,
+            "an unreachable head is never a proof"
+        );
+        assert_eq!(counter(&metrics, "lease_lapse_resyncs"), 1);
+        assert_eq!(resyncs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counter(&metrics, "feed_applied"),
+            0,
+            "nothing was applied — that is precisely why the head stayed out of reach"
+        );
+        assert_eq!(
+            held(&cache, "k1").await,
+            Some(false),
+            "so the body is held and distrusted, not served on an unproved licence"
+        );
+    }
+
+    /// The other side of the crux: a peer that was **already** down before the lapse is
+    /// exempt, and its reap mid-recovery indicts nothing.
+    ///
+    /// This is the same reap that forces the fallback above, arriving on a peer the
+    /// recovery never counted — so the barrier path proceeds and the cache survives. Its
+    /// precondition is asserted rather than assumed: the failure detector had reached
+    /// its verdict a full watch interval before the lease expired.
+    #[tokio::test]
+    async fn a_peer_down_since_before_the_lapse_is_exempt_from_the_vanished_check() {
+        let net = Network::new();
+        let (a_id, _a_node, a_group) = spawn_node(&net, "exempt-a", "exempt-b");
+        let (b_id, _b_node, b_group, b_alive) = spawn_killable(&net, "exempt-b", "exempt-a");
+        let metrics = Arc::new(Metrics::default());
+        let (sync_a, cache, resyncs) = leased_reader(a_group.clone(), a_id, &metrics);
+        let _sync_b = attach(b_group, b_id.clone(), Consistency::Strong);
+        let _state = start_watching(&sync_a, &cache, &resyncs, &metrics);
+
+        sync_a.affirm_resynced(sync_a.resync_gen()).await;
+        assert!(sync_a.may_serve_local(), "A takes its serve-lease");
+        fill(&cache, "k1", b"body").await;
+
+        b_alive.store(false, Ordering::Relaxed);
+        eventually(
+            || sync_a.lease_lapses() == 1,
+            "A's lease to lapse on B's silence",
+        )
+        .await;
+        assert_exempt(&a_group, &b_id);
+
+        eventually(
+            || counter(&metrics, "lapse_barrier_retains") == 1,
+            "the barrier path to proceed despite the reap",
+        )
+        .await;
+        assert!(
+            !a_group.statuses().iter().any(|(peer, _)| *peer == b_id),
+            "B was reaped during the recovery — the exact event that indicts a live peer"
+        );
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_fallbacks"),
+            0,
+            "an exempt peer's reap indicts nothing"
+        );
+        assert_eq!(counter(&metrics, "lease_lapse_resyncs"), 0);
+        assert_eq!(resyncs.load(Ordering::Relaxed), 0);
+        assert_eq!(held(&cache, "k1").await, Some(true));
     }
 
     /// The interlock: a lapse a gap has **already** stood the lease down for buys one
@@ -2489,12 +3764,12 @@ mod tests {
     /// than sampled: the apply loop (and with it the watcher) starts after the gap's
     /// stand-down, so the watcher's first look is guaranteed to be the one that must
     /// yield. It yields because [`super::ResyncGate::require_resync`] recorded the lapse
-    /// count it covers, and the flush and origin re-LIST that follow a stand-down cover
-    /// every lapse observed before it. Without that watermark the watcher would flush and
-    /// re-LIST a second time, on top of a resync already in flight.
+    /// count it covers, and the distrust and origin re-LIST that follow a stand-down
+    /// cover every lapse observed before it. Without that watermark the watcher would
+    /// distrust and re-LIST a second time, on top of a resync already in flight.
     ///
     /// The reverse order is deliberately *not* deduplicated: a gap that lands after the
-    /// watcher remediated is independent proof of missed writes and is entitled to its
+    /// watcher recovered is independent proof of missed writes and is entitled to its
     /// own resync.
     #[tokio::test]
     async fn a_lapse_a_gap_already_owns_is_not_remediated_twice() {
@@ -2537,12 +3812,17 @@ mod tests {
             generation + 1,
             "and it started no generation of its own to affirm against"
         );
-        assert!(
-            metrics
-                .prometheus_text()
-                .contains("\ns3cache_lease_lapse_resyncs 0\n"),
+        assert_eq!(
+            counter(&metrics, "lease_lapse_resyncs"),
+            0,
             "a lapse remediated by the gap is not also counted as the watcher's"
         );
+        assert_eq!(
+            counter(&metrics, "lapse_barrier_retains"),
+            0,
+            "and the watcher concluded nothing about the cache either way"
+        );
+        assert_eq!(counter(&metrics, "lapse_barrier_fallbacks"), 0);
     }
 
     /// The modes that hold no lease answer the licence questions the way they always

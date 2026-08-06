@@ -12,6 +12,11 @@ seen by the other:
   3. DELETE via A -> B's LIST loses the key
   4. reverse direction: PUT via B -> A's LIST shows it
 
+Step 2's premise — that B really had the body cached — is not visible from the S3 API, so
+B runs with the Prometheus endpoint on and the priming is asserted there: a fill, then a
+hit. Without that the step passes for any node that simply forwards every read, which is
+exactly what a checksum-mode GET makes every boto3 read into (see `_s3cache_e2e`).
+
 The main checks use PLAIN clients — no tokens, no headers: in the default strong
 mode a write returns only after every peer applied its invalidation, so the no-poll
 assertions are guaranteed for clients that don't know s3cache exists. The forged-token
@@ -28,6 +33,8 @@ import _s3cache_e2e as h
 
 BUCKET = "coherence-test"
 PORT_A, PORT_B = 18031, 18032
+# B's Prometheus endpoint: the only witness to which path answered a read.
+METRICS_B = 18035
 
 # The most recent write's session token; tokenized clients echo it on reads.
 TOKEN = {"v": None}
@@ -59,10 +66,12 @@ def main():
     node_a = h.start_node("nodeA", PORT_A, BUCKET, gossip_port=19031,
                           seeds="nodeB=127.0.0.1:19032")
     node_b = h.start_node("nodeB", PORT_B, BUCKET, gossip_port=19032,
-                          seeds="nodeA=127.0.0.1:19031")
+                          seeds="nodeA=127.0.0.1:19031",
+                          extra={"S3CACHE_METRICS_LISTEN": f"127.0.0.1:{METRICS_B}"})
     failures = []
     try:
         assert h.wait_port(PORT_A) and h.wait_port(PORT_B), "nodes did not bind"
+        assert h.wait_port(METRICS_B), "B's metrics endpoint did not bind"
         time.sleep(1.5)  # let each node's (empty-bucket) index sync complete
         a, b = h.s3(f"http://127.0.0.1:{PORT_A}"), h.s3(f"http://127.0.0.1:{PORT_B}")
 
@@ -79,7 +88,20 @@ def main():
               bool(resp["ResponseMetadata"]["HTTPHeaders"].get("x-s3cache-write-token")))
         check("PUT via A -> LIST via B sees k1 (strong: write-ack, no poll)", "k1" in keys(b))
 
+        # The priming, and the proof it primed: the first read must fill B's cache (a
+        # miss, not a bypass) and the second must be served out of it. A read routed
+        # origin-only — which is what boto3's default checksum mode makes every GET —
+        # would pass the invalidation check below without B ever having held a copy.
+        before = h.counters(METRICS_B)
         check("GET via B returns v1", body(b, "k1") == b"v1")  # primes B's hot copy
+        filled = h.counters(METRICS_B)
+        check("GET via B was cache-eligible and filled B's copy (step 2's whole premise)",
+              filled["get_miss"] == before["get_miss"] + 1
+              and filled["get_bypass"] == before["get_bypass"])
+        check("GET via B again is served from B's cache", body(b, "k1") == b"v1")
+        check("...and is counted as a hit, so B really holds the body",
+              h.counters(METRICS_B)["get_hit"] == filled["get_hit"] + 1)
+
         a.put_object(Bucket=BUCKET, Key="k1", Body=b"v2-overwritten")
         check("overwrite via A -> GET via B returns v2 (strong: write-ack, no stale hot)",
               body(b, "k1") == b"v2-overwritten")

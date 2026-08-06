@@ -2,16 +2,29 @@
 
 Config from env, boto3 S3 clients, and launching real s3cache nodes in front of a
 shared MinIO (the S3 origin), coherent over the gossip write feed. Imported by
-coherence_e2e.py and parity_e2e.py.
+coherence_e2e.py, parity_e2e.py and resilience_e2e.py.
 """
 import os
-import socket
-import subprocess
-import time
 
-import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
+# botocore >= 1.36 asks for response checksum validation on every GetObject
+# (`x-amz-checksum-mode: ENABLED`), and s3cache sends a checksum-mode GET straight to the
+# origin on purpose — the checksum is the origin's to compute, and a locally served answer
+# would have to invent one. Correct, and it also means such a read never touches the body
+# cache: with the botocore default, NO boto3 read in any of these tests is cache-eligible,
+# so every claim about caching (a hit, a fill, a peer's copy going stale) passes for the
+# wrong reason. It belongs here, in the one module every test imports before it builds a
+# client, rather than in whichever test last noticed. Older botocore has no such default
+# and ignores it.
+os.environ.setdefault("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
+
+import socket  # noqa: E402  (the line above has to run before boto3 builds a client)
+import subprocess  # noqa: E402
+import time  # noqa: E402
+import urllib.request  # noqa: E402
+
+import boto3  # noqa: E402
+from botocore.client import Config  # noqa: E402
+from botocore.exceptions import ClientError  # noqa: E402
 
 BIN = os.environ.get("S3CACHE_BIN", "target/release/s3cache")
 MINIO = os.environ.get("MINIO_ENDPOINT", "http://127.0.0.1:9000")
@@ -85,6 +98,22 @@ def reset_bucket(cli, bucket):
         cli.delete_object(Bucket=bucket, Key=o["Key"])
     for u in cli.list_multipart_uploads(Bucket=bucket).get("Uploads", []):
         cli.abort_multipart_upload(Bucket=bucket, Key=u["Key"], UploadId=u["UploadId"])
+
+
+def counters(port):
+    """One node's Prometheus counters as {name: int} (the `s3cache_` prefix stripped),
+    scraped the way Prometheus would. Needs `S3CACHE_METRICS_LISTEN` on that node.
+
+    Which cache path answered a read is invisible from the S3 API — a correct answer is
+    correct either way — so a test that asserts on caching at all has to ask here."""
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as resp:
+        text = resp.read().decode()
+    out = {}
+    for line in text.splitlines():
+        if line.startswith("s3cache_"):
+            name, _, value = line.partition(" ")
+            out[name[len("s3cache_"):]] = int(value)
+    return out
 
 
 def poll(fn, timeout=10):

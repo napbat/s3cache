@@ -8,11 +8,14 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::{
-    Origin, delete, get, gossip_pair, head, list, list_entry, proxy_over, put, put_conditional,
-    put_typed, wait_for_index,
+    Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, gossip_pair, head, list,
+    list_entry, proxy_over, put, put_conditional, put_typed, wait_for_index, warm_proxy_over,
 };
 use s3cache::cache::CachingProxy;
+use s3cache::metrics::Metrics;
 use s3s::S3ErrorCode;
 use s3s::dto::{ETag, ETagCondition};
 
@@ -221,6 +224,110 @@ async fn a_delete_on_a_removes_the_key_from_bs_index() {
         origin.ops.head(),
         heads,
         "the 404 came from B's index, not from the origin"
+    );
+}
+
+/// The **retention** claim, with the origin's counter as the witness: a node that comes
+/// back onto its persisted warm tier pays the origin only for what actually changed while
+/// it was gone.
+///
+/// A body off the disk tier is *suspect*, because the trust stamp is bookkeeping about a
+/// copy in a live cache and does not survive the encoding — a decoded copy carries
+/// generation `0`, which no live cache ever issues. Suspect is not stale, and that
+/// distinction is the whole of what this test is about: each copy proves itself against
+/// the LIST index this node re-read from the origin on the way up. `kept` proves itself —
+/// same `ETag`, an mtime the index has not moved past — and is served off disk for
+/// nothing.
+///
+/// `changed` is the other half, and it never gets that far: a subscriber that has never
+/// seen a peer starts at that peer's earliest still-visible write, so rejoining replays
+/// the overwrite out of the peer's ring and applying it evicts exactly that key. Had the
+/// write aged out of the ring — or had the peer restarted too — the index would have
+/// contradicted the copy on the read and dropped it there instead. Both routes are one
+/// origin GET, which is why the assertion is the counter and not the route.
+///
+/// One origin GET for the whole restart, then. A node that had thrown its tier away
+/// instead would have paid two, and the counter is what tells the two apart.
+///
+/// The previous life is staged as the directory it left behind rather than as a node that
+/// is shut down, because a node in this harness cannot be shut down: `start_coherence`
+/// spawns an apply loop holding the resync closure, which holds the [`WriteSync`], which
+/// owns the gossip node — so a dropped proxy keeps gossiping. The disk tier is all a
+/// restart inherits either way.
+#[tokio::test]
+async fn a_restart_onto_a_warm_tier_pays_only_for_what_changed() {
+    let origin = Origin::start("coherence-warm-restart").await;
+    let bucket = origin.bucket();
+    origin.seed("kept", b"never-touched").await;
+    origin.seed("changed", b"version-1").await;
+    let dir = WarmDir::new("warm-restart");
+
+    // The previous life: it fills its disk tier from the origin and goes away.
+    {
+        let metrics = Arc::new(Metrics::default());
+        let previous = warm_proxy_over(&origin.counted_client(), CAP, None, &dir, &metrics);
+        previous.spawn_background_sync(vec![bucket.to_owned()]);
+        wait_for_index(&previous, &origin, bucket).await;
+        let fetched = origin.ops.get();
+        assert_eq!(get(&previous, bucket, "kept").await, "never-touched");
+        assert_eq!(get(&previous, bucket, "changed").await, "version-1");
+        assert_eq!(
+            origin.ops.get(),
+            fetched + 2,
+            "the first life filled both bodies from the origin"
+        );
+        // The disk fill is offloaded to its own threads, so wait for it rather than
+        // assume it: with nothing on disk there is no retention left to prove.
+        eventually!("both bodies to reach the disk tier", dir.files() == 2);
+    }
+
+    // The peer, and the write the restarted node is going to miss: A is up, and nothing
+    // that could be invalidated is running when it overwrites `changed`.
+    let (port_a, port_b) = (free_udp_port(), free_udp_port());
+    let sync_a = gossip_node("warm-a", port_a, &[("warm-b", port_b)]).await;
+    let node_a = proxy_over(&origin.counted_client(), CAP, Some(sync_a));
+    node_a.start_coherence(&[bucket.to_owned()]);
+    node_a.spawn_background_sync(vec![bucket.to_owned()]);
+    wait_for_index(&node_a, &origin, bucket).await;
+    put_typed(&node_a, bucket, "changed", b"version-2", "text/x-fixture").await;
+
+    // The restart: the same disk, and nothing else the same — a cold hot tier, an empty
+    // index, and a peer that has been writing.
+    let metrics = Arc::new(Metrics::default());
+    let sync_b = gossip_node("warm-b", port_b, &[("warm-a", port_a)]).await;
+    let node_b = warm_proxy_over(&origin.counted_client(), CAP, Some(sync_b), &dir, &metrics);
+    node_b.start_coherence(&[bucket.to_owned()]);
+    node_b.spawn_background_sync(vec![bucket.to_owned()]);
+    wait_for_index(&node_b, &origin, bucket).await;
+    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+
+    let fetched = origin.ops.get();
+    assert_eq!(
+        get(&node_b, bucket, "kept").await,
+        "never-touched",
+        "the body outlived the process that cached it"
+    );
+    assert_eq!(
+        origin.ops.get(),
+        fetched,
+        "and the origin was never asked for it: the copy proved itself against the index"
+    );
+    assert_eq!(counter(&metrics, "warm_hit"), 1, "served off the disk tier");
+    assert_eq!(
+        counter(&metrics, "body_revalidations"),
+        1,
+        "and proved before it was served, not trusted for having survived"
+    );
+
+    assert_eq!(
+        get(&node_b, bucket, "changed").await,
+        "version-2",
+        "the copy this node kept is not what the peer left at the origin"
+    );
+    assert_eq!(
+        origin.ops.get(),
+        fetched + 1,
+        "exactly one refetch, for the one key that changed"
     );
 }
 

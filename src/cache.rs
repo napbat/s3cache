@@ -31,8 +31,8 @@ use tracing::info;
 
 use crate::index::{
     BucketState, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del, apply_put,
-    complete_entry, head_object_from_index, list_objects_v2_from_index, standard_class,
-    sync_bucket_into,
+    complete_entry, entry_matches_body, head_object_from_index, list_objects_v2_from_index,
+    standard_class, sync_bucket_into,
 };
 use crate::metrics::Metrics;
 use crate::sync::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync, wire_stamp};
@@ -376,8 +376,9 @@ impl CachingProxy {
 
     /// Start the gossip apply loop: peers' events fold into this node's LIST index and
     /// invalidate its body copies; a gap — or, in `strong`, a serve-lease lapse with no
-    /// gap behind it — flushes every local tier and resyncs `buckets` from the origin.
-    /// A no-op without gossip — single-node is already strict.
+    /// gap behind it whose staged recovery could not prove the cache — *distrusts* every
+    /// local body copy (nothing is dropped; each has to prove itself again) and resyncs
+    /// `buckets` from the origin. A no-op without gossip — single-node is already strict.
     pub fn start_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
         sync.start_apply(
@@ -393,8 +394,9 @@ impl CachingProxy {
     /// the origin — the authority the index caches.
     ///
     /// Both triggers in `sync` call this — a write-feed gap and a serve-lease lapse with
-    /// no gap behind it — and each has already stood the lease down and flushed the tiers
-    /// before it does.
+    /// no gap behind it — and each has already stood the lease down and *distrusted*
+    /// every cached body before it does: the copies are still there, and the index this
+    /// re-LISTs is what they now have to prove themselves against.
     ///
     /// It also **owns the affirmation** that puts this node back in service: only work
     /// that actually re-synchronized may lift a stand-down, so the generation is read
@@ -756,6 +758,9 @@ impl CachingProxy {
         };
         let cap = self.max_obj_bytes;
         let inner = &self.inner;
+        // Read before the fetch, not after it: a remediation that distrusts the cache
+        // while this round-trip is in flight must leave the copy it lands suspect.
+        let generation = self.obj_cache.suspect_gen();
         let origin = async move {
             let mut resp = inner.get_object(whole).await.map_err(|e| e.to_string())?;
             let declared = resp.output.content_length.unwrap_or(-1);
@@ -768,7 +773,9 @@ impl CachingProxy {
                     .ok_or_else(|| format!("oversize {declared} (body past declared length)"))?,
                 None => Bytes::new(),
             };
-            Ok::<_, String>(Arc::new(CachedObject::from_get(&resp.output, body)))
+            let obj = CachedObject::from_get(&resp.output, body);
+            obj.mark_trusted(generation);
+            Ok::<_, String>(Arc::new(obj))
         };
         // Box the promotion future: it carries a full cloned request + buffered body,
         // large enough that keeping it on the stack trips clippy's `large_futures`.
@@ -836,6 +843,73 @@ impl CachingProxy {
         self.sync.as_ref().is_none_or(|sync| sync.may_answer_404())
     }
 
+    /// A cached body this node is entitled to serve, or `None` — every read that answers
+    /// from a local copy goes through here.
+    ///
+    /// A hit is not by itself a licence. The warm tier outlives the process, so a body on
+    /// that disk may predate writes made while this node was down; a body in memory may
+    /// predate a remediation that distrusted the whole cache. So a copy is served only
+    /// once it is *proved*, and the proof is deliberately cheap in the case that is
+    /// almost every case:
+    ///
+    /// * **Single node** — no write feed, so this proxy is the sole writer and its own
+    ///   tiers cannot have missed anything, restart included. Served as-is, which is the
+    ///   warm tier's whole value proposition and what `tests/tier_cache.rs` asserts.
+    /// * **Already proved** — one relaxed load ([`CachedObject::trusted`]). The steady
+    ///   state, and it costs nothing.
+    /// * **Suspect, synced bucket** — the LIST index is this node's own re-read of the
+    ///   origin, so it can arbitrate: a matching `ETag` and an mtime it has not moved
+    ///   past ([`entry_matches_body`]) proves the copy, and the stamp puts the next read
+    ///   of it back on the fast path. Anything else — a different version, a comparison
+    ///   neither side carries, or a key the index no longer holds, which is precisely the
+    ///   DELETE this node missed — drops the copy and sends the read to the origin.
+    /// * **Suspect, unsynced bucket** — nothing to arbitrate with, so nothing is served
+    ///   and the copy is dropped. That is the same outcome a flush would have produced
+    ///   for this key, reached one key at a time instead of all at once.
+    ///
+    /// Both `None` arms invalidate **before** returning, which is what keeps the fill
+    /// that follows honest: [`TieredCache::get_or_fetch`] re-probes the tiers under its
+    /// singleflight gate, and without the eviction that probe would hand back the very
+    /// copy this call just refused. What the probe *can* still find is a body a
+    /// concurrent fill landed in between — fetched from the origin after this eviction,
+    /// so newer than what was dropped, and stamped current by that fill.
+    async fn validated_get(&self, ckey: &(String, String)) -> Option<Arc<CachedObject>> {
+        let obj = self.obj_cache.get(ckey).await?;
+        if self.sync.is_none() {
+            return Some(obj);
+        }
+        let generation = self.obj_cache.suspect_gen();
+        if obj.trusted(generation) {
+            return Some(obj);
+        }
+        // Scoped so the index guard is dropped before the awaits below. `None` is "this
+        // bucket cannot arbitrate", which is not the same answer as "it says no".
+        let proved = {
+            let g = self.state.read().unwrap();
+            g.get(ckey.0.as_str()).filter(|b| b.synced).map(|b| {
+                b.keys
+                    .get(ckey.1.as_str())
+                    .is_some_and(|entry| entry_matches_body(entry, &obj))
+            })
+        };
+        match proved {
+            Some(true) => {
+                obj.mark_trusted(generation);
+                self.metrics.body_revalidation();
+                Some(obj)
+            }
+            Some(false) => {
+                self.obj_cache.invalidate(ckey).await;
+                self.metrics.body_revalidation_eviction();
+                None
+            }
+            None => {
+                self.obj_cache.invalidate(ckey).await;
+                None
+            }
+        }
+    }
+
     /// The GET decision tree, with the per-request `response-*` overrides already lifted
     /// off `req`: every copy this serves or fills is of the object as the origin stores
     /// it, so one client's formatting is never handed to the next and the caller puts
@@ -875,7 +949,7 @@ impl CachingProxy {
         if let Some((first, last)) = int_range {
             // Cached whole object → serve the slice locally.
             if local_ok
-                && let Some(obj) = self.obj_cache.get(&ckey).await
+                && let Some(obj) = self.validated_get(&ckey).await
                 && let Some(out) = obj.to_get_range(first, last)
             {
                 self.metrics.range_hit();
@@ -901,11 +975,14 @@ impl CachingProxy {
         }
         if local_ok
             && cacheable
-            && let Some(obj) = self.obj_cache.get(&ckey).await
+            && let Some(obj) = self.validated_get(&ckey).await
         {
             self.metrics.get_hit();
             return Ok(S3Response::new(obj.to_get()));
         }
+        // Read before the fetch, not after it: a remediation that distrusts the cache
+        // while this round-trip is in flight must leave the copy it lands suspect.
+        let generation = self.obj_cache.suspect_gen();
         let mut resp = self.inner.get_object(req).await?;
         let len = resp.output.content_length.unwrap_or(-1);
         let small = len >= 0 && usize::try_from(len).unwrap_or(usize::MAX) <= self.max_obj_bytes;
@@ -915,12 +992,12 @@ impl CachingProxy {
         {
             match tier::buffer_body(body, self.max_obj_bytes).await {
                 Some(bytes) => {
-                    self.obj_cache
-                        .insert(
-                            ckey.clone(),
-                            Arc::new(CachedObject::from_get(&resp.output, bytes.clone())),
-                        )
-                        .await;
+                    // Stamped current as of *before* the fetch: these bytes are what the
+                    // origin held then, so nothing has to prove them again until the
+                    // generation moves on.
+                    let filled = CachedObject::from_get(&resp.output, bytes.clone());
+                    filled.mark_trusted(generation);
+                    self.obj_cache.insert(ckey.clone(), Arc::new(filled)).await;
                     // The whole of what a HEAD reports is in hand, so the index entry is
                     // completed here too — a body fill is the cheapest place to turn a
                     // skeletal entry faithful, and it costs the origin nothing extra.
@@ -962,7 +1039,7 @@ impl CachingProxy {
             && req.input.if_unmodified_since.is_none();
         let ckey = (req.input.bucket.clone(), req.input.key.clone());
         if cache_eligible && self.read_barrier(&req.headers).await == ReadRoute::Local {
-            if let Some(obj) = self.obj_cache.get(&ckey).await {
+            if let Some(obj) = self.validated_get(&ckey).await {
                 self.metrics.head_hit();
                 return Ok(S3Response::new(obj.to_head()));
             }
@@ -1066,6 +1143,11 @@ impl s3s::S3 for CachingProxy {
             content_type: content_type.clone(),
             meta: faithful.then(|| Box::new(meta.clone())),
         };
+        // Read before the write round-trip, not after it: a remediation that distrusts
+        // the cache while this one is in flight must leave the copy it lands suspect —
+        // this node's own bytes are not proof that a peer's concurrent write did not
+        // land behind them at the origin.
+        let generation = self.obj_cache.suspect_gen();
         // The bytes a client writes are the bytes its next read wants, and they are
         // already in hand: buffer them (bounded by the same per-object cap the read path
         // uses) so a freshly written object's first read is not a guaranteed origin GET.
@@ -1089,9 +1171,12 @@ impl s3s::S3 for CachingProxy {
         // with, so it fills nothing either.
         if let (Some(body), Some(e_tag)) = (written, entry.etag.clone()) {
             let out = written_object(content_type, e_tag, &meta, body.len());
-            self.obj_cache
-                .insert(ckey, Arc::new(CachedObject::from_get(&out, body)))
-                .await;
+            // The writer's own bytes, stamped as of before the write: this node just made
+            // them the truth, so its next read of them needs no proof — unless the
+            // generation moved while the write was in flight, and then it does.
+            let filled = CachedObject::from_get(&out, body);
+            filled.mark_trusted(generation);
+            self.obj_cache.insert(ckey, Arc::new(filled)).await;
             self.metrics.write_fill();
         }
         let token = self
@@ -1845,15 +1930,20 @@ impl s3s::S3 for CachingProxy {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
+    use bytes::Bytes;
     use groupnet::consistency::LeaseConfig;
     use groupnet::core::{Config, NodeId};
     use groupnet::runtime::Node;
     use groupnet::transport::mem::{MemTransport, Network};
+    use s3s::dto::{ETag, GetObjectOutput, Timestamp};
 
-    use super::affirm_after;
+    use super::{CacheConfig, CachingProxy, affirm_after};
+    use crate::index::{ObjEntry, apply_put, standard_class};
+    use crate::metrics::Metrics;
     use crate::sync::{Consistency, WriteSync};
+    use crate::tier::CachedObject;
 
     /// The same tuning shape [`WriteSync::new`] ships, in miniature: `dead_timeout_ms`
     /// tracks the lease duration, and the probe timings are brisk so the lease shell's
@@ -1936,6 +2026,268 @@ mod tests {
         assert!(
             sync.may_serve_local(),
             "and the warm-up landing is what puts the node in service"
+        );
+    }
+
+    // ---- the retention read path (`validated_get`) -------------------------------
+
+    /// A proxy over an origin it never dials. Every case below is decided from local
+    /// state; a row that reached the endpoint would fail on the connection, not pass.
+    fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "unused",
+                "unused",
+                None,
+                None,
+                "s3cache-unit-tests",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .force_path_style(true)
+            .build();
+        let client = aws_sdk_s3::Client::from_conf(conf);
+        CachingProxy::new(
+            s3s_aws::Proxy::from(client.clone()),
+            client,
+            CacheConfig {
+                cache_bytes: 1024 * 1024,
+                max_obj_bytes: 1024 * 1024,
+            },
+            None,
+            sync,
+            Arc::new(Metrics::default()),
+        )
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn ck(key: &str) -> (String, String) {
+        ("b".to_owned(), key.to_owned())
+    }
+
+    /// A cached body at version `etag`, filled when the origin said `modified`.
+    fn cached(etag: &str, modified: SystemTime) -> Arc<CachedObject> {
+        let out = GetObjectOutput {
+            content_length: Some(4),
+            content_type: Some("text/x-fixture".to_owned()),
+            e_tag: Some(ETag::Strong(etag.to_owned())),
+            last_modified: Some(Timestamp::from(modified)),
+            ..Default::default()
+        };
+        Arc::new(CachedObject::from_get(&out, Bytes::from_static(b"body")))
+    }
+
+    /// Index `key` at version `etag` (or with none), stamped `modified`.
+    fn index(proxy: &CachingProxy, key: &str, etag: Option<&str>, modified: SystemTime) {
+        apply_put(
+            &proxy.state,
+            "b",
+            key,
+            ObjEntry {
+                size: Some(4),
+                last_modified: modified,
+                etag: etag.map(|tag| ETag::Strong(tag.to_owned())),
+                storage_class: standard_class(),
+                content_type: Some("text/x-fixture".to_owned()),
+                meta: Some(Box::default()),
+            },
+        );
+    }
+
+    /// Flip the bucket to synced — the state in which the index may arbitrate.
+    fn synced(proxy: &CachingProxy) {
+        proxy
+            .state
+            .write()
+            .unwrap()
+            .entry("b".to_owned())
+            .or_default()
+            .synced = true;
+    }
+
+    fn counter(proxy: &CachingProxy, name: &str) -> u64 {
+        let text = proxy.metrics().prometheus_text();
+        let prefix = format!("s3cache_{name} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{name} is not exposed:\n{text}"))
+    }
+
+    /// Single node: no feed, so this proxy is the only writer and its own tiers cannot
+    /// have missed anything — a copy is served with no index consulted and nothing
+    /// dropped, which is the property the warm tier's restart survival rests on.
+    #[tokio::test]
+    async fn a_single_node_serves_a_suspect_copy_unproved() {
+        let proxy = proxy(None);
+        proxy
+            .obj_cache
+            .insert(ck("k"), cached("v1", at(1_700_000_000)))
+            .await;
+        // Unsynced bucket, no entry: with a peer, this is the drop case.
+        assert!(
+            proxy.validated_get(&ck("k")).await.is_some(),
+            "the sole writer's own copy is never suspect"
+        );
+        assert!(
+            proxy.obj_cache.get(&ck("k")).await.is_some(),
+            "and it is still there afterwards"
+        );
+    }
+
+    /// The steady state: a copy stamped under the current generation is served on one
+    /// atomic load, without the index being asked anything.
+    #[tokio::test]
+    async fn a_proved_copy_is_served_without_consulting_the_index() {
+        let (_node, sync) = solo("proved");
+        let proxy = proxy(Some(sync));
+        let obj = cached("v1", at(1_700_000_000));
+        obj.mark_trusted(proxy.obj_cache.suspect_gen());
+        proxy.obj_cache.insert(ck("k"), obj).await;
+
+        // The bucket is unsynced and holds no entry — the state that drops a *suspect*
+        // copy — so serving here can only be the stamp doing it.
+        assert!(proxy.validated_get(&ck("k")).await.is_some());
+        assert_eq!(counter(&proxy, "body_revalidations"), 0);
+        assert_eq!(counter(&proxy, "body_revalidation_evictions"), 0);
+    }
+
+    /// A suspect copy the index confirms is served — and stamped, so it is proved once
+    /// and not once per read. The second call must not touch the index again.
+    #[tokio::test]
+    async fn a_suspect_copy_the_index_confirms_is_proved_exactly_once() {
+        let (_node, sync) = solo("confirm");
+        let proxy = proxy(Some(sync));
+        let filled = at(1_700_000_000);
+        proxy.obj_cache.insert(ck("k"), cached("v1", filled)).await;
+        // The write-fill shape: the entry is stamped a moment after the body it describes.
+        index(&proxy, "k", Some("v1"), filled + Duration::from_micros(120));
+        synced(&proxy);
+
+        assert!(proxy.validated_get(&ck("k")).await.is_some());
+        assert_eq!(counter(&proxy, "body_revalidations"), 1);
+        assert!(proxy.validated_get(&ck("k")).await.is_some());
+        assert_eq!(
+            counter(&proxy, "body_revalidations"),
+            1,
+            "the stamp put the second read back on the fast path"
+        );
+        assert_eq!(counter(&proxy, "body_revalidation_evictions"), 0);
+    }
+
+    /// Every way the index can contradict a copy, and the one answer to all of them:
+    /// drop it and let the origin serve the read.
+    #[tokio::test]
+    async fn a_suspect_copy_the_index_contradicts_is_dropped() {
+        let (_node, sync) = solo("contradict");
+        let proxy = proxy(Some(sync));
+        let filled = at(1_700_000_000);
+        synced(&proxy);
+
+        // An overwrite this node missed: same key, a version it is not holding.
+        proxy
+            .obj_cache
+            .insert(ck("rewritten"), cached("v1", filled))
+            .await;
+        index(&proxy, "rewritten", Some("v2"), filled);
+        // A DELETE this node missed: on a synced bucket, absent means gone.
+        proxy
+            .obj_cache
+            .insert(ck("deleted"), cached("v1", filled))
+            .await;
+        // Nothing to compare with: a skeletal entry (a bootstrap row, a v1 feed event)
+        // proves the key exists and nothing about which version of it.
+        proxy
+            .obj_cache
+            .insert(ck("etagless"), cached("v1", filled))
+            .await;
+        index(&proxy, "etagless", None, filled);
+
+        for key in ["rewritten", "deleted", "etagless"] {
+            assert!(
+                proxy.validated_get(&ck(key)).await.is_none(),
+                "{key} must not be served"
+            );
+            assert!(
+                proxy.obj_cache.get(&ck(key)).await.is_none(),
+                "{key} must be gone from the tiers, so the refill cannot re-probe it"
+            );
+        }
+        assert_eq!(counter(&proxy, "body_revalidation_evictions"), 3);
+        assert_eq!(counter(&proxy, "body_revalidations"), 0);
+    }
+
+    /// The corner the mtime clause exists for: a rewrite storing byte-identical content
+    /// keeps the `ETag`, so only the moved mtime separates the new object from a copy of
+    /// the old one. Asserted against the fill it must *not* break — a write fill, whose
+    /// entry is stamped microseconds after its body.
+    #[tokio::test]
+    async fn a_byte_identical_rewrite_is_caught_by_the_mtime_and_a_fresh_fill_is_not() {
+        let (_node, sync) = solo("rewrite");
+        let proxy = proxy(Some(sync));
+        let filled = at(1_700_000_000);
+        synced(&proxy);
+
+        proxy
+            .obj_cache
+            .insert(ck("rewritten"), cached("same", filled))
+            .await;
+        index(
+            &proxy,
+            "rewritten",
+            Some("same"),
+            filled + Duration::from_secs(30),
+        );
+        proxy
+            .obj_cache
+            .insert(ck("fresh"), cached("same", filled))
+            .await;
+        index(
+            &proxy,
+            "fresh",
+            Some("same"),
+            filled + Duration::from_micros(120),
+        );
+
+        assert!(
+            proxy.validated_get(&ck("rewritten")).await.is_none(),
+            "identical bytes, a newer object: the ETag agrees and the mtime does not"
+        );
+        assert!(
+            proxy.validated_get(&ck("fresh")).await.is_some(),
+            "and the stamp order of a real write fill must still validate"
+        );
+        assert_eq!(counter(&proxy, "body_revalidation_evictions"), 1);
+        assert_eq!(counter(&proxy, "body_revalidations"), 1);
+    }
+
+    /// A bucket whose index has not finished warming has nothing to arbitrate with, so a
+    /// suspect copy is dropped rather than served on trust. Same outcome a flush would
+    /// have produced for the key — reached one key at a time, and only for the keys that
+    /// are actually read.
+    #[tokio::test]
+    async fn an_unsynced_bucket_arbitrates_nothing_and_drops_the_copy() {
+        let (_node, sync) = solo("unsynced");
+        let proxy = proxy(Some(sync));
+        let filled = at(1_700_000_000);
+        proxy.obj_cache.insert(ck("k"), cached("v1", filled)).await;
+        // The entry is even *there* and even matches — it just cannot be trusted yet,
+        // because the bucket's warm-up LIST has not landed.
+        index(&proxy, "k", Some("v1"), filled);
+
+        assert!(proxy.validated_get(&ck("k")).await.is_none());
+        assert!(
+            proxy.obj_cache.get(&ck("k")).await.is_none(),
+            "dropped, not merely refused"
+        );
+        assert_eq!(
+            counter(&proxy, "body_revalidation_evictions"),
+            0,
+            "nothing was contradicted — there was nothing to contradict it with"
         );
     }
 }

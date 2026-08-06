@@ -12,21 +12,46 @@ suffered: when it returns, the dead peer provably cannot serve what the write in
 
 Reads stay correct throughout. While the dead peer sits unreaped in the roster the
 survivor cannot get its own lease confirmed, so its reads go to the origin — a round trip,
-not a barrier, and still fast. That freeze ends at the reap rather than latching: the
-survivor's lapse watcher runs the gap remediation (flush, origin re-LIST, affirm) and it
-serves locally again, cold. When the peer comes back it returns in a fresh feed epoch:
-the survivor sees a gap, stands its lease down, flushes, resyncs its index from the origin
-and affirms the catch-up, and cross-node coherence resumes in both directions. Exits 0/1.
+not a barrier, and still fast. That freeze ends at the reap rather than latching, and it
+ends *cheaply*: a lapse says this node's licence expired, not that anything changed
+underneath it, so the lapse watcher runs a staged recovery (re-confirm the lease, settle,
+check no peer that was live at the lapse has vanished, barrier on every advertised feed
+head) and keeps the whole body cache when the barrier proves it —
+`s3cache_lapse_barrier_retains`. A peer that died before the lapse is exempt from the
+vanished check, which is exactly this scenario, so the survivor comes back warm rather
+than cold. Only a stage that cannot get its proof falls back to the gap's remediation —
+distrust every body, re-LIST the index from the origin, affirm — and that arm is
+`s3cache_lease_lapse_resyncs`, asserted here to stay at zero.
+
+When the peer comes back it returns in a fresh feed epoch: the survivor sees a gap, stands
+its lease down, distrusts every cached body (nothing is dropped — each copy proves itself
+against the re-LISTed index on its next read, or is evicted then), resyncs its index from
+the origin and affirms the catch-up, and cross-node coherence resumes in both directions.
+
+The survivor runs with the Prometheus endpoint on (`S3CACHE_METRICS_LISTEN`), because
+which recovery arm ran is not visible from the S3 API — a correct answer is correct either
+way — and the price of the expensive arm is exactly what this test exists to notice.
+Exits 0/1.
 """
 import os
 import sys
 import time
 
+# The import scopes the botocore checksum-mode default every test here depends on (see
+# `_s3cache_e2e`): without it no boto3 read is cache-eligible, and the cache-hit
+# assertions below would pass for the wrong reason.
 import _s3cache_e2e as h
 
 BUCKET = "resilience-test"
 PORT_A, PORT_B = 18071, 18072
 GOSSIP_A, GOSSIP_B = 19071, 19072
+# The survivor's Prometheus endpoint: the recovery's own account of itself.
+METRICS_A = 18073
+
+# The key warmed into A's cache before the outage and never touched again — the one whose
+# survival says the lapse recovery kept the cache rather than throwing it away.
+WARM_KEY = "warm"
+WARM_BODY = b"cached-before-the-outage"
 
 # The lease duration `D` these nodes actually run with: `h.start_node` passes the ambient
 # environment through, so reading the variable the binary reads is the number the binary
@@ -59,11 +84,17 @@ DEAD_TIMEOUT_MS = max(LEASE_MS, 2000)
 # The rejoin budgets. Nothing here is a latency claim — they are ceilings on *membership*,
 # which is the slow half of a rejoin: the survivor keeps the dead incarnation on its roster
 # until the reap horizon (`2 x dead_timeout` past the Dead verdict), and only then does the
-# returning node's fresh feed epoch land as a gap — flush, origin re-LIST, affirm. Both
+# returning node's fresh feed epoch land as a gap — distrust, origin re-LIST, affirm. Both
 # scale with the tuned timeout, so a fleet tuned differently gets budgets tuned with it.
 REAP_S = 2 * (DEAD_TIMEOUT_MS / 1000.0) + 1.0  # 5s at the default D = 2s
 REJOIN_S = 3 * REAP_S  # 15s at D = 2s
 GAP_RESYNC_S = 4 * REAP_S  # 20s at D = 2s — the above, plus the survivor's origin re-LIST
+
+# How long the staged lapse recovery gets. It cannot even start until the lease lapses
+# (≤ D) and cannot finish its first stage until the dead granter is reaped (the reap
+# horizon), after which it settles and barriers. That is ~8s at D = 2s; the budget is
+# loose because nothing here is a latency claim — the assertion is *which arm ran*.
+LAPSE_RECOVERY_S = 3 * REAP_S
 
 
 def start_b():
@@ -73,6 +104,29 @@ def start_b():
 
 def keys(cli):
     return {o["Key"] for o in cli.list_objects_v2(Bucket=BUCKET).get("Contents", [])}
+
+
+def metrics():
+    """Node A's counters as {name: int}, scraped the way Prometheus would."""
+    return h.counters(METRICS_A)
+
+
+def await_metric(name, at_least, timeout):
+    """The counter set once `name` reaches `at_least`, or the last sample if it never
+    does — so a failed wait reports what the node actually thought, not just a timeout."""
+    deadline = time.time() + timeout
+    while True:
+        sample = metrics()
+        if sample.get(name, 0) >= at_least or time.time() >= deadline:
+            return sample
+        time.sleep(0.25)
+
+
+def recovery(sample):
+    """The lapse recovery's counters, for a failure message worth reading."""
+    return " ".join(f"{n}={sample.get(n, 0)}" for n in
+                    ("lapse_barrier_retains", "lapse_barrier_fallbacks", "lease_lapse_resyncs",
+                     "feed_gaps", "unhealthy_bypasses"))
 
 
 def timed(fn):
@@ -89,7 +143,8 @@ def main():
     d = h.direct()
     h.reset_bucket(d, BUCKET)
     a = h.start_node("resA", PORT_A, BUCKET, gossip_port=GOSSIP_A,
-                     seeds=f"resB=127.0.0.1:{GOSSIP_B}")
+                     seeds=f"resB=127.0.0.1:{GOSSIP_B}",
+                     extra={"S3CACHE_METRICS_LISTEN": f"127.0.0.1:{METRICS_A}"})
     b = start_b()
     fails = []
 
@@ -100,12 +155,25 @@ def main():
 
     try:
         assert h.wait_port(PORT_A) and h.wait_port(PORT_B), "nodes did not bind"
+        assert h.wait_port(METRICS_A), "A's metrics endpoint did not bind"
         time.sleep(1.5)
         pa, pb = h.s3(f"http://127.0.0.1:{PORT_A}"), h.s3(f"http://127.0.0.1:{PORT_B}")
 
         # Baseline: coherence works with both nodes up.
         pa.put_object(Bucket=BUCKET, Key="base", Body=b"1")
         check("baseline: B sees A's write", h.poll(lambda: "base" in keys(pb)) is not None)
+
+        # Warm one key into A's cache and leave it alone from here on: nothing touches it
+        # again until after the outage, so what serves it afterwards is the copy that was
+        # already there — or nothing.
+        pa.put_object(Bucket=BUCKET, Key=WARM_KEY, Body=WARM_BODY)
+        pa.get_object(Bucket=BUCKET, Key=WARM_KEY)["Body"].read()
+        before = metrics()
+        served = pa.get_object(Bucket=BUCKET, Key=WARM_KEY)["Body"].read()
+        after = metrics()
+        check("baseline: the warm key is an established cache hit on A",
+              served == WARM_BODY and after["get_hit"] == before["get_hit"] + 1,
+              f"get_hit {before['get_hit']} -> {after['get_hit']}")
 
         # Kill the peer; A's data plane must stay correct, and must slow down in exactly
         # one place: the first write, which owes the dead peer's lease its remainder.
@@ -139,6 +207,37 @@ def main():
         check(f"peer down: GET is fast (< {FAST_MS}ms)", get_ms < FAST_MS, f"{get_ms:.0f}ms")
         check(f"peer down: LIST is fast (< {FAST_MS}ms)", list_ms < FAST_MS, f"{list_ms:.0f}ms")
 
+        # The freeze ends when the dead peer is reaped, and how it ends is the whole
+        # question: the staged barrier proving the cache (cheap, warm) or the gap
+        # remediation being borrowed for a lapse that never proved anything (expensive,
+        # cold). B died before the lapse, so it is exempt from the vanished check and the
+        # barrier has everything it needs.
+        m = await_metric("lapse_barrier_retains", 1, LAPSE_RECOVERY_S)
+        check("peer down: the lapse recovery ran the retention barrier",
+              m.get("lapse_barrier_retains", 0) >= 1, recovery(m))
+        check("peer down: and kept the cache — no lapse resync, no fallback",
+              m.get("lease_lapse_resyncs", 0) == 0 and m.get("lapse_barrier_fallbacks", 0) == 0,
+              recovery(m))
+        print(f"    lapse recovery: {recovery(m)}")
+
+        # What the barrier kept, proved by the only thing that can prove it: the key
+        # nobody has touched since before the outage still serves from the cache. A miss
+        # or a bypass here would mean the recovery cost this node its warm cache.
+        before = metrics()
+        served = pa.get_object(Bucket=BUCKET, Key=WARM_KEY)["Body"].read()
+        after = metrics()
+        check("after the lapse: the untouched key still serves the right bytes",
+              served == WARM_BODY)
+        check("after the lapse: it is still a cache hit (no miss, no bypass, no refetch)",
+              after["get_hit"] == before["get_hit"] + 1
+              and after["get_miss"] == before["get_miss"]
+              and after["get_bypass"] == before["get_bypass"]
+              and after["unhealthy_bypasses"] == before["unhealthy_bypasses"],
+              f"hit {before['get_hit']}->{after['get_hit']} "
+              f"miss {before['get_miss']}->{after['get_miss']} "
+              f"bypass {before['get_bypass']}->{after['get_bypass']} "
+              f"unhealthy {before['unhealthy_bypasses']}->{after['unhealthy_bypasses']}")
+
         # Bring the peer back (fresh feed epoch); coherence must resume both ways.
         print(">>> restarting node B")
         b = start_b()
@@ -149,8 +248,10 @@ def main():
         pa.put_object(Bucket=BUCKET, Key="recovered", Body=b"back")
         check("after restart: B sees A's new write",
               h.poll(lambda: "recovered" in keys(pb), timeout=REJOIN_S) is not None)
-        # B's writes arrive in a new epoch: A takes the gap (lease stands down, flush +
-        # origin resync, affirm) and then converges — the loud-recovery path, end to end.
+        # B's writes arrive in a new epoch: A takes the gap (lease stands down, every body
+        # distrusted, origin re-LIST, affirm) and then converges — the loud-recovery path,
+        # end to end. A gap is proof that events were missed, so unlike the lapse above it
+        # gets the full remediation; what it no longer does is throw the bodies away.
         pb.put_object(Bucket=BUCKET, Key="from-b", Body=b"epoch2")
         check("after restart: A sees B's write (new epoch, gap-resync path)",
               h.poll(lambda: "from-b" in keys(pa), timeout=GAP_RESYNC_S) is not None)
@@ -162,7 +263,7 @@ def main():
     if fails:
         print(f"\nFAILED ({len(fails)}): {fails}")
         return 1
-    print("\nALL RESILIENCE CHECKS PASSED (peer outage != data-plane outage)")
+    print("\nALL RESILIENCE CHECKS PASSED (peer outage != data-plane outage, nor a cache outage)")
     return 0
 
 

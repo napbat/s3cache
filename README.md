@@ -101,9 +101,10 @@ consistency layer, no broker, no consensus service, no extra infrastructure:
 
 The fast path stays in local memory (LIST is served from RAM; nothing remote is on the
 read path). Loss is **detected, never silent**: a peer that falls behind the feed's ring,
-or a peer restart, surfaces as a *gap* — the node flushes its local tiers and resyncs its
-index from the origin, which is the authority the index caches. Only seeds need static
-addressing; every other peer resolves through gossiped advertisements.
+or a peer restart, surfaces as a *gap* — the node distrusts every local body and resyncs
+its index from the origin, which is the authority the index caches, so a copy is served
+again only once that index has proved it current. Only seeds need static addressing;
+every other peer resolves through gossiped advertisements.
 
 With the feed on, **multiple replicas are safe** — this lifts the historical
 single-replica constraint with zero extra services.
@@ -143,12 +144,26 @@ heuristic earlier releases used:
   *before* the remediation runs — and only the resync that actually ran may hand it
   back. A booting node likewise serves nothing local until its configured buckets have
   warmed and the lease shell's own warm-up window has passed.
-- **A lapse with no gap behind it gets the same remediation.** Not every way of losing
-  the licence arrives as an event: a peer scaled in, lost for good, or restarted while
-  the write feed was quiet freezes this node's confirmation with no gap to notice. The
-  lapse latches, so a watcher on the lease runs exactly the gap's remediation — flush,
-  origin re-LIST, affirm — and the node returns to service the moment its lease can be
-  confirmed again (`lease_lapse_resyncs`). Without it a lapse would be permanent
+- **A lapse with no gap behind it gets a recovery, and usually keeps the cache.** Not
+  every way of losing the licence arrives as an event: a peer scaled in, lost for good,
+  or restarted while the write feed was quiet freezes this node's confirmation with no
+  gap to notice. The lapse latches, so a watcher on the lease recovers from it — and a
+  lapse is *not* proof that anything changed, only that this node stopped being allowed
+  to serve, so the watcher proves the cache rather than throwing it away. It stands the
+  licence down, waits for **every granter separately** to adopt a renewal published
+  after the lapse (so every wait held against the old one is resolved — read per granter
+  rather than off the confirmed watermark, which is a *min* over the roster and advances
+  when the member pinning it is merely reaped), settles for the fabric's
+  entry-propagation bound (`2 × anti_entropy_interval`), checks that no peer which was
+  live at the lapse has vanished from membership since, and then barriers on every peer's
+  advertised feed head — re-running the vanished check once more afterwards, because the
+  barrier waits and a reap can land inside that wait. Past the barrier the apply loop has
+  evicted exactly the keys the lapse era changed and every remaining body is provably
+  untouched, so the node re-affirms warm (`lapse_barrier_retains`). Any stage that cannot
+  get its proof — a live peer reaped before the recovery could affirm, so its feed frame
+  went with it; a head that never arrives; a granter that never re-grants — falls back to
+  the gap's remediation instead (`lapse_barrier_fallbacks`, the same set
+  `lease_lapse_resyncs` counts). Without any of this a lapse would be permanent
   origin-serving for a node whose surviving peers are perfectly healthy.
 
 **What it rests on, stated as failure modes** (groupnet's `consistency::lease` honesty
@@ -171,11 +186,11 @@ box is the long form):
   freezes every other reader's lease cluster-wide: reads stay correct and all of them
   go to the origin. s3cache tunes `dead_timeout` down to `D` for exactly this, turning
   the untuned ~19s of cluster-wide origin-serving into ≈3s. The freeze *ends* at the
-  reap rather than latching: each frozen reader watches its own lapse and remediates it
-  (above), so it comes back — cold, having flushed, but in service. The price is the
-  other end of the same horizon: a partition outliving ~4s lands on the write-feed
-  **gap** path (flush + origin re-LIST) instead of reconciling — loud, correct, and the
-  standing remedy a cache wants.
+  reap rather than latching: each frozen reader watches its own lapse and recovers from
+  it (above), so it comes back in service — and, in the common case, still warm. The
+  price is the other end of the same horizon: a partition outliving ~4s lands on the
+  write-feed **gap** path (distrust + origin re-LIST) instead of reconciling — loud,
+  correct, and the standing remedy a cache wants.
 - **First write after a pod dies costs up to `D`.** That is the lapse being waited out,
   once. It shows up as `write_lease_lapses`, not `ack_timeouts`, because the guarantee
   held. A *planned* stop does not pay it: on `SIGTERM` (a rollout, a scale-in) the node
@@ -200,9 +215,9 @@ underneath every mode, and this one gets them too:
 - **Membership is tuned differently, in every mode.** `dead_timeout` is pulled from
   groupnet's 10s default down to `max(D, 2s)` uniformly — a mixed fleet must have one
   membership timing, not two — which puts the reap horizon at ~4s instead of ~20s. A
-  partition outliving that lands on the write-feed **gap** path (flush + origin re-LIST)
-  rather than reconciling through a digest catch-up: loud, correct, and not what this
-  mode did before.
+  partition outliving that lands on the write-feed **gap** path (distrust + origin
+  re-LIST) rather than reconciling through a digest catch-up: loud, correct, and not what
+  this mode did before.
 - **The 404 trust window is computed per call, not fixed.** It was a constant 650ms off
   groupnet's *default* probe timings. It is now `detection_window_ms` read off the
   **effective** config and the membership actually being swept (floored at two members)
@@ -271,7 +286,8 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
 - **Unit / protocol tests** (`cargo test`): fully in-process — real groupnet nodes over
   an in-memory transport, no external services. They cover peer-write index folding +
   hot invalidation, out-of-order LWW convergence (tombstones, delete-wins-ties,
-  no-resurrection), the freshness barrier, and the flush path.
+  no-resurrection), the freshness barrier, the gap path, and the staged lapse recovery —
+  what it retains, and every way it falls back.
 - **Integration tests** (`cargo test`, needs a Docker daemon): `tests/e2e.rs` and
   `tests/coherence.rs` run the real `CachingProxy` against a **real MinIO origin**
   (testcontainers) reached through a transparent request counter, so every claim is
@@ -304,7 +320,7 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
   - `resilience_e2e.py` — a **peer outage is not a data-plane outage**: with its peer
     down, a node's PUT/GET/LIST stay correct and fast (the barrier never waits on a dead
     peer), and coherence resumes both ways after the peer restarts — including the
-    fresh-epoch gap path (flush + origin resync), exercised end to end.
+    fresh-epoch gap path (distrust + origin resync), exercised end to end.
 
 ## Config (env)
 
@@ -346,9 +362,9 @@ origin GET the object's first read no longer costs), `index_backfills` (index en
 completed from a forwarded answer — see below), the warm tier (`warm_hit` / `warm_miss` / `warm_error`, with `warm_rejects` for
 objects the per-object cap declined, kept apart so `warm_error` stays alertable) and the
 gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`, `lease_lapse_resyncs`,
-`unhealthy_bypasses`).
+`lapse_barrier_retains`, `lapse_barrier_fallbacks`, `unhealthy_bypasses`).
 
-The last four are the coherence tier's, and the split between the first two is the one
+The last six are the coherence tier's, and the split between the first two is the one
 worth wiring an alert around: **`write_lease_lapses` is the guarantee working** — a peer
 stopped acknowledging, its serve-lease expired, and the write completed knowing that peer
 can serve nothing cached until it re-synchronizes. Sustained movement means a pod is
@@ -358,7 +374,10 @@ behind when the wait's deadline passed (in `strong`, the fail-slow reader — re
 not applying — plus any un-leased peer that did not ack). Alert on that one.
 `unhealthy_bypasses` counts reads sent to the origin because this node held no licence to
 answer them locally; it is expected to be non-zero at every startup and after every gap.
-`lease_lapse_resyncs` is the read side of the same story: this node's *own* lease lapsed
-with no gap to explain it (a peer stopped granting), so it flushed, re-LISTed and affirmed
-its way back into service. One per peer death is normal; sustained movement is a flapping
-peer, and each one leaves this node cold.
+The lapse pair is the read side of the same story: this node's *own* lease lapsed with no
+gap to explain it (a peer stopped granting). `lapse_barrier_retains` is the cheap arm —
+the staged recovery proved the cache and kept it, so the node came back **warm** — and
+`lapse_barrier_fallbacks` is the expensive one, where the proof was unavailable and the
+node distrusted, re-LISTed and affirmed its way back cold; `lease_lapse_resyncs` counts
+exactly that second set. One lapse per peer death is normal, and the ratio between the
+two arms is what says what a flapping peer is actually costing.

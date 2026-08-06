@@ -15,6 +15,7 @@ use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
@@ -31,6 +32,10 @@ pub type CacheKey = (String, String);
 
 /// A cached object body plus the response metadata needed to reconstruct a GET/HEAD.
 /// `Serialize`/`Deserialize` so the warm disk tier can round-trip it.
+///
+/// Deliberately **not** `Clone`: the tiers hand out `Arc<CachedObject>`, and a copy's
+/// trust stamp (below) is bookkeeping about *that* copy — a clone would have to decide
+/// whether to carry it, and either answer would be wrong somewhere.
 #[derive(Serialize, Deserialize)]
 pub struct CachedObject {
     body: Bytes,
@@ -44,6 +49,19 @@ pub struct CachedObject {
     content_disposition: Option<String>,
     accept_ranges: Option<String>,
     metadata: Option<Metadata>,
+    /// The trust generation this copy was last proved current under (see
+    /// [`TieredCache::suspect_gen`]). Interior-mutable because the tiers only ever hand
+    /// out `Arc<CachedObject>`, and this is proof-of-freshness *about* a copy rather
+    /// than part of the object it describes.
+    ///
+    /// **Skipped by serde**, which is load-bearing twice over: the warm tier's on-disk
+    /// encoding does not move (entries written by a binary without this field decode
+    /// unchanged), and — because a decoded entry defaults to `0` while a live cache's
+    /// generation starts at `1` — every copy that comes back off disk is born
+    /// *suspect*. That is the point: a node whose disk outlives its process cannot
+    /// vouch for what happened to those objects while it was down.
+    #[serde(skip)]
+    trusted_gen: AtomicU64,
 }
 
 /// Replays the cached response fields into `$out`, defaulting the rest. `GetObjectOutput`
@@ -85,7 +103,41 @@ impl CachedObject {
             content_disposition: out.content_disposition.clone(),
             accept_ranges: out.accept_ranges.clone(),
             metadata: out.metadata.clone(),
+            // Born suspect. Only the fill site knows which generation the bytes were
+            // fetched or written under, and it stamps this on the way into the tiers.
+            trusted_gen: AtomicU64::new(0),
         }
+    }
+
+    /// Whether this copy was proved current under `generation` — one relaxed load, which
+    /// is the whole of the steady-state read path's coherence check.
+    ///
+    /// `Relaxed` orders nothing because there is nothing to order: the bytes this
+    /// describes are immutable and were published by the `Arc` itself. Reading a stale
+    /// `false` costs one revalidation. A read that races a generation bump is the same
+    /// race a read racing an invalidation always is, and is bounded the same way — by
+    /// the barrier the caller already passed.
+    #[must_use]
+    pub fn trusted(&self, generation: u64) -> bool {
+        self.trusted_gen.load(Ordering::Relaxed) == generation
+    }
+
+    /// Stamp this copy as proved current under `generation`: what a fill does on the way
+    /// in, and what a revalidation does once the LIST index has confirmed the copy.
+    pub fn mark_trusted(&self, generation: u64) {
+        self.trusted_gen.store(generation, Ordering::Relaxed);
+    }
+
+    /// The `ETag` the origin reported for these bytes, when it reported one — the handle
+    /// a revalidation compares against the LIST index.
+    pub(crate) fn e_tag(&self) -> Option<&ETag> {
+        self.e_tag.as_ref()
+    }
+
+    /// When the object these bytes came from was last modified, as the fill learned it:
+    /// the origin's `Last-Modified` on a read fill, the local write clock on a write one.
+    pub(crate) fn last_modified(&self) -> Option<&Timestamp> {
+        self.last_modified.as_ref()
     }
 
     fn body_blob(&self) -> StreamingBlob {
@@ -274,6 +326,14 @@ struct Core {
     fills: SingleFlight<CacheKey>,
     metrics: Arc<Metrics>,
     has_warm: bool,
+    /// The generation a copy must carry to be served without proving itself first.
+    ///
+    /// It starts at **1**, never 0, and that one digit is the whole PVC-restart story:
+    /// a warm-tier entry decodes with `trusted_gen: 0` (the field is serde-skipped), so
+    /// on the far side of a restart every object on disk is suspect until something
+    /// revalidates it. Bumping this ([`LocalCache::distrust_all`]) makes every copy
+    /// currently held suspect without dropping one.
+    suspect_gen: AtomicU64,
 }
 
 impl Core {
@@ -316,9 +376,12 @@ impl Core {
         }
     }
 
-    /// Drop EVERY local copy — the coarse remediation when an unknown set of
-    /// entries may be stale (a write-feed gap): the hot tier empties
-    /// immediately, the disk store unlinks its files on a blocking worker.
+    /// Drop EVERY local copy: the hot tier empties immediately, the disk store unlinks
+    /// its files on a blocking worker.
+    ///
+    /// The blunt instrument. It throws away every *correct* body along with the suspect
+    /// ones and buys them all back from the origin, which is why the retention path
+    /// ([`Core::suspect_gen`]) exists — see [`LocalCache::flush`] for what still uses it.
     async fn flush(&self) {
         self.hot.inner().invalidate_all();
         if let Some(disk) = &self.warm_disk {
@@ -369,8 +432,17 @@ impl TieredCache {
                 fills: SingleFlight::new(),
                 metrics,
                 has_warm,
+                suspect_gen: AtomicU64::new(1),
             }),
         }
+    }
+
+    /// The generation a copy must carry to be served without revalidation (see
+    /// [`CachedObject::trusted`]). A fill stamps what this reads; a hit compares against
+    /// it; [`LocalCache::distrust_all`] moves it on.
+    #[must_use]
+    pub fn suspect_gen(&self) -> u64 {
+        self.core.suspect_gen.load(Ordering::Relaxed)
     }
 
     /// A handle the commit-log consumer uses to invalidate this node's local copies.
@@ -444,8 +516,20 @@ impl LocalCache {
         self.core.invalidate(key).await;
     }
 
-    /// Drop every node-local copy (see [`Core::flush`]) — used when peers'
-    /// writes were provably missed and the stale subset is unknowable.
+    /// Distrust every node-local copy without dropping one: the generation moves on, so
+    /// each cached body must prove itself current — against the LIST index, which the
+    /// same remediation re-LISTs from the origin — before it is served again, and is
+    /// dropped only if it cannot. The retention half of the pair; nothing correct is
+    /// thrown away, and a copy that is still current costs one index lookup rather than
+    /// an origin GET.
+    pub fn distrust_all(&self) {
+        self.core.suspect_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drop every node-local copy (see [`Core::flush`]) — the escape hatch, for a stale
+    /// set that cannot be revalidated at all. It is strictly more expensive than
+    /// [`distrust_all`](Self::distrust_all) and never more correct, so a remediation
+    /// reaches for it only when there is nothing left to revalidate *against*.
     pub async fn flush(&self) {
         self.core.flush().await;
     }
@@ -506,6 +590,111 @@ mod tests {
         assert_eq!(obj.e_tag, back.e_tag);
         assert_eq!(obj.last_modified, back.last_modified);
         assert_eq!(obj.metadata, back.metadata);
+    }
+
+    /// The trust stamp is bookkeeping about a *copy*, not part of the object, and
+    /// `#[serde(skip)]` is what keeps it off the warm tier's disk format.
+    ///
+    /// Asserted without a fixture of the old bytes, which would only ever prove what
+    /// this build's serializer does anyway: the stamp is varied across the widest value
+    /// it can hold and the encoding must not move by a byte. A field that reached the
+    /// wire — at any width, in any position, even as a length — could not survive that.
+    /// The decode side then pins the consequence: whatever was stamped, what comes back
+    /// off disk is suspect.
+    #[test]
+    fn the_trust_stamp_never_reaches_the_warm_tier() {
+        let obj = sample();
+        let unstamped = bincode::serialize(&obj).unwrap();
+        for generation in [1, 0x0102_0304_0506_0708, u64::MAX] {
+            obj.mark_trusted(generation);
+            assert_eq!(
+                bincode::serialize(&obj).unwrap(),
+                unstamped,
+                "generation {generation} left a trace in the encoding"
+            );
+        }
+
+        let back: CachedObject = bincode::deserialize(&unstamped).unwrap();
+        assert_eq!(back.body, obj.body, "the object itself round-trips");
+        assert!(
+            back.trusted(0),
+            "a decoded entry carries the default generation"
+        );
+        assert!(
+            !back.trusted(1),
+            "which a live cache never issues — so warm entries are born suspect"
+        );
+    }
+
+    /// A restart is the case the generation floor exists for: the object comes back off
+    /// disk intact and is *not* trusted, because nothing on this node saw what happened
+    /// to it in between.
+    #[tokio::test]
+    async fn a_warm_tier_entry_comes_back_suspect() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let cap = 10 * 1024 * 1024;
+
+        let (warm, _disk) = open_warm(dir.clone(), cap, 8 * 1024 * 1024, metrics()).unwrap();
+        let obj = Arc::new(sample());
+        obj.mark_trusted(1); // trusted in the process that filled it
+        warm.put(ck("b", "k"), obj).await.unwrap();
+
+        // A fresh cache over the same directory: a new process, a new hot tier.
+        let warm2 = open_warm(dir.clone(), cap, 8 * 1024 * 1024, metrics()).unwrap();
+        let cache = TieredCache::new(1024 * 1024, Some(warm2), metrics());
+        let back = cache
+            .get(&ck("b", "k"))
+            .await
+            .expect("re-indexed from disk");
+        assert!(
+            !back.trusted(cache.suspect_gen()),
+            "a warm-decoded body is suspect until something revalidates it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stamp/compare mechanics, and the generation floor that makes a decoded `0`
+    /// mean "unproved" rather than "proved under generation zero".
+    #[test]
+    fn trust_is_stamped_and_read_per_generation() {
+        let cache = TieredCache::new(1024, None, metrics());
+        assert_eq!(cache.suspect_gen(), 1, "a live cache never issues 0");
+
+        let obj = sample();
+        assert!(!obj.trusted(cache.suspect_gen()), "born suspect");
+        obj.mark_trusted(cache.suspect_gen());
+        assert!(obj.trusted(cache.suspect_gen()));
+        assert!(
+            !obj.trusted(2),
+            "a stamp only speaks for its own generation"
+        );
+    }
+
+    /// Distrusting keeps every copy and invalidates every proof: the object is still
+    /// served by the tiers, it just has to prove itself again.
+    #[tokio::test]
+    async fn distrust_all_moves_the_generation_on_without_dropping_a_copy() {
+        let cache = TieredCache::new(1024 * 1024, None, metrics());
+        let obj = Arc::new(sample());
+        obj.mark_trusted(cache.suspect_gen());
+        cache.insert(ck("b", "k"), Arc::clone(&obj)).await;
+
+        let before = cache.suspect_gen();
+        cache.local().distrust_all();
+        assert_eq!(cache.suspect_gen(), before + 1);
+
+        let held = cache
+            .get(&ck("b", "k"))
+            .await
+            .expect("the copy is still here");
+        assert!(
+            !held.trusted(cache.suspect_gen()),
+            "but it no longer counts as proved"
+        );
+        held.mark_trusted(cache.suspect_gen());
+        assert!(obj.trusted(cache.suspect_gen()), "one copy, one stamp");
     }
 
     #[tokio::test]

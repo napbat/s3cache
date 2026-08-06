@@ -26,6 +26,8 @@ use s3s::dto::{
 };
 use tracing::info;
 
+use crate::tier::CachedObject;
+
 /// S3's default storage class, and what an object reports when it carries no
 /// `x-amz-storage-class`. Used where a path proves a key exists without saying which
 /// class it is in (a legacy v1 feed event); the next origin sync corrects it.
@@ -82,6 +84,56 @@ impl ObjEntry {
             && self.content_type.is_some()
             && self.meta.is_some()
     }
+}
+
+/// How far the LIST index's mtime for a key may run *ahead* of a cached body's and still
+/// describe the same version of the object. It absorbs two known, bounded disagreements
+/// and nothing else:
+///
+/// * **Stamp order on a write fill.** A `PutObject` stamps the body from
+///   `SystemTime::now()` and then stamps the index entry from a second `now()`, so the
+///   entry is always microseconds *later* than the body it describes.
+/// * **Wire precision.** A LIST row carries milliseconds; the `Last-Modified` a GET or
+///   HEAD carries is an HTTP-date, whole seconds, rounded **down**. The same origin
+///   write therefore reads as `T.813` in the index and `T` on the body.
+///
+/// A second is comfortably above both and far below anything that matters: the corner it
+/// is guarding is a rewrite with byte-identical content (same `ETag`, new mtime), and a
+/// rewrite inside a one-second window of the fill it is racing was already indistinguishable
+/// from the fill itself.
+const BODY_MTIME_SLACK: Duration = Duration::from_secs(1);
+
+/// Whether this bucket's index entry for a key describes the **same version of the
+/// object** as a cached body of it — the question a suspect body has to answer before it
+/// may be served (see `CachingProxy::validated_get`).
+///
+/// The `ETag` is the version identity and carries the decision. It is not enough on its
+/// own: a rewrite that stores byte-identical content produces the *same* `ETag`, so an
+/// `ETag` match alone would happily serve a body from before a write this node missed.
+/// What separates them is the mtime — the origin moves it on for every write, identical
+/// bytes or not — so the entry's mtime must not run ahead of the body's by more than
+/// [`BODY_MTIME_SLACK`].
+///
+/// Anything missing is a mismatch, never a pass: an entry with no `ETag` (a v1 feed
+/// event, a skeletal write) or a body with no `ETag`/`Last-Modified` cannot be compared,
+/// and an uncomparable copy is one the origin has to re-serve.
+pub(crate) fn entry_matches_body(entry: &ObjEntry, obj: &CachedObject) -> bool {
+    let (Some(indexed), Some(cached)) = (entry.etag.as_ref(), obj.e_tag()) else {
+        return false;
+    };
+    let Some(filled_at) = obj.last_modified() else {
+        return false;
+    };
+    // `entry.last_modified <= filled_at + SLACK`, with the slack taken off the entry
+    // rather than added to the body: a `Timestamp` has no way back to a `SystemTime`
+    // without pulling in the `time` crate, and shifting the other operand is the same
+    // comparison. A subtraction that underflows loses the slack, which is the strict
+    // direction and therefore the safe one.
+    let floor = entry
+        .last_modified
+        .checked_sub(BODY_MTIME_SLACK)
+        .unwrap_or(entry.last_modified);
+    indexed == cached && Timestamp::from(floor) <= *filled_at
 }
 
 /// What an origin response adds to an already-indexed entry (see [`complete_entry`]).
@@ -447,10 +499,11 @@ pub(crate) async fn sync_bucket_into(
 #[cfg(test)]
 mod tests {
     use super::{
-        Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del, apply_put,
-        complete_entry, head_object_from_index, list_objects_v2_from_index, standard_class,
-        sync_listing_into,
+        BODY_MTIME_SLACK, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del,
+        apply_put, complete_entry, entry_matches_body, head_object_from_index,
+        list_objects_v2_from_index, standard_class, sync_listing_into,
     };
+    use crate::tier::CachedObject;
     use std::collections::HashMap;
     use std::sync::RwLock;
     use std::time::Duration;
@@ -778,6 +831,116 @@ mod tests {
             out.last_modified,
             Some(super::Timestamp::from(ts(10))),
             "completing an entry never moves its timestamp"
+        );
+    }
+
+    /// A cached body carrying `etag`/`modified`, the way a fill builds one.
+    fn body(etag: Option<&str>, modified: Option<std::time::SystemTime>) -> CachedObject {
+        let out = s3s::dto::GetObjectOutput {
+            e_tag: etag.map(|tag| ETag::Strong((*tag).to_owned())),
+            last_modified: modified.map(super::Timestamp::from),
+            ..Default::default()
+        };
+        CachedObject::from_get(&out, bytes::Bytes::from_static(b"body"))
+    }
+
+    /// An index entry stamped `modified`, carrying `etag`.
+    fn indexed(etag: Option<&str>, modified: std::time::SystemTime) -> ObjEntry {
+        ObjEntry {
+            size: Some(4),
+            last_modified: modified,
+            etag: etag.map(|tag| ETag::Strong((*tag).to_owned())),
+            storage_class: standard_class(),
+            content_type: None,
+            meta: None,
+        }
+    }
+
+    /// The `ETag` decides, and both sides have to have one to decide with. An entry that
+    /// cannot be compared to the body is not a match — the origin re-serves it.
+    #[test]
+    fn a_body_matches_its_entry_only_on_an_etag_both_sides_carry() {
+        let now = ts(1_700_000_000);
+        assert!(
+            entry_matches_body(&indexed(Some("v1"), now), &body(Some("v1"), Some(now))),
+            "same version, same moment"
+        );
+        assert!(
+            !entry_matches_body(&indexed(Some("v2"), now), &body(Some("v1"), Some(now))),
+            "the index holds a version this body is not"
+        );
+        assert!(
+            !entry_matches_body(&indexed(None, now), &body(Some("v1"), Some(now))),
+            "an entry with no ETag proves nothing about the body"
+        );
+        assert!(
+            !entry_matches_body(&indexed(Some("v1"), now), &body(None, Some(now))),
+            "and neither does a body with no ETag"
+        );
+        assert!(
+            !entry_matches_body(&indexed(Some("v1"), now), &body(Some("v1"), None)),
+            "a body with no mtime cannot answer the rewrite question at all"
+        );
+    }
+
+    /// The clause that closes the byte-identical rewrite: same content re-PUT keeps the
+    /// `ETag` and moves the origin's mtime on, so an entry whose mtime runs ahead of the
+    /// body's by more than the slack describes a write this copy predates.
+    ///
+    /// The slack itself is not fudge: it is the width of two disagreements the system
+    /// really has (write-fill stamp order, and LIST's milliseconds against an HTTP-date's
+    /// whole seconds), so the boundary is asserted on both sides of exactly one second.
+    #[test]
+    fn an_entry_newer_than_the_body_by_more_than_the_slack_is_a_rewrite() {
+        let filled = ts(1_700_000_000);
+        let matches = |entry_at: std::time::SystemTime| {
+            entry_matches_body(
+                &indexed(Some("same"), entry_at),
+                &body(Some("same"), Some(filled)),
+            )
+        };
+
+        assert!(
+            matches(filled - Duration::from_mins(1)),
+            "an entry older than the body is fine: the body is the newer observation"
+        );
+        assert!(
+            matches(filled + BODY_MTIME_SLACK),
+            "exactly the slack still describes the same write"
+        );
+        assert!(
+            !matches(filled + BODY_MTIME_SLACK + Duration::from_millis(1)),
+            "a millisecond past it is a rewrite this copy missed"
+        );
+        assert!(
+            !matches(filled + Duration::from_hours(1)),
+            "and an hour past it certainly is"
+        );
+    }
+
+    /// The two real fills, end to end. A write fill stamps the body and then the entry
+    /// from consecutive clock reads; a read fill takes the body's mtime off an HTTP-date
+    /// (whole seconds, rounded down) while the index holds LIST's milliseconds. Both must
+    /// validate, or every restart refetches the whole cache.
+    #[test]
+    fn both_fill_paths_validate_against_their_own_entries() {
+        let write_body = ts(1_700_000_000);
+        assert!(
+            entry_matches_body(
+                &indexed(Some("w"), write_body + Duration::from_micros(120)),
+                &body(Some("w"), Some(write_body)),
+            ),
+            "a write fill's entry is stamped a moment after its body"
+        );
+
+        let http_date = ts(1_700_000_000);
+        assert!(
+            entry_matches_body(
+                &indexed(Some("r"), http_date + Duration::from_millis(813)),
+                &body(Some("r"), Some(http_date)),
+            ),
+            "a read fill's body carries the HTTP-date's whole seconds, the index LIST's \
+             milliseconds"
         );
     }
 

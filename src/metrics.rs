@@ -120,11 +120,23 @@ counters! {
     /// per-object cap — policy, not failure, and kept out of `warm_error` so that
     /// counter stays alertable.
     warm_rejects => warm_reject,
+    /// Record a **suspect** cached body — one filled under an older trust generation, or
+    /// decoded off the warm tier after a restart — that proved itself current against
+    /// the LIST index instead of being refetched: same `ETag`, and an indexed mtime no
+    /// newer than the copy. One index lookup where the alternative was an origin GET.
+    body_revalidations => body_revalidation,
+    /// Record a suspect cached body the index contradicted — a different `ETag`, no
+    /// `ETag` on one side to compare, or a key the synced index no longer holds (the
+    /// DELETE this node missed) — so the copy was dropped and the read went to the
+    /// origin. This is a warm tier that outlived its coherence being made to pay, which
+    /// is what it is for; sustained movement outside a restart means writes are being
+    /// missed.
+    body_revalidation_evictions => body_revalidation_eviction,
     /// Record a write advertised to peers over the gossip write feed.
     feed_published => feed_published,
     /// Record a peer's write applied from the feed (index + invalidation).
     feed_applied => feed_applied,
-    /// Record a feed gap (missed writes): local tiers flushed, index resynced.
+    /// Record a feed gap (missed writes): every local body distrusted, index resynced.
     feed_gaps => feed_gap,
     /// Record a write that ended with **no** coherence guarantee: peers still live and
     /// still behind when the wait's deadline passed. In `strong` that is the lease
@@ -142,11 +154,31 @@ counters! {
     write_lease_lapses => write_lease_lapse,
     /// Record a resync this node ran because **its own** serve-lease lapsed with no
     /// write-feed gap to explain it — a peer stopped granting (scale-in, a crash, a
-    /// partition that healed without overflowing the ring), so the lapse watcher ran the
-    /// gap remediation: tiers flushed, index re-LISTed from the origin, licence
+    /// partition that healed without overflowing the ring) — and the staged barrier could
+    /// not prove its cache instead, so the lapse watcher fell back to the gap
+    /// remediation: every body distrusted, index re-LISTed from the origin, licence
     /// re-affirmed. Each one is a stretch of origin-serving that ends at the reap
-    /// horizon; sustained movement means a peer is flapping.
+    /// horizon, plus a cache that has to buy itself back one key at a time; sustained
+    /// movement means a peer is flapping.
+    ///
+    /// The **expensive** arm of a lapse, and the same set `lapse_barrier_fallbacks`
+    /// counts — the two move together, and the pair with `lapse_barrier_retains` is what
+    /// says how often the cheap arm is winning.
     lease_lapse_resyncs => lease_lapse_resync,
+    /// Record a serve-lease lapse the staged barrier answered by **retaining** the body
+    /// cache: the peers that were alive when the lapse landed were still there after the
+    /// lease re-confirmed, and their advertised feed heads had all been applied locally,
+    /// so every write of the lapse era had already evicted exactly the keys it touched.
+    /// Nothing was distrusted, nothing was re-LISTed, and every untouched body kept its
+    /// proof — the cheap arm, and the one a healthy fleet should live on.
+    lapse_barrier_retains => lapse_barrier_retain,
+    /// Record a lapse the staged barrier could **not** answer, so the node fell back to
+    /// the full remediation (which is what `lease_lapse_resyncs` counts): a peer that was
+    /// alive when the lapse landed vanished from membership before the barrier ran (its
+    /// feed frame went with it), a peer's head never arrived, or the lease never
+    /// re-confirmed inside the deadline. Fail-closed by construction — every one of these
+    /// is "the proof was unavailable", never "the proof failed".
+    lapse_barrier_fallbacks => lapse_barrier_fallback,
     /// Record a cache-served read routed to the origin because this node held no licence
     /// to serve it locally: no valid coherence lease (`strong` — booting, warming up,
     /// lapsed, awaiting a resync affirmation, or a granter gone silent), or a membership
