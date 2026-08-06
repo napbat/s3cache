@@ -19,8 +19,7 @@ use crate::sync::coherence::{
 use crate::sync::config::{parse_lease_ms, parse_seeds};
 use crate::sync::recovery::{lapse_poll, settle_window};
 use crate::sync::wire::{
-    IndexEvent, IndexEventV1, IndexOp, IndexOpV1, V2_MAGIC, decode_event, encode_event,
-    from_micros, to_micros, wire_stamp,
+    IndexEvent, IndexOp, WIRE_MAGIC, decode_event, encode_event, from_micros, to_micros, wire_stamp,
 };
 use crate::tier::{CachedObject, LocalCache, TieredCache};
 
@@ -244,7 +243,7 @@ fn undecodable_feed(group: &Group) -> WriteFeed<IndexEvent> {
     WriteFeed::new(
         group.clone(),
         std::num::NonZeroUsize::new(FEED_CAPACITY).expect("a non-zero ring"),
-        |_: &IndexEvent| vec![V2_MAGIC, V2_MAGIC],
+        |_: &IndexEvent| vec![WIRE_MAGIC, WIRE_MAGIC],
     )
 }
 
@@ -532,7 +531,16 @@ fn event_codec_round_trips_and_rejects_garbage() {
         ts_us: 1_700_000_000_000_000,
     };
     let encoded = encode_event(&event);
-    assert_eq!(encoded.first(), Some(&V2_MAGIC), "the sender emits v2");
+    assert_eq!(
+        encoded.first(),
+        Some(&WIRE_MAGIC),
+        "the sender prefixes the current event format"
+    );
+    let unprefixed = bincode::serialize(&event).expect("the event shape serializes");
+    assert!(
+        decode_event(&unprefixed).is_none(),
+        "the decoder rejects bytes outside the current envelope"
+    );
     let back = decode_event(&encoded).expect("round trip");
     let IndexOp::Put {
         size,
@@ -551,49 +559,6 @@ fn event_codec_round_trips_and_rejects_garbage() {
     assert_eq!(back.key, event.key);
     assert_eq!(back.ts_us, event.ts_us);
     assert!(decode_event(b"\xff\xff").is_none());
-}
-
-/// Mixed-version safety: a node that has already been upgraded still applies the
-/// writes of one that has not. The v1 envelope is what a pre-upgrade peer puts on
-/// the wire, and its millisecond stamp has to land as the same instant.
-#[test]
-fn a_v1_event_still_decodes() {
-    let legacy = bincode::serialize(&IndexEventV1 {
-        op: IndexOpV1::Put { size: 7 },
-        bucket: "bucket-1".to_owned(),
-        key: "legacy".to_owned(),
-        ts_ms: 1_700_000_000_123,
-    })
-    .expect("v1 encodes");
-    assert_ne!(
-        legacy.first(),
-        Some(&V2_MAGIC),
-        "the magic byte cannot begin a v1 encoding, which is what makes them separable"
-    );
-    let back = decode_event(&legacy).expect("v1 decodes");
-    assert!(matches!(
-        back.op,
-        IndexOp::Put {
-            size: Some(7),
-            etag: None,
-            content_type: None,
-            storage_class: None
-        }
-    ));
-    assert_eq!(back.key, "legacy");
-    assert_eq!(back.ts_us, 1_700_000_000_123_000);
-
-    let deleted = bincode::serialize(&IndexEventV1 {
-        op: IndexOpV1::Del,
-        bucket: "bucket-1".to_owned(),
-        key: "legacy".to_owned(),
-        ts_ms: 1,
-    })
-    .expect("v1 encodes");
-    assert!(matches!(
-        decode_event(&deleted).expect("v1 delete decodes").op,
-        IndexOp::Del
-    ));
 }
 
 /// The LWW clock is only comparable if both sides carry the same precision: a local
@@ -636,7 +601,7 @@ async fn peer_events_fold_into_index_and_invalidate() {
     assert_eq!(
         entry.etag.as_ref().map(s3s::dto::ETag::value),
         Some("deadbeef"),
-        "the v2 envelope carries the origin's ETag to peers"
+        "the event envelope carries the origin's ETag to peers"
     );
     assert_eq!(entry.content_type.as_deref(), Some("text/x-fixture"));
     assert!(

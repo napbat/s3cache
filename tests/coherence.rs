@@ -105,8 +105,8 @@ async fn a_write_on_a_folds_into_bs_index() {
         ["shared"],
         "B's index has the key the moment A's write returned"
     );
-    // The v2 feed envelope carries the origin's ETag, so B reports it without ever
-    // asking the origin — where v1 advertised existence and size and nothing else.
+    // The feed envelope carries the origin's ETag, so B reports it without ever
+    // asking the origin.
     let (size, etag) = list_entry(&node_b, bucket, "shared")
         .await
         .expect("B lists the key");

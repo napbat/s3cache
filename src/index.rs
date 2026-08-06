@@ -30,7 +30,7 @@ use crate::tier::CachedObject;
 
 /// S3's default storage class, and what an object reports when it carries no
 /// `x-amz-storage-class`. Used where a path proves a key exists without saying which
-/// class it is in (a legacy v1 feed event); the next origin sync corrects it.
+/// class it is in; the next origin sync corrects it.
 #[must_use]
 pub(crate) fn standard_class() -> ObjectStorageClass {
     ObjectStorageClass::from_static(ObjectStorageClass::STANDARD)
@@ -64,7 +64,7 @@ pub(crate) struct ObjEntry {
     /// (the bootstrap LIST, a read observation) and the local write clock otherwise.
     pub(crate) last_modified: SystemTime,
     /// The origin's entity tag, when the path that indexed the key carried one: LIST,
-    /// the write responses and a v2 feed event do. An entry without one still answers
+    /// write responses and feed events do. An entry without one still answers
     /// existence, size and mtime — but never a HEAD.
     pub(crate) etag: Option<ETag>,
     pub(crate) storage_class: ObjectStorageClass,
@@ -114,8 +114,8 @@ const BODY_MTIME_SLACK: Duration = Duration::from_secs(1);
 /// bytes or not — so the entry's mtime must not run ahead of the body's by more than
 /// [`BODY_MTIME_SLACK`].
 ///
-/// Anything missing is a mismatch, never a pass: an entry with no `ETag` (a v1 feed
-/// event, a skeletal write) or a body with no `ETag`/`Last-Modified` cannot be compared,
+/// Anything missing is a mismatch, never a pass: an entry with no `ETag` (a bootstrap
+/// row or skeletal write) or a body with no `ETag`/`Last-Modified` cannot be compared,
 /// and an uncomparable copy is one the origin has to re-serve.
 pub(crate) fn entry_matches_body(entry: &ObjEntry, obj: &CachedObject) -> bool {
     let (Some(indexed), Some(cached)) = (entry.etag.as_ref(), obj.e_tag()) else {

@@ -268,8 +268,8 @@ async fn a_suspect_copy_the_index_contradicts_is_dropped() {
         .obj_cache
         .insert(ck("deleted"), cached("v1", filled))
         .await;
-    // Nothing to compare with: a skeletal entry (a bootstrap row, a v1 feed event)
-    // proves the key exists and nothing about which version of it.
+    // Nothing to compare with: a skeletal entry proves the key exists and nothing
+    // about which version of it.
     proxy
         .obj_cache
         .insert(ck("etagless"), cached("v1", filled))

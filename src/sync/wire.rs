@@ -11,35 +11,9 @@ pub(super) fn parse_token(value: &str) -> Option<(&str, u64, u64)> {
     Some((writer, epoch.parse().ok()?, seq.parse().ok()?))
 }
 
-/// What one durable write did, as the original (v1) envelope carried it. Kept exactly as
-/// it was: it is still the wire format of every node in a cluster that has not finished
-/// restarting, and this node has to keep reading it.
-#[derive(Serialize, Deserialize)]
-pub(super) enum IndexOpV1 {
-    /// The key now holds an object of `size` bytes.
-    Put {
-        /// Object size, for the LIST index.
-        size: i64,
-    },
-    /// The key was deleted.
-    Del,
-}
-
-/// One durable write in the v1 envelope: the operation, its `(bucket, key)`, and the
-/// writer's wall-clock timestamp in **milliseconds**.
-#[derive(Serialize, Deserialize)]
-pub(super) struct IndexEventV1 {
-    pub(super) op: IndexOpV1,
-    pub(super) bucket: String,
-    pub(super) key: String,
-    pub(super) ts_ms: u64,
-}
-
-/// First byte of a v2 envelope. A v1 encoding is bincode of [`IndexEventV1`], whose
-/// leading field is an enum — a little-endian `u32` variant index — so every v1 encoding
-/// begins `0x00` or `0x01`. `0xFF` can begin none of them, which is what lets one decoder
-/// accept both formats through a rolling upgrade with no flag day.
-pub(super) const V2_MAGIC: u8 = 0xFF;
+/// Prefix identifying the current event envelope. Bytes without it are not this
+/// protocol and are rejected rather than interpreted as another shape.
+pub(super) const WIRE_MAGIC: u8 = 0xFF;
 
 /// What one durable write did, as advertised to peers.
 #[derive(Serialize, Deserialize)]
@@ -105,7 +79,7 @@ pub(super) fn etag_to_wire(tag: &ETag) -> String {
 }
 
 pub(super) fn encode_event(event: &IndexEvent) -> Vec<u8> {
-    let mut out = vec![V2_MAGIC];
+    let mut out = vec![WIRE_MAGIC];
     match bincode::serialize(event) {
         Ok(body) => out.extend_from_slice(&body),
         Err(_) => return Vec::new(),
@@ -113,30 +87,10 @@ pub(super) fn encode_event(event: &IndexEvent) -> Vec<u8> {
     out
 }
 
-/// Decodes either envelope: the magic byte selects v2, anything else is read as v1 and
-/// lifted into the v2 shape, so a node mid-upgrade applies its peers' writes whichever
-/// version wrote them.
+/// Decode the current event envelope. Unprefixed or malformed bytes are rejected.
 pub(super) fn decode_event(bytes: &[u8]) -> Option<IndexEvent> {
     match bytes.split_first() {
-        Some((&V2_MAGIC, body)) => bincode::deserialize(body).ok(),
-        _ => decode_v1(bytes),
+        Some((&WIRE_MAGIC, body)) => bincode::deserialize(body).ok(),
+        _ => None,
     }
-}
-
-fn decode_v1(bytes: &[u8]) -> Option<IndexEvent> {
-    let event: IndexEventV1 = bincode::deserialize(bytes).ok()?;
-    Some(IndexEvent {
-        op: match event.op {
-            IndexOpV1::Put { size } => IndexOp::Put {
-                size: Some(size),
-                etag: None,
-                content_type: None,
-                storage_class: None,
-            },
-            IndexOpV1::Del => IndexOp::Del,
-        },
-        bucket: event.bucket,
-        key: event.key,
-        ts_us: event.ts_ms.saturating_mul(1000),
-    })
 }
