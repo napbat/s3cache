@@ -7,6 +7,24 @@ while cutting request costs for chatty clients.
 It is a *service that speaks S3* — not a client library. Set the client's S3
 endpoint to this proxy; no client code changes.
 
+> ## ⚠️ DO NOT SHIP THIS TREE — it does not build anywhere but one workstation
+>
+> `Cargo.toml` carries a `[patch."https://github.com/napbat/groupnet"]` section pointing
+> at a **local** `../groupnet` checkout. The lease tier this branch is built on
+> (`consistency-leases`, groupnet milestones M0–M6) is not pushed to GitHub yet, so
+> **every non-local build is structurally broken**: CI, the Dockerfile image build, and
+> anyone cloning this repo resolve `../groupnet` and find nothing.
+>
+> Release order, no steps skipped:
+>
+> 1. push groupnet `main` to `github.com/napbat/groupnet`;
+> 2. delete the `[patch]` section from `Cargo.toml`;
+> 3. `cargo update -p groupnet`;
+> 4. run the whole gate — `cargo build`, `cargo test`, `cargo clippy --all-targets`,
+>    `cargo fmt --check`, `helm lint`, `helm template`.
+>
+> Until step 2 lands, treat this branch as unmergeable and unreleasable.
+
 ## What it does
 
 - **LIST and HEAD from an in-memory key index.** Because every request funnels through
@@ -94,33 +112,110 @@ single-replica constraint with zero extra services.
 
 Clients should never have to know s3cache exists. In the default mode they don't:
 
-**`strong` (default).** Indistinguishable from talking to one S3 node, for *every*
-client, no headers, no cooperation:
+**`strong` (default) — lease-backed.** Indistinguishable from talking to one S3 node,
+for *every* client, no headers, no cooperation. The mechanism is a **coherence lease**
+(Gray–Cheriton freshness leases, groupnet's T3 tier), and it replaces the view-stability
+heuristic earlier releases used:
 
-- **Writes wait for cluster-wide invalidation.** A write returns only after the origin
-  acked it AND every currently-alive peer acknowledged applying its invalidation (an
-  in-cluster ack round, ~2 gossip hops, riding behind the origin round-trip already
-  paid). So `PUT via A; GET via B` is deterministically fresh — B applied the
-  invalidation before A's PUT even returned.
-- **Unhealthy nodes bench themselves.** A node whose membership view is not fully
-  alive may be the partitioned one — writers can't reach it — so it serves
-  cache-eligible reads via the origin until the view heals: slower, never stale. (This
-  is also what bounds the writer's ack wait: a dying peer is excluded once SWIM marks
-  it suspect.)
-- **The authoritative 404 waits for a settled view.** A HEAD of a key the index does
-  not hold is a local 404 only once the membership view has been unchanged — no status
-  change, no ack timeout, no write-feed gap — for the failure detector's whole window.
-  Inside it, a peer that has just written the key may not yet look unhealthy, and a 404
-  for an object that exists is a lie no retry corrects; so the HEAD is forwarded and
-  counted as `head_miss`. Without gossip (single node) there is no such window and the
-  404 is always local.
-- **Honesty footnote:** the residual window is an *asymmetric* partition inside the
-  SWIM probe window combined with an ack timeout (logged + counted, ~2s) — bounded and
-  loud, never silent. The absolute arbiter for conflicting writers remains the origin:
-  conditional `If-Match`/`If-None-Match` writes pass through untouched (OCC — no lost
-  updates, regardless of node), and the index heals from the origin (gap resync,
-  startup bootstrap). Cross-writer index races resolve by timestamp, deletes winning
-  ties.
+- **A node may serve locally only while it holds a lease.** Every node continuously
+  renews a *serve-lease* (one small gossip entry every `D/3`), and every other node
+  grants the renewals it has adopted. A node answers a LIST from its index, a GET from
+  its cache, or an authoritative 404 **only** while a lease confirmed by every peer
+  covers this instant. It is one mechanism for all three questions, not three
+  heuristics — and `false` covers everything: booting, warming up, lapsed, awaiting a
+  resync, a peer gone silent, a partition. Every one of them sends the read to the
+  origin: slower, never stale (`unhealthy_bypasses`).
+- **Writes end at an ack *or* at a lapse.** A write returns only after the origin acked
+  it AND every lease-holder either applied the invalidation (the fast path — one
+  in-cluster ack round, ~2 gossip hops, behind the origin round-trip already paid) or
+  had its serve-lease **expire in the writer's own engine** (the slow path — bounded by
+  `D`, counted as `write_lease_lapses`). So `PUT via A; GET via B` is deterministically
+  fresh, and a peer that stops answering costs one write up to `D` **once**, not an ack
+  timeout on every write forever.
+- **That second path is the whole point.** The old mode ended an unacked write in a
+  *degradation*: the writer proceeded and correctness then depended on the stale peer
+  *learning* it should stand down — exactly what an asymmetrically-partitioned peer
+  cannot do. A lapse is a guarantee instead: the straggler's own clock has closed its
+  serve window, and a lapsed node serves nothing cached until it re-synchronizes from
+  the origin and affirms it.
+- **A gap stands the lease down first.** A write-feed gap (ring overflow, a peer
+  restart) is proof this node missed invalidations, so it drops its right to serve
+  *before* the remediation runs — and only the resync that actually ran may hand it
+  back. A booting node likewise serves nothing local until its configured buckets have
+  warmed and the lease shell's own warm-up window has passed.
+- **A lapse with no gap behind it gets the same remediation.** Not every way of losing
+  the licence arrives as an event: a peer scaled in, lost for good, or restarted while
+  the write feed was quiet freezes this node's confirmation with no gap to notice. The
+  lapse latches, so a watcher on the lease runs exactly the gap's remediation — flush,
+  origin re-LIST, affirm — and the node returns to service the moment its lease can be
+  confirmed again (`lease_lapse_resyncs`). Without it a lapse would be permanent
+  origin-serving for a node whose surviving peers are perfectly healthy.
+
+**What it rests on, stated as failure modes** (groupnet's `consistency::lease` honesty
+box is the long form):
+
+- **Bounded clock *rate* skew, not bounded connectivity.** A reader computes its window
+  on its own monotonic clock and its granters expire on theirs. A reader whose clock
+  runs slow relative to a granter's by more than the rate margin (`max(D/100, 5ms)`)
+  over one lease duration can believe it holds a lease the granter already expired. It
+  is an assumption about *rates* — a few hundred ppm on any healthy host — never about
+  wall-clock steps, which cannot affect it.
+- **The fail-slow reader is the one shape no lease bounds.** A node that keeps
+  *renewing* while it stops *applying* — a stuck apply loop, a partition that carries
+  gossip but not writes — offers neither an ack nor a lapse, so writes behind it run to
+  their own deadline (`D + 1s`) and end with **no** guarantee, counted as
+  `ack_timeouts` and logged naming the node. Raising the deadline cannot help; the
+  remedy is operational — stop that pod. The log line names it.
+- **One unresponsive pod freezes every reader, briefly.** Confirmation is a min over
+  the whole roster and only a *reap* removes a member, so a pod that stops granting
+  freezes every other reader's lease cluster-wide: reads stay correct and all of them
+  go to the origin. s3cache tunes `dead_timeout` down to `D` for exactly this, turning
+  the untuned ~19s of cluster-wide origin-serving into ≈3s. The freeze *ends* at the
+  reap rather than latching: each frozen reader watches its own lapse and remediates it
+  (above), so it comes back — cold, having flushed, but in service. The price is the
+  other end of the same horizon: a partition outliving ~4s lands on the write-feed
+  **gap** path (flush + origin re-LIST) instead of reconciling — loud, correct, and the
+  standing remedy a cache wants.
+- **First write after a pod dies costs up to `D`.** That is the lapse being waited out,
+  once. It shows up as `write_lease_lapses`, not `ack_timeouts`, because the guarantee
+  held. A *planned* stop does not pay it: on `SIGTERM` (a rollout, a scale-in) the node
+  retracts its serve-lease before it drains, so there is no lapse to wait out. That is
+  the write side only — the reader-side freeze above is unchanged either way, because
+  the departing node's capability advertisement lives in every roster until the reap.
+- The absolute arbiter for conflicting writers remains the origin: conditional
+  `If-Match`/`If-None-Match` writes pass through untouched (OCC — no lost updates,
+  regardless of node), and the index heals from the origin (gap resync, startup
+  bootstrap). Cross-writer index races resolve by timestamp, deletes winning ties.
+
+**`strong-acks` (`S3CACHE_CONSISTENCY=strong-acks`) — deprecated, one release only.**
+The pre-lease *coherence mechanism*, kept so a deployment can roll the lease tier
+through the fleet in stages: writes wait on every alive peer that participates in the
+ack tier, an ack timeout ends in a degradation rather than a guarantee, and the
+read-side licence is the old view-stability heuristic (a fully-alive membership view,
+unchanged for the failure detector's whole window).
+
+It is a rollback lever for that mechanism, **not a time machine**. Three things changed
+underneath every mode, and this one gets them too:
+
+- **Membership is tuned differently, in every mode.** `dead_timeout` is pulled from
+  groupnet's 10s default down to `max(D, 2s)` uniformly — a mixed fleet must have one
+  membership timing, not two — which puts the reap horizon at ~4s instead of ~20s. A
+  partition outliving that lands on the write-feed **gap** path (flush + origin re-LIST)
+  rather than reconciling through a digest catch-up: loud, correct, and not what this
+  mode did before.
+- **The 404 trust window is computed per call, not fixed.** It was a constant 650ms off
+  groupnet's *default* probe timings. It is now `detection_window_ms` read off the
+  **effective** config and the membership actually being swept (floored at two members)
+  — a correction of a window that was too short, and a larger number: 700ms for a pair,
+  growing with the cluster.
+- **The ack wait skips peers that declare themselves bounded.** A peer advertising
+  `s3cache:bounded` is no longer waited out per write. A peer that advertises *nothing*
+  still is — absence is not non-participation — so a pre-upgrade fleet is unaffected.
+
+It is removed in the next release. Nothing new should choose it, and a fleet running it
+is running the brittleness the lease tier exists to remove. Mixed fleets are safe in
+both directions — a leased writer waits for `strong-acks` and pre-upgrade peers through
+the ordinary ack round, since they publish no lease for it to wait on or expire.
 
 **`bounded` (`S3CACHE_CONSISTENCY=bounded`, set uniformly).** For clusters too large to
 pay a per-write ack round: writes return on the origin ack, reads are fresh within ~one
@@ -225,7 +320,8 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
 | `S3CACHE_GOSSIP_BIND` | (empty) | UDP bind for the gossip write feed (e.g. `0.0.0.0:7946`); unset = single-node, no coherence layer |
 | `S3CACHE_GOSSIP_SEEDS` | (empty) | Comma-separated seed peers as `id=host:port`; only seeds need static addressing |
 | `S3CACHE_GOSSIP_ADVERTISE` | bind addr | Address peers should dial back (set under NAT/container networking) |
-| `S3CACHE_CONSISTENCY` | `strong` | `strong`: writes wait for cluster-wide invalidation, unhealthy nodes serve via origin. `bounded`: ~one-hop freshness, no per-write ack round (large clusters; set uniformly) |
+| `S3CACHE_CONSISTENCY` | `strong` | `strong`: lease-backed — a node serves locally only while it holds a serve-lease, and a write ends at an ack or at a lapse. `strong-acks`: the pre-lease ack-only mechanism, **deprecated**, removed next release. `bounded`: ~one-hop freshness, no per-write ack round (large clusters; set uniformly) |
+| `S3CACHE_LEASE_MS` | `2000` | Coherence-lease duration `D` (`strong` only): the writer's worst-case stall on a silent peer, each reader's window between confirmations, and the fleet's membership `dead_timeout`. Renewal traffic is one small entry per node per `D/3` |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval (seconds) |
 | `S3CACHE_METRICS_LISTEN` | (empty) | Listen address for the Prometheus text endpoint (e.g. `0.0.0.0:9090`); unset = no endpoint |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` | — | Upstream creds (R2: region `auto`) |
@@ -249,4 +345,20 @@ read path), `write_fill` (writes whose body was kept rather than dropped — eac
 origin GET the object's first read no longer costs), `index_backfills` (index entries
 completed from a forwarded answer — see below), the warm tier (`warm_hit` / `warm_miss` / `warm_error`, with `warm_rejects` for
 objects the per-object cap declined, kept apart so `warm_error` stays alertable) and the
-gossip write feed (`feed_*`, `ack_timeouts`, `unhealthy_bypasses`).
+gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`, `lease_lapse_resyncs`,
+`unhealthy_bypasses`).
+
+The last four are the coherence tier's, and the split between the first two is the one
+worth wiring an alert around: **`write_lease_lapses` is the guarantee working** — a peer
+stopped acknowledging, its serve-lease expired, and the write completed knowing that peer
+can serve nothing cached until it re-synchronizes. Sustained movement means a pod is
+unresponsive and each such write cost up to one lease duration, but no read was ever
+stale. **`ack_timeouts` is the absence of the guarantee**: peers still live and still
+behind when the wait's deadline passed (in `strong`, the fail-slow reader — renewing but
+not applying — plus any un-leased peer that did not ack). Alert on that one.
+`unhealthy_bypasses` counts reads sent to the origin because this node held no licence to
+answer them locally; it is expected to be non-zero at every startup and after every gap.
+`lease_lapse_resyncs` is the read side of the same story: this node's *own* lease lapsed
+with no gap to explain it (a peer stopped granting), so it flushed, re-LISTed and affirmed
+its way back into service. One per peer death is normal; sustained movement is a flapping
+peer, and each one leaves this node cold.

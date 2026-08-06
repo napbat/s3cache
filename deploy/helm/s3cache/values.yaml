@@ -45,11 +45,21 @@ diskCache:
 # are the node identities. A single replica is a cluster of one.
 gossip:
   port: 7946
-  # strong (default): writes wait for every alive peer to apply their invalidation and
-  # unhealthy nodes serve via the origin — indistinguishable from one S3 node, right for
-  # fleet-sized clusters. bounded: reads fresh within ~one gossip hop, writes return on
-  # the origin ack, no per-write cluster round — for large clusters. Set uniformly.
+  # strong (default): coherence leases. A pod may answer from its own index or body cache
+  # only while it holds an unexpired serve-lease its peers granted, so a write ends when
+  # every lease-holder has either applied the invalidation (one ack round) or had its
+  # lease lapse (bounded by leaseMs, on the stale pod's own clock) — indistinguishable
+  # from one S3 node, right for fleet-sized clusters. bounded: reads fresh within ~one
+  # gossip hop, writes return on the origin ack, no per-write cluster round — for large
+  # clusters. strong-acks: the pre-lease mechanism, DEPRECATED and removed next release;
+  # set it only to pin today's behaviour while the fleet rolls. Set uniformly.
   consistency: strong
+  # Coherence-lease duration D in milliseconds (S3CACHE_LEASE_MS), strong mode only.
+  # The knob trading write-stall-under-failure against renewal traffic: a writer whose
+  # peer goes silent stalls at most one D, and each pod republishes one small entry every
+  # D/3 to keep its lease. It also sets the fleet's membership dead_timeout, so raising it
+  # lengthens the freeze a single unresponsive pod costs every reader. Empty = 2000.
+  leaseMs: ""
 
 # Prometheus text endpoint (GET /metrics) on its own port, carrying the same counters as
 # the 60s stats line — graphable and alertable instead of diffed out of pod logs by hand.

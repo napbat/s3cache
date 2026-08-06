@@ -20,7 +20,7 @@ http-body-util = "0.1"
 tierstore = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-mmap = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-moka = { git = "https://github.com/napbat/tierstore", branch = "main" }
-groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency-acks", "udp"] }
+groupnet = { git = "https://github.com/napbat/groupnet", branch = "main", features = ["consistency-leases", "udp"] }
 bytes = { version = "1", features = ["serde"] }
 http = "1"
 futures = "0.3"
@@ -31,6 +31,25 @@ anyhow = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 bincode = "1"
 blake3 = "1.8.5"
+
+# ############################################################################
+# TEMPORARY — DO NOT MERGE PAST THE GROUPNET PUSH. DO NOT SHIP.
+#
+# The APIs this crate now builds against (capability advertisement,
+# `applied_by_selected`, `Config::detection_window_ms`, the lease tier) live on
+# local groupnet main (651bdeb, milestones M0–M6) and are NOT yet pushed to
+# github. While this section exists, EVERY non-local build is structurally
+# broken: CI, the Dockerfile image build, and anyone cloning this repo all
+# resolve `../groupnet` and find nothing. Only this workstation builds.
+#
+# Release steps, in this order:
+#   1. push groupnet main to github.com/napbat/groupnet
+#   2. delete this `[patch]` section
+#   3. cargo update -p groupnet
+#   4. run the full gate (build, test, clippy --all-targets, fmt --check)
+# ############################################################################
+[patch."https://github.com/napbat/groupnet"]
+groupnet = { path = "../groupnet/crates/groupnet" }
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

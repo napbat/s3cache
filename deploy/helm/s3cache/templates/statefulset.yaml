@@ -93,6 +93,14 @@ spec:
               value: "s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }},s3cache-1=s3cache-1.s3cache-gossip:{{ .Values.gossip.port }}"
             - name: S3CACHE_CONSISTENCY
               value: {{ .Values.gossip.consistency | quote }}
+            {{- with .Values.gossip.leaseMs }}
+            # Coherence-lease duration D (strong mode): the writer's worst-case stall on
+            # a silent peer, and each reader's window between confirmations. Unset here
+            # means the binary's own default (2000ms) — the value the whole tier is tuned
+            # around, so override it deliberately or not at all.
+            - name: S3CACHE_LEASE_MS
+              value: {{ . | int64 | quote }}
+            {{- end }}
             - name: RUST_LOG
               value: "info"
           # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION for the upstream.

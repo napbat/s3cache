@@ -65,6 +65,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // comma-separated id=host:port pairs) to enable; single-node needs none of it.
     let write_sync = sync::from_env(&cfg.node_name).await.map(Arc::new);
     info!("gossip coherence (write feed): {}", write_sync.is_some());
+    // Kept for the shutdown path: a planned stop retracts this node's serve-lease
+    // instead of letting peers wait it out (see `WriteSync::leave`).
+    let leaving = write_sync.clone();
 
     // Object-body cache: hot (node-local heap) in front of the optional disk tier (warm),
     // in front of the S3 origin (cold). Always layered — no mode to pick.
@@ -101,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let listener = TcpListener::bind(&cfg.listen).await?;
     let http_server = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut stopping = std::pin::pin!(stop_signal());
 
     let (listen, endpoint) = (&cfg.listen, &cfg.endpoint);
     info!("s3cache listening on {listen}, upstream {endpoint}");
@@ -112,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 Ok(conn) => conn,
                 Err(err) => { tracing::error!("accept error: {err}"); continue; }
             },
-            _ = ctrl_c.as_mut() => break,
+            () = stopping.as_mut() => break,
         };
         let conn = http_server.serve_connection(TokioIo::new(socket), service.clone());
         let conn = graceful.watch(conn.into_owned());
@@ -121,11 +124,55 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         });
     }
 
+    // Announce the departure before draining, not after: the retraction is one gossip
+    // entry and the drain can take seconds, and every one of them is a second a peer's
+    // next write might spend waiting out a lease this node has already stopped using.
+    if let Some(sync) = &leaving {
+        sync.leave();
+    }
+
     tokio::select! {
         () = graceful.shutdown() => info!("graceful shutdown complete"),
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => info!("shutdown timed out"),
     }
     Ok(())
+}
+
+/// Resolves on the first signal that means "stop": `SIGTERM` or `ctrl_c`.
+///
+/// `SIGTERM` is the one that matters in production and the one this process would
+/// otherwise not hear at all — it is what a `StatefulSet` rollout, a scale-in, and
+/// `kubectl delete pod` all send, and Kubernetes follows it with `SIGKILL` at the end of
+/// the grace period. Catching it is what turns a planned stop into a *planned* stop:
+/// connections drain, and the coherence lease is retracted rather than left for peers to
+/// wait out (see [`sync::WriteSync::leave`]).
+///
+/// A platform without `SIGTERM` (a developer's Windows workstation) keeps `ctrl_c`,
+/// which is the only stop it can send.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // A failed registration is not a reason to run unstoppable: fall back to
+        // `ctrl_c` alone, loudly, so the missing half is visible in the log.
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = sigterm.recv() => info!("SIGTERM received; shutting down"),
+                    _ = tokio::signal::ctrl_c() => info!("interrupted; shutting down"),
+                }
+            }
+            Err(err) => {
+                tracing::warn!("cannot listen for SIGTERM ({err}); ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("interrupted; shutting down");
+    }
 }
 
 /// Raise `RLIMIT_NOFILE`'s soft limit to the hard cap. The proxy holds one socket per

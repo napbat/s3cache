@@ -126,10 +126,31 @@ counters! {
     feed_applied => feed_applied,
     /// Record a feed gap (missed writes): local tiers flushed, index resynced.
     feed_gaps => feed_gap,
-    /// Record a write held past the ack window by an unresponsive peer.
+    /// Record a write that ended with **no** coherence guarantee: peers still live and
+    /// still behind when the wait's deadline passed. In `strong` that is the lease
+    /// tier's one unbounded shape — a holder renewing but not applying, whose remedy is
+    /// operational rather than a longer deadline — plus any transitional (unleased) peer
+    /// that did not ack; in `strong-acks` it is an unresponsive peer, and it also stands
+    /// this node's authoritative 404s down. Alertable in every mode.
     ack_timeouts => ack_timeout,
-    /// Record a cache-served read routed to the origin because this node's
-    /// membership view was not fully alive.
+    /// Record a write that completed on a **lease lapse** rather than an acknowledgement:
+    /// a peer stopped acking and its serve-lease expired here, so it serves nothing
+    /// cached until it re-synchronizes. The guarantee held — this is the slow path
+    /// working, not failing, and it is deliberately not `ack_timeouts`. Sustained
+    /// movement means a peer is unresponsive, and each such write cost up to one lease
+    /// duration.
+    write_lease_lapses => write_lease_lapse,
+    /// Record a resync this node ran because **its own** serve-lease lapsed with no
+    /// write-feed gap to explain it — a peer stopped granting (scale-in, a crash, a
+    /// partition that healed without overflowing the ring), so the lapse watcher ran the
+    /// gap remediation: tiers flushed, index re-LISTed from the origin, licence
+    /// re-affirmed. Each one is a stretch of origin-serving that ends at the reap
+    /// horizon; sustained movement means a peer is flapping.
+    lease_lapse_resyncs => lease_lapse_resync,
+    /// Record a cache-served read routed to the origin because this node held no licence
+    /// to serve it locally: no valid coherence lease (`strong` — booting, warming up,
+    /// lapsed, awaiting a resync affirmation, or a granter gone silent), or a membership
+    /// view that was not fully alive (`strong-acks`).
     unhealthy_bypasses => unhealthy_bypass,
     /// Record a skeletal index entry completed from an origin response (the one
     /// forwarded HEAD that makes every later HEAD of that key local *and* faithful).

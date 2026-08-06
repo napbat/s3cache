@@ -10,6 +10,15 @@ serves GET/HEAD from a tiered object-body cache: **hot** (in-memory heap) → **
 (node-local disk, optional) → **cold** (the S3 origin). Writes go through to the
 upstream. Cross-node coherence rides a gossip write feed (`groupnet`).
 
+## ⚠️ DO NOT SHIP THIS TREE — it builds on exactly one workstation
+
+`Cargo.toml` carries a `[patch."https://github.com/napbat/groupnet"]` pointing at a
+**local** `../groupnet` checkout, because the coherence-lease tier this branch is built
+on (`consistency-leases`) is not pushed to GitHub yet. CI, the Dockerfile image build,
+and any fresh clone all resolve `../groupnet`, find nothing, and fail. Release order:
+push groupnet `main`, delete the `[patch]` section, `cargo update -p groupnet`, then run
+the whole gate below. Do not merge, tag, or build an image before that.
+
 ## Agent workflow: Fable orchestrator, Opus 5 implementer
 
 Work in this repo uses a two-tier agent setup:
@@ -101,7 +110,8 @@ daemon. The proxy reaches MinIO through a transparent counting forwarder in
 | `S3CACHE_DISK_CACHE` | empty (disabled) | Directory for the warm (disk) tier |
 | `S3CACHE_DISK_CACHE_BYTES` | `10737418240` (10 GiB) | Warm tier byte budget |
 | `S3CACHE_GOSSIP_BIND` / `_ADVERTISE` / `_SEEDS` | empty (disabled) | Gossip write feed for cross-node coherence |
-| `S3CACHE_CONSISTENCY` | `strong` | `strong` or `bounded` |
+| `S3CACHE_CONSISTENCY` | `strong` | `strong` (lease-backed), `strong-acks` (the pre-lease mechanism — **deprecated**, removed next release), or `bounded` |
+| `S3CACHE_LEASE_MS` | `2000` | Coherence-lease duration `D` (`strong` only) — also the fleet's membership `dead_timeout` |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval |
 | `S3CACHE_METRICS_LISTEN` | empty (disabled) | Bind address for the Prometheus text endpoint (`GET /metrics`) |
 
@@ -117,3 +127,30 @@ daemon. The proxy reaches MinIO through a transparent counting forwarder in
 - `upstream.endpoint` (required) / `upstream.buckets`.
 - `metrics.enabled` / `metrics.port` — the Prometheus text endpoint
   (`S3CACHE_METRICS_LISTEN`) on a named `metrics` container port.
+- `gossip.consistency` / `gossip.leaseMs` — the coherence mode
+  (`S3CACHE_CONSISTENCY`) and the lease duration `D` (`S3CACHE_LEASE_MS`; empty renders
+  no env var, so the binary's own 2000ms default applies).
+
+## Consistency, in one paragraph
+
+The default `strong` mode is **lease-backed**: a node may answer a LIST, a GET, or an
+authoritative 404 from its own state only while it holds an unexpired *serve-lease* its
+peers granted (groupnet's `consistency::lease`, tier T3), and a write ends when every
+lease-holder has either applied the invalidation (one ack round) or had its lease lapse
+in the writer's engine (bounded by `D`, on the straggler's own clock). That replaces the
+old view-stability heuristic (`Stability`/`settled()`), which survives only for
+`strong-acks` — deprecated, removed next release. `strong-acks` pins the **mechanism**
+and nothing else: `dead_timeout` is retuned to `max(D, 2s)` in every mode, the 404 trust
+window is computed per call, and declared-bounded peers are skipped by every ack wait —
+so do not describe it as pinning the previous release's behaviour (the README's
+`strong-acks` section states the three differences). The named failure modes
+(clock-*rate* skew, the fail-slow reader, the unreaped-granter freeze, the first write
+after a death) are in the README's Consistency section and in groupnet's own honesty box;
+do not restate them loosely, and do not add a mode without answering
+`Consistency::{acks, leases, capabilities}` explicitly — they are exhaustive on purpose.
+
+Losing the read-side licence is a **latch**, so every way of losing it needs a way back:
+a write-feed gap has the apply loop's remediation, and a lapse with no gap behind it has
+`sync::watch_lapses` (strong only), which runs the same remediation on the same
+`ResyncGate` generation. A planned stop calls `WriteSync::leave` from the binary's
+signal path so peers do not wait out a lease of a pod that is leaving on purpose.

@@ -449,6 +449,7 @@ pub async fn gossip_pair(a: &str, b: &str) -> (Arc<WriteSync>, Arc<WriteSync>) {
             seeds: vec![(peer.to_owned(), format!("127.0.0.1:{peer_port}"))],
             node_id: me.to_owned(),
             consistency: Consistency::Strong,
+            lease_ms: s3cache::sync::DEFAULT_LEASE_MS,
         };
         let (Some(sync_a), Some(sync_b)) = (
             WriteSync::new(config(a, port_a, b, port_b)).await,

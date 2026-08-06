@@ -61,6 +61,11 @@ enum ReadRoute {
 /// How long a write response may be held waiting for every alive peer to
 /// acknowledge applying its invalidation. Generously above the SWIM suspect
 /// timeout, so a dying peer is excluded from the wait before this fires.
+///
+/// In `strong` this bounds only the *transitional* wait on unleased peers (empty in a
+/// uniform leased fleet): the lease wait runs to its own `D + 1s` deadline, and the two
+/// run concurrently, so the response is held for the longer of the two — see
+/// [`WriteSync::wait_cluster_applied`](crate::sync::WriteSync).
 const WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a strict read waits for the freshness barrier before serving
@@ -296,6 +301,35 @@ impl IndexedWrite {
     }
 }
 
+/// Wait for every warm-up in `warmups`, then affirm to the coherence lease that this
+/// node has caught up and may serve locally again — on behalf of `generation`, so a gap
+/// that arrives while the warm-ups run supersedes the affirmation instead of being
+/// papered over by it.
+///
+/// With **no** buckets the join is vacuous and the affirmation is immediate, which is
+/// safe rather than a hole: a node told to warm nothing has empty tiers and a
+/// passthrough index, so there is no local state for a lease to license serving — every
+/// LIST forwards, every GET misses, and every index miss is a miss rather than a 404. The
+/// lease shell's own warm-up guard still holds the window shut for this node's first
+/// `detection_window_ms + 2 × anti_entropy_interval` regardless, which is the window that
+/// matters: it is what keeps a booting node from serving under a roster it has not
+/// finished learning.
+async fn affirm_after(
+    warmups: Vec<tokio::task::JoinHandle<()>>,
+    sync: Option<Arc<WriteSync>>,
+    generation: Option<u64>,
+) {
+    for warmup in warmups {
+        // A warm-up task only ends by succeeding (it retries forever otherwise), so a
+        // join error is this process shutting down — nothing to report and nothing left
+        // to affirm to.
+        let _ = warmup.await;
+    }
+    if let (Some(sync), Some(generation)) = (sync, generation) {
+        sync.affirm_resynced(generation).await;
+    }
+}
+
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
 /// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
 /// every write.
@@ -341,8 +375,9 @@ impl CachingProxy {
     }
 
     /// Start the gossip apply loop: peers' events fold into this node's LIST index and
-    /// invalidate its body copies; a gap flushes every local tier and resyncs `buckets`
-    /// from the origin. A no-op without gossip — single-node is already strict.
+    /// invalidate its body copies; a gap — or, in `strong`, a serve-lease lapse with no
+    /// gap behind it — flushes every local tier and resyncs `buckets` from the origin.
+    /// A no-op without gossip — single-node is already strict.
     pub fn start_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
         sync.start_apply(
@@ -353,12 +388,24 @@ impl CachingProxy {
         );
     }
 
-    /// The gap remediation for the apply loop: reset every bucket to
-    /// passthrough (unsynced LISTs are always correct) and re-warm the
-    /// configured ones from the origin — the authority the index caches.
+    /// The index half of the remediation: reset every bucket to passthrough
+    /// (unsynced LISTs are always correct) and re-warm the configured ones from
+    /// the origin — the authority the index caches.
+    ///
+    /// Both triggers in `sync` call this — a write-feed gap and a serve-lease lapse with
+    /// no gap behind it — and each has already stood the lease down and flushed the tiers
+    /// before it does.
+    ///
+    /// It also **owns the affirmation** that puts this node back in service: only work
+    /// that actually re-synchronized may lift a stand-down, so the generation is read
+    /// here, after that stand-down and before the first LIST, and handed to the
+    /// affirmation at the end. A second gap arriving mid-resync moves the generation on,
+    /// and this affirmation then declines rather than re-opening a window its own resync
+    /// no longer covers.
     fn gap_resync_handle(&self, buckets: Vec<String>) -> Arc<dyn Fn() + Send + Sync> {
         let client = self.client.clone();
         let state = self.state.clone();
+        let sync = self.sync.clone();
         Arc::new(move || {
             {
                 let mut g = state.write().unwrap();
@@ -367,6 +414,8 @@ impl CachingProxy {
                 }
             }
             let (client, state, buckets) = (client.clone(), state.clone(), buckets.clone());
+            let sync = sync.clone();
+            let generation = sync.as_ref().map(|sync| sync.resync_gen());
             tokio::spawn(async move {
                 for bucket in buckets {
                     if let Err(e) = sync_bucket_into(&client, &state, &bucket).await {
@@ -374,6 +423,9 @@ impl CachingProxy {
                             "gap resync of `{bucket}` failed (staying passthrough): {e}"
                         );
                     }
+                }
+                if let (Some(sync), Some(generation)) = (sync, generation) {
+                    sync.affirm_resynced(generation).await;
                 }
             });
         })
@@ -388,11 +440,12 @@ impl CachingProxy {
         let Some(sync) = &self.sync else {
             return ReadRoute::Local; // single node: the sole writer is strict
         };
-        // The read-side half of transparent coherence: if this node's
-        // membership view is not fully alive, it may be the partitioned one —
-        // writers can't reach it with invalidations, so its cache is not
-        // trustworthy. Serve via the origin until the view heals.
-        if !sync.cluster_healthy() {
+        // The read-side half of transparent coherence: this node may answer from its
+        // own state only while it holds the licence its mode issues — a valid coherence
+        // lease in `strong`, a fully-alive membership view in `strong-acks`. Without one
+        // it may be the partitioned node that writers cannot reach with invalidations,
+        // so it serves via the origin until the licence comes back.
+        if !sync.may_serve_local() {
             self.metrics.unhealthy_bypass();
             return ReadRoute::Origin;
         }
@@ -487,11 +540,18 @@ impl CachingProxy {
     /// sync retries with capped exponential backoff rather than leaving the bucket
     /// passthrough for the process lifetime — a transient origin outage at startup
     /// should not cost every LIST for the next fortnight.
+    ///
+    /// The **boot affirmation** rides on the same join (see [`affirm_after`]): a booting
+    /// node starts with no right to serve, and gets one only once every bucket it was
+    /// told to warm has landed. The generation is read here, before the first warm-up
+    /// runs, so a gap arriving during warm-up supersedes this affirmation rather than
+    /// being papered over by it.
     pub fn spawn_background_sync(&self, buckets: Vec<String>) {
+        let mut warmups = Vec::with_capacity(buckets.len());
         for bucket in buckets {
             let client = self.client.clone();
             let state = self.state.clone();
-            tokio::spawn(async move {
+            warmups.push(tokio::spawn(async move {
                 let mut backoff = SYNC_RETRY_MIN;
                 loop {
                     match sync_bucket_into(&client, &state, &bucket).await {
@@ -509,8 +569,11 @@ impl CachingProxy {
                         }
                     }
                 }
-            });
+            }));
         }
+        let sync = self.sync.clone();
+        let generation = sync.as_ref().map(|sync| sync.resync_gen());
+        tokio::spawn(affirm_after(warmups, sync, generation));
     }
 
     /// Fold what an origin response proved into the index. An already-indexed key is
@@ -765,12 +828,12 @@ impl CachingProxy {
     }
 
     /// Whether an index miss may be answered as an authoritative 404. Single-node — no
-    /// write feed — always: the sole writer's index is the truth. With gossip, only once
-    /// the cluster view has held still long enough that no peer can be holding a write
-    /// this node has not seen (see [`WriteSync::settled`]); inside that window the
-    /// origin answers instead, which is slower and never wrong.
+    /// write feed — always: the sole writer's index is the truth. With gossip it is the
+    /// mode's own licence for a local answer (see [`WriteSync::may_answer_404`]): a
+    /// valid coherence lease in `strong`, a settled view in `strong-acks`/`bounded`.
+    /// Without one the origin answers instead, which is slower and never wrong.
     fn index_404_trustworthy(&self) -> bool {
-        self.sync.as_ref().is_none_or(|sync| sync.settled())
+        self.sync.as_ref().is_none_or(|sync| sync.may_answer_404())
     }
 
     /// The GET decision tree, with the per-request `response-*` overrides already lifted
@@ -1776,5 +1839,103 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<s3s::dto::WriteGetObjectResponseInput>,
     ) -> S3Result<S3Response<s3s::dto::WriteGetObjectResponseOutput>> {
         self.inner.write_get_object_response(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use groupnet::consistency::LeaseConfig;
+    use groupnet::core::{Config, NodeId};
+    use groupnet::runtime::Node;
+    use groupnet::transport::mem::{MemTransport, Network};
+
+    use super::affirm_after;
+    use crate::sync::{Consistency, WriteSync};
+
+    /// The same tuning shape [`WriteSync::new`] ships, in miniature: `dead_timeout_ms`
+    /// tracks the lease duration, and the probe timings are brisk so the lease shell's
+    /// warm-up window is milliseconds rather than a second.
+    fn brisk() -> Config {
+        Config {
+            gossip_interval_ms: 10,
+            probe_interval_ms: 20,
+            probe_timeout_ms: 10,
+            suspect_timeout_ms: 50,
+            dead_timeout_ms: 300,
+            anti_entropy_interval_ms: 25,
+            ..Config::default()
+        }
+    }
+
+    /// One leased node, alone in its group. A solo reader's granter roster is empty, so
+    /// its lease confirms vacuously — which is exactly why the shell's warm-up guard,
+    /// not the confirmation, is what a booting node has to get past.
+    fn solo(id: &str) -> (Node<MemTransport>, Arc<WriteSync>) {
+        let net = Network::new();
+        let me = NodeId::new(id);
+        let node = Node::builder(me.clone(), net.endpoint(me.clone()))
+            .config(brisk())
+            .spawn();
+        let group = node.join_group("s3cache");
+        let sync = WriteSync::attach(
+            group,
+            me,
+            Consistency::Strong,
+            LeaseConfig::for_duration(Duration::from_millis(300)),
+            None,
+        );
+        (node, Arc::new(sync))
+    }
+
+    /// A node told to warm nothing affirms as soon as its lease allows — and that is
+    /// safe rather than a shortcut: with empty tiers and a passthrough index there is no
+    /// local state for the licence to license.
+    #[tokio::test]
+    async fn the_boot_affirmation_is_immediate_with_no_buckets() {
+        let (_node, sync) = solo("boot-none");
+        assert!(!sync.may_serve_local(), "a booting node holds no licence");
+
+        affirm_after(Vec::new(), Some(Arc::clone(&sync)), Some(sync.resync_gen())).await;
+
+        assert!(
+            sync.may_serve_local(),
+            "and takes one as soon as the lease shell's warm-up guard releases"
+        );
+    }
+
+    /// With a bucket, the licence waits for that bucket's warm-up to land. A node whose
+    /// index is still filling from the origin must not answer a LIST — or an
+    /// authoritative 404 — out of it.
+    #[tokio::test]
+    async fn the_boot_affirmation_waits_for_every_bucket_warmup() {
+        let (_node, sync) = solo("boot-one");
+        let (done, warmed) = tokio::sync::oneshot::channel::<()>();
+        let warmup = tokio::spawn(async move {
+            let _ = warmed.await;
+        });
+
+        let affirming = tokio::spawn(affirm_after(
+            vec![warmup],
+            Some(Arc::clone(&sync)),
+            Some(sync.resync_gen()),
+        ));
+        // Comfortably past the warm-up guard (one detection window plus two
+        // anti-entropy rounds, ~100ms here): the lease would take the affirmation by
+        // now, and the only thing holding it back is the bucket.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !sync.may_serve_local(),
+            "an index still filling from the origin licenses nothing"
+        );
+
+        drop(done);
+        affirming.await.expect("the affirmation task");
+        assert!(
+            sync.may_serve_local(),
+            "and the warm-up landing is what puts the node in service"
+        );
     }
 }
