@@ -395,6 +395,7 @@ impl Core {
 }
 
 /// The layered object-body cache handle held by the proxy.
+#[derive(Clone)]
 pub struct TieredCache {
     core: Arc<Core>,
 }

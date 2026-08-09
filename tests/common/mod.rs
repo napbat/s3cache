@@ -45,12 +45,13 @@ use s3s::{S3, S3Request, S3Result};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 /// The `MinIO` image the repo's shell-driven e2e suite already uses, so both suites test
 /// the same origin. Pulled once; every run after that starts from the local image.
@@ -148,6 +149,61 @@ pub struct Origin {
     counted_endpoint: String,
     bucket: String,
     pub ops: Arc<Ops>,
+    put_fault: Arc<AppliedPutFault>,
+}
+
+/// One-shot fault injection for a conditional PUT: let `MinIO` apply it, then hold and
+/// replace its successful response with an `InternalError`. This is the ambiguity a real
+/// proxy sees when an upstream connection fails after the origin commits.
+#[derive(Default)]
+struct AppliedPutFault {
+    armed: AtomicBool,
+    applied: AtomicBool,
+    released: AtomicBool,
+    applied_notify: Notify,
+    release_notify: Notify,
+}
+
+impl AppliedPutFault {
+    fn arm(&self) {
+        assert!(
+            !self.armed.swap(true, Ordering::SeqCst),
+            "fault already armed"
+        );
+        self.applied.store(false, Ordering::SeqCst);
+        self.released.store(false, Ordering::SeqCst);
+    }
+
+    fn claim(&self, req: &Request<Incoming>) -> bool {
+        req.method() == Method::PUT
+            && req.headers().contains_key("if-match")
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    fn origin_applied(&self) {
+        self.applied.store(true, Ordering::SeqCst);
+        self.applied_notify.notify_waiters();
+    }
+
+    async fn wait_applied(&self) {
+        while !self.applied.load(Ordering::SeqCst) {
+            self.applied_notify.notified().await;
+        }
+    }
+
+    async fn wait_release(&self) {
+        while !self.released.load(Ordering::SeqCst) {
+            self.release_notify.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release_notify.notify_waiters();
+    }
 }
 
 impl Origin {
@@ -182,13 +238,15 @@ impl Origin {
             .expect("create the test bucket");
 
         let ops = Arc::new(Ops::default());
-        let counted = counting_proxy(minio, Arc::clone(&ops)).await;
+        let put_fault = Arc::new(AppliedPutFault::default());
+        let counted = counting_proxy(minio, Arc::clone(&ops), Arc::clone(&put_fault)).await;
         Arc::new(Self {
             _container: container,
             direct,
             counted_endpoint: format!("http://{counted}"),
             bucket: bucket.to_owned(),
             ops,
+            put_fault,
         })
     }
 
@@ -301,6 +359,22 @@ impl Origin {
             .ok()?;
         Some(out.e_tag()?.trim_matches('"').to_owned())
     }
+
+    /// Arm the next `If-Match` PUT to commit at `MinIO` while its response is withheld.
+    pub fn fail_next_conditional_put_after_apply(&self) {
+        self.put_fault.arm();
+    }
+
+    /// Wait until the armed PUT has received a successful response from `MinIO`, proving
+    /// that cancellation now occurs after the mutation reached durable origin state.
+    pub async fn wait_for_faulted_put_to_apply(&self) {
+        self.put_fault.wait_applied().await;
+    }
+
+    /// Release the withheld response as an injected upstream 500.
+    pub fn release_faulted_put(&self) {
+        self.put_fault.release();
+    }
 }
 
 /// A transparent forwarder to `upstream` that counts what passes through it.
@@ -309,7 +383,11 @@ impl Origin {
 /// `Authorization` included) and body bytes — so the origin verifies exactly the
 /// signature the client produced. Only hop-by-hop headers are dropped, as any
 /// intermediary must. Returns the address to point a client at.
-async fn counting_proxy(upstream: SocketAddr, ops: Arc<Ops>) -> SocketAddr {
+async fn counting_proxy(
+    upstream: SocketAddr,
+    ops: Arc<Ops>,
+    put_fault: Arc<AppliedPutFault>,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind the counting proxy");
@@ -321,14 +399,18 @@ async fn counting_proxy(upstream: SocketAddr, ops: Arc<Ops>) -> SocketAddr {
                 continue;
             };
             let ops = Arc::clone(&ops);
+            let put_fault = Arc::clone(&put_fault);
             let conn = http
                 .serve_connection(
                     TokioIo::new(socket),
                     service_fn(move |req: Request<Incoming>| {
                         let ops = Arc::clone(&ops);
+                        let put_fault = Arc::clone(&put_fault);
                         async move {
                             ops.record(req.method(), req.uri(), req.headers());
-                            Ok::<_, std::convert::Infallible>(forward(upstream, req).await)
+                            Ok::<_, std::convert::Infallible>(
+                                forward(upstream, req, &put_fault).await,
+                            )
                         }
                     }),
                 )
@@ -357,8 +439,25 @@ const HOP_BY_HOP: [&str; 7] = [
 async fn forward(
     upstream: SocketAddr,
     req: Request<Incoming>,
+    put_fault: &AppliedPutFault,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
+    let faulted = put_fault.claim(&req);
     match relay(upstream, req).await {
+        Ok(resp) if faulted && resp.status().is_success() => {
+            put_fault.origin_applied();
+            put_fault.wait_release().await;
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/xml")
+                .body(
+                    Full::new(Bytes::from_static(
+                        b"<Error><Code>InternalError</Code><Message>injected after apply</Message></Error>",
+                    ))
+                    .map_err(|never| match never {})
+                    .boxed(),
+                )
+                .expect("an injected 500 is well-formed")
+        }
         Ok(resp) => resp.map(|body| body.map_err(std::io::Error::other).boxed()),
         Err(err) => Response::builder()
             .status(StatusCode::BAD_GATEWAY)

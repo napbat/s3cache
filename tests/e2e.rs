@@ -262,8 +262,8 @@ async fn a_write_that_names_no_content_type_keeps_no_body() {
 
 /// The writer keeps its *own* fresh copy: an overwrite replaces the cached body with the
 /// bytes it just wrote rather than dropping them, so the read after it is both new and
-/// free. And a write the origin *refuses* (a lost CAS) changes neither — the rejected
-/// bytes are not cached, and the copy that was already there is not disturbed.
+/// free. A write the origin *refuses* (a lost CAS) never caches the rejected bytes; its
+/// pre-forward invalidation costs one origin refill without changing durable contents.
 #[tokio::test]
 async fn a_fillable_overwrite_serves_its_own_new_bytes() {
     let origin = Origin::start("e2e-write-fill").await;
@@ -303,9 +303,13 @@ async fn a_fillable_overwrite_serves_its_own_new_bytes() {
     assert_eq!(
         get(&proxy, bucket, "obj").await,
         "version-2",
-        "a refused write neither cached its body nor dropped the one already held"
+        "a refused write never cached its rejected body"
     );
-    assert_eq!(origin.ops.get(), 0, "so the read stayed local");
+    assert_eq!(
+        origin.ops.get(),
+        1,
+        "pre-forward invalidation buys the confirmed origin version back"
+    );
 }
 
 /// A write past `max_obj_bytes` keeps nothing: the body streams through to the origin
@@ -369,8 +373,9 @@ async fn an_overwrite_invalidates_the_local_copy() {
 
 /// Compare-and-set survives the proxy end to end. The origin is the authority for
 /// conditional writes, so the proxy must forward them untouched *and* keep its own
-/// state consistent with the outcome: a rejected write must leave the index and the
-/// cached body exactly as they were, an accepted one must invalidate both.
+/// state consistent with the outcome: a rejected ordinary stale CAS leaves the index
+/// intact (the body was conservatively evicted before forwarding), while an accepted one
+/// replaces both.
 #[tokio::test]
 async fn conditional_writes_keep_their_origin_semantics() {
     let origin = Origin::start("e2e-cas").await;
@@ -409,12 +414,12 @@ async fn conditional_writes_keep_their_origin_semantics() {
     assert_eq!(
         get(&proxy, bucket, "cas").await,
         "one",
-        "the rejected write must not have disturbed the cached body"
+        "the rejected write leaves the durable object unchanged"
     );
     assert_eq!(
         origin.ops.get(),
-        fetched,
-        "and must not have invalidated it either"
+        fetched + 1,
+        "the body is conservatively evicted before every forwarded mutation"
     );
     assert_eq!(
         head(&proxy, bucket, "cas").await.unwrap().content_length,
@@ -454,6 +459,100 @@ async fn conditional_writes_keep_their_origin_semantics() {
         list_entry(&proxy, bucket, "cas").await,
         Some((5, origin.etag("cas").await)),
         "and folded the new size and ETag into the index"
+    );
+}
+
+/// Cancellation after `MinIO` has applied a conditional PUT cannot cancel the proxy's
+/// coherence tail. The forwarder withholds that successful response, the caller is
+/// cancelled, and the response is then replaced with a 500: the detached tail must fence
+/// the stale local view and rebuild it before local HEAD/GET/LIST service resumes.
+#[tokio::test]
+async fn an_applied_put_survives_caller_cancellation_and_reconciles() {
+    let origin = Origin::start("e2e-put-cancel").await;
+    let bucket = origin.bucket();
+    origin
+        .seed_rich("writer", b"epoch-1", "text/plain", &[])
+        .await;
+    let proxy = node(&origin, 1024 * 1024);
+    wait_for_index(&proxy, &origin, bucket).await;
+
+    let current = head(&proxy, bucket, "writer")
+        .await
+        .expect("the indexed writer exists")
+        .e_tag
+        .expect("the writer has an ETag")
+        .into_value();
+    assert_eq!(get(&proxy, bucket, "writer").await, "epoch-1");
+
+    origin.fail_next_conditional_put_after_apply();
+    let worker = proxy.clone();
+    let owned_bucket = bucket.to_owned();
+    let mutation = tokio::spawn(async move {
+        put_conditional(
+            &worker,
+            &owned_bucket,
+            "writer",
+            b"epoch-2",
+            None,
+            Some(ETagCondition::ETag(ETag::Strong(current))),
+        )
+        .await
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        origin.wait_for_faulted_put_to_apply(),
+    )
+    .await
+    .expect("the conditional PUT reached MinIO");
+    assert_eq!(
+        origin.stored("writer").await.as_deref(),
+        Some(&b"epoch-2"[..]),
+        "the mutation was durable before cancellation"
+    );
+    mutation.abort();
+    assert!(
+        mutation
+            .await
+            .expect_err("the caller was cancelled")
+            .is_cancelled(),
+        "the inbound request future was actually dropped"
+    );
+    let lists_before_reconciliation = origin.ops.list();
+    origin.release_faulted_put();
+
+    eventually!(
+        "the detached PUT tail to start an origin rebuild",
+        origin.ops.list() > lists_before_reconciliation
+    );
+    wait_for_index(&proxy, &origin, bucket).await;
+    let rebuilt = list_entry(&proxy, bucket, "writer").await;
+    assert_eq!(
+        rebuilt,
+        Some((7, origin.etag("writer").await)),
+        "the origin rebuild replaced the stale index ETag"
+    );
+    let reconciled = head(&proxy, bucket, "writer")
+        .await
+        .expect("HEAD converges to the applied mutation")
+        .e_tag
+        .expect("the reconciled writer has an ETag")
+        .into_value();
+    assert_eq!(get(&proxy, bucket, "writer").await, "epoch-2");
+
+    put_conditional(
+        &proxy,
+        bucket,
+        "writer",
+        b"epoch-3",
+        None,
+        Some(ETagCondition::ETag(ETag::Strong(reconciled))),
+    )
+    .await
+    .expect("a CAS using the proxy's reconciled ETag succeeds");
+    assert_eq!(
+        origin.stored("writer").await.as_deref(),
+        Some(&b"epoch-3"[..])
     );
 }
 

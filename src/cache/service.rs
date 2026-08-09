@@ -9,7 +9,7 @@ use s3s::dto::{
     GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output,
     PutObjectInput, PutObjectOutput,
 };
-use s3s::{S3Request, S3Response, S3Result};
+use s3s::{S3Error, S3Request, S3Response, S3Result};
 
 use crate::cache::proxy::{
     CachingProxy, IndexedWrite, ReadRoute, ResponseOverrides, observed_entry, write_storage_class,
@@ -55,6 +55,22 @@ macro_rules! apply_overrides {
             out.expires.clone_from(&overrides.expires);
         }
     }};
+}
+
+/// Why a failed PUT cannot be assumed not to have reached durable origin state. A 412 is
+/// normally a conclusive client-side race; it becomes contradictory only when this proxy
+/// had just vouched that the exact precondition held in its locally-serveable index.
+fn uncertain_put_error(error: &S3Error, locally_vouched: bool) -> Option<&'static str> {
+    match error.status_code() {
+        Some(http::StatusCode::PRECONDITION_FAILED) if locally_vouched => {
+            Some("origin rejected a locally-vouched precondition")
+        }
+        Some(status) if status.is_server_error() || status == http::StatusCode::REQUEST_TIMEOUT => {
+            Some("origin returned an ambiguous server failure")
+        }
+        None => Some("origin response was unavailable"),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -137,38 +153,64 @@ impl s3s::S3 for CachingProxy {
         // already in hand: buffer them (bounded by the same per-object cap the read path
         // uses) so a freshly written object's first read is not a guaranteed origin GET.
         let written = self.buffered_put_body(&mut req.input).await;
-        let mut resp = self.inner.put_object(req).await?;
         let ckey = (bucket.clone(), key.clone());
-        // Drop this node's own copy the instant the origin has the new bytes — before
-        // the cluster-ack round the index update pays for. Otherwise the writing node
-        // is the one node in the fleet still serving the old body.
+        let locally_vouched = self.locally_vouches_for_put(&req.input);
+        // Invalidate before the origin call. Besides closing the ordinary in-flight read
+        // window, this is the only ordering that survives a process crash after the
+        // origin applies a write but before it can answer: no warm or hot copy of the old
+        // body is left behind to be trusted after restart.
         self.obj_cache.invalidate(&ckey).await;
-        // The origin's ETag rides back on the response, so the index learns it here
-        // rather than paying a HEAD for what a later HEAD will want to report.
-        entry.etag = resp.output.e_tag.clone();
-        // ...and the body just written takes the dropped copy's place. Invalidate *then*
-        // insert, rather than letting the insert overwrite on its own: a tier write is
-        // best-effort each, so a warm-tier put that is refused (the encoded object over
-        // the cap) or fails would otherwise leave the *older* body on disk, to be served
-        // the moment hot evicts the new one. Between the two there is only a local miss
-        // — an origin read, never a stale answer — where an insert-only ordering risks a
-        // stale one. An ETag-less write response is not enough to describe the object
-        // with, so it fills nothing either.
-        if let (Some(body), Some(e_tag)) = (written, entry.etag.clone()) {
-            let out = written_object(content_type, e_tag, &meta, body.len());
-            // The writer's own bytes, stamped as of before the write: this node just made
-            // them the truth, so its next read of them needs no proof — unless the
-            // generation moved while the write was in flight, and then it does.
-            let filled = CachedObject::from_get(&out, body);
-            filled.mark_trusted(generation);
-            self.obj_cache.insert(ckey, Arc::new(filled)).await;
-            self.metrics.write_fill();
+
+        // The request future belongs to the inbound connection and is cancelled when that
+        // client times out. Once the mutation starts, its origin result and coherence tail
+        // must outlive that future or an applied write can leave the local index behind.
+        let worker = self.clone();
+        let reconcile_bucket = bucket.clone();
+        let reconcile_key = key.clone();
+        let tail = tokio::spawn(async move {
+            let mut resp = match worker.inner.put_object(req).await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    if let Some(reason) = uncertain_put_error(&error, locally_vouched) {
+                        worker.reconcile_uncertain_put(&bucket, &key, reason);
+                    }
+                    return Err(error);
+                }
+            };
+            // The origin's ETag rides back on the response, so the index learns it here
+            // rather than paying a HEAD for what a later HEAD will want to report.
+            entry.etag = resp.output.e_tag.clone();
+            // The body just written takes the dropped copy's place. An ETag-less write
+            // response cannot faithfully describe the object and therefore fills nothing.
+            if let (Some(body), Some(e_tag)) = (written, entry.etag.clone()) {
+                let out = written_object(content_type, e_tag, &meta, body.len());
+                // Stamped as of before the write: a remediation that moved the generation
+                // while it was in flight leaves this copy suspect, as intended.
+                let filled = CachedObject::from_get(&out, body);
+                filled.mark_trusted(generation);
+                worker.obj_cache.insert(ckey, Arc::new(filled)).await;
+                worker.metrics.write_fill();
+            }
+            let token = worker
+                .record_put(IndexedWrite::Put, &bucket, &key, entry)
+                .await;
+            Self::attach_token(&mut resp.headers, token);
+            Ok(resp)
+        });
+        match tail.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.reconcile_uncertain_put(
+                    &reconcile_bucket,
+                    &reconcile_key,
+                    "PUT completion task terminated",
+                );
+                Err(s3s::s3_error!(
+                    InternalError,
+                    "s3cache: PUT completion task failed: {error}"
+                ))
+            }
         }
-        let token = self
-            .record_put(IndexedWrite::Put, &bucket, &key, entry)
-            .await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
     }
 
     async fn delete_object(
@@ -909,5 +951,27 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<s3s::dto::WriteGetObjectResponseInput>,
     ) -> S3Result<S3Response<s3s::dto::WriteGetObjectResponseOutput>> {
         self.inner.write_get_object_response(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uncertain_put_error;
+    use s3s::{S3Error, S3ErrorCode};
+
+    #[test]
+    fn only_a_locally_vouched_412_is_an_uncertain_mutation() {
+        let rejected = S3Error::new(S3ErrorCode::PreconditionFailed);
+        assert_eq!(uncertain_put_error(&rejected, false), None);
+        assert_eq!(
+            uncertain_put_error(&rejected, true),
+            Some("origin rejected a locally-vouched precondition")
+        );
+
+        let failed = S3Error::new(S3ErrorCode::InternalError);
+        assert_eq!(
+            uncertain_put_error(&failed, false),
+            Some("origin returned an ambiguous server failure")
+        );
     }
 }

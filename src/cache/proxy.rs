@@ -4,16 +4,18 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use s3s::dto::{
-    ETag, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input,
-    ListObjectsV2Output, ObjectStorageClass, PutObjectInput, StreamingBlob, Timestamp,
+    ETag, ETagCondition, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
+    ListObjectsV2Input, ListObjectsV2Output, ObjectStorageClass, PutObjectInput, StreamingBlob,
+    Timestamp,
 };
 use s3s::{S3, S3Request, S3Response, S3Result};
 use tracing::info;
 
 use crate::index::{
     BucketState, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del, apply_put,
-    complete_entry, entry_matches_body, head_object_from_index, list_objects_v2_from_index,
-    standard_class, sync_bucket_into,
+    begin_bucket_resync, bucket_resync_is_current, complete_entry, entry_matches_body,
+    head_object_from_index, list_objects_v2_from_index, restart_bucket_resync_if_current,
+    standard_class, sync_bucket_generation, sync_bucket_into,
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync};
@@ -278,8 +280,9 @@ pub(super) async fn affirm_after(
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
 /// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
 /// every write.
+#[derive(Clone)]
 pub struct CachingProxy {
-    pub(super) inner: s3s_aws::Proxy,
+    pub(super) inner: Arc<s3s_aws::Proxy>,
     /// Direct client used only for the background full LIST warm-up sync.
     pub(super) client: aws_sdk_s3::Client,
     /// The LIST index, `Arc` so the background warm-up task shares it with the serving
@@ -309,7 +312,7 @@ impl CachingProxy {
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
-            inner,
+            inner: Arc::new(inner),
             client,
             state: Arc::new(RwLock::new(HashMap::new())),
             obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),
@@ -354,11 +357,11 @@ impl CachingProxy {
         let state = self.state.clone();
         let sync = self.sync.clone();
         Arc::new(move || {
-            {
-                let mut g = state.write().unwrap();
-                for bucket_state in g.values_mut() {
-                    *bucket_state = BucketState::default();
-                }
+            let mut reset: std::collections::BTreeSet<String> =
+                state.read().unwrap().keys().cloned().collect();
+            reset.extend(buckets.iter().cloned());
+            for bucket in reset {
+                begin_bucket_resync(&state, &bucket, None);
             }
             let (client, state, buckets) = (client.clone(), state.clone(), buckets.clone());
             let sync = sync.clone();
@@ -410,6 +413,112 @@ impl CachingProxy {
             return ReadRoute::Origin;
         }
         ReadRoute::Local
+    }
+
+    /// Whether this node's currently serveable index says every conditional on `input`
+    /// would pass. A contradictory origin 412 is evidence that this locally-vouched view
+    /// is stale; a condition the index could not prove is merely the client's stale CAS.
+    pub(super) fn locally_vouches_for_put(&self, input: &PutObjectInput) -> bool {
+        if input.if_match.is_none() && input.if_none_match.is_none() {
+            return false;
+        }
+        if self
+            .sync
+            .as_ref()
+            .is_some_and(|sync| !sync.may_serve_local())
+        {
+            return false;
+        }
+        let g = self.state.read().unwrap();
+        let Some(bucket) = g.get(input.bucket.as_str()).filter(|bucket| bucket.synced) else {
+            return false;
+        };
+        if bucket.uncertain_keys.contains(input.key.as_str()) {
+            return false;
+        }
+        let entry = bucket.keys.get(input.key.as_str());
+        let if_match_holds = input
+            .if_match
+            .as_ref()
+            .is_none_or(|condition| match condition {
+                ETagCondition::Any => entry.is_some(),
+                ETagCondition::ETag(expected) => {
+                    entry.and_then(|entry| entry.etag.as_ref()) == Some(expected)
+                }
+            });
+        let if_none_match_holds =
+            input
+                .if_none_match
+                .as_ref()
+                .is_none_or(|condition| match condition {
+                    ETagCondition::Any => entry.is_none(),
+                    ETagCondition::ETag(expected) => match entry {
+                        None => true,
+                        Some(entry) => entry.etag.as_ref().is_some_and(|etag| etag != expected),
+                    },
+                });
+        if_match_holds && if_none_match_holds
+    }
+
+    /// Fence an ambiguously-mutated key and rebuild its bucket from the origin. The
+    /// generation is checked while each page is published and again at completion, so a
+    /// newer uncertainty cannot be cleared by this older task.
+    pub(super) fn reconcile_uncertain_put(&self, bucket: &str, key: &str, reason: &str) {
+        let generation = begin_bucket_resync(&self.state, bucket, Some(key));
+        let client = self.client.clone();
+        let state = self.state.clone();
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        let reason = reason.to_owned();
+        tracing::warn!(
+            "origin outcome for PUT `{bucket}/{key}` is uncertain ({reason}); fencing the key and rebuilding the bucket index"
+        );
+        tokio::spawn(async move {
+            let mut backoff = SYNC_RETRY_MIN;
+            let mut generation = generation;
+            loop {
+                if !bucket_resync_is_current(&state, &bucket, generation) {
+                    return;
+                }
+                match sync_bucket_generation(&client, &state, &bucket, generation).await {
+                    Ok(found) => {
+                        info!(
+                            "reconciled uncertain PUT `{bucket}/{key}` from origin: {found} keys"
+                        );
+                        return;
+                    }
+                    Err(error) if !bucket_resync_is_current(&state, &bucket, generation) => {
+                        tracing::debug!(
+                            "origin reconciliation of `{bucket}/{key}` was superseded: {error}"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "origin reconciliation of `{bucket}/{key}` failed (retrying in {backoff:?}): {error}"
+                        );
+                        let Some(retry_generation) =
+                            restart_bucket_resync_if_current(&state, &bucket, generation)
+                        else {
+                            return;
+                        };
+                        generation = retry_generation;
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(SYNC_RETRY_MAX);
+                    }
+                }
+            }
+        });
+    }
+
+    /// A key fenced by an ambiguous mutation may only be read from the origin until the
+    /// generation that fenced it has completed its rebuild.
+    fn key_uncertain(&self, bucket: &str, key: &str) -> bool {
+        self.state
+            .read()
+            .unwrap()
+            .get(bucket)
+            .is_some_and(|bucket| bucket.uncertain_keys.contains(key))
     }
 
     /// Attach a write's session token to a response, when coherence is on.
@@ -887,7 +996,8 @@ impl CachingProxy {
         // overwrite is never read stale; a token-carrying read that cannot be
         // verified in time skips every local copy and streams from the origin.
         let local_ok = if cacheable || int_range.is_some() {
-            self.read_barrier(&req.headers).await == ReadRoute::Local
+            !self.key_uncertain(&ckey.0, &ckey.1)
+                && self.read_barrier(&req.headers).await == ReadRoute::Local
         } else {
             true
         };
@@ -983,7 +1093,10 @@ impl CachingProxy {
             && req.input.if_modified_since.is_none()
             && req.input.if_unmodified_since.is_none();
         let ckey = (req.input.bucket.clone(), req.input.key.clone());
-        if cache_eligible && self.read_barrier(&req.headers).await == ReadRoute::Local {
+        if cache_eligible
+            && !self.key_uncertain(&ckey.0, &ckey.1)
+            && self.read_barrier(&req.headers).await == ReadRoute::Local
+        {
             if let Some(obj) = self.validated_get(&ckey).await {
                 self.metrics.head_hit();
                 return Ok(S3Response::new(obj.to_head()));

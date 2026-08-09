@@ -176,6 +176,13 @@ pub(crate) struct BucketState {
     pub(crate) keys: BTreeMap<String, ObjEntry>,
     /// Deleted keys and when: consulted by [`apply_put`], pruned amortized.
     pub(crate) gone: BTreeMap<String, SystemTime>,
+    /// Generation of the origin rebuild currently allowed to publish into this bucket.
+    /// A mutation whose outcome is ambiguous increments it before starting a rebuild, so
+    /// an older in-flight LIST cannot make the bucket authoritative again.
+    pub(crate) sync_generation: u64,
+    /// Keys whose last mutation outcome is not yet reconciled with the origin. Reads of
+    /// these keys stay origin-only until the matching bucket rebuild completes.
+    pub(crate) uncertain_keys: BTreeSet<String>,
 }
 
 /// How long a delete tombstone shields its key from older, late-arriving
@@ -209,6 +216,70 @@ pub(crate) fn apply_put(
     }
     b.keys.insert(key.to_owned(), entry);
     true
+}
+
+/// Reset a bucket to origin-serving state and advance the generation that may rebuild it.
+/// `uncertain_key` is retained across overlapping resets because the newest full rebuild
+/// covers every earlier uncertainty too. Returns the new generation.
+pub(crate) fn begin_bucket_resync(
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    uncertain_key: Option<&str>,
+) -> u64 {
+    let mut g = state.write().unwrap();
+    let previous = g.remove(bucket).unwrap_or_default();
+    let generation = previous.sync_generation.wrapping_add(1);
+    let mut uncertain_keys = previous.uncertain_keys;
+    if let Some(key) = uncertain_key {
+        uncertain_keys.insert(key.to_owned());
+    }
+    g.insert(
+        bucket.to_owned(),
+        BucketState {
+            sync_generation: generation,
+            uncertain_keys,
+            ..BucketState::default()
+        },
+    );
+    generation
+}
+
+/// Discard a failed rebuild's partial rows and advance to a clean retry, but only while
+/// `generation` still owns the bucket. `None` means a newer fence already superseded it.
+pub(crate) fn restart_bucket_resync_if_current(
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    generation: u64,
+) -> Option<u64> {
+    let mut g = state.write().unwrap();
+    let current = g.get(bucket)?;
+    if current.sync_generation != generation {
+        return None;
+    }
+    let previous = g.remove(bucket).unwrap_or_default();
+    let next = generation.wrapping_add(1);
+    g.insert(
+        bucket.to_owned(),
+        BucketState {
+            sync_generation: next,
+            uncertain_keys: previous.uncertain_keys,
+            ..BucketState::default()
+        },
+    );
+    Some(next)
+}
+
+/// Whether `generation` is still the rebuild authorised for `bucket`.
+pub(crate) fn bucket_resync_is_current(
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    generation: u64,
+) -> bool {
+    state
+        .read()
+        .unwrap()
+        .get(bucket)
+        .is_some_and(|state| state.sync_generation == generation)
 }
 
 /// Applies an observed delete: removes any not-newer entry and records a
@@ -412,6 +483,7 @@ pub(crate) fn head_object_from_index(
 /// view of a key is old news the moment a newer local write or a delete has been applied,
 /// and folding it in raw would resurrect deleted keys and clobber fresh ones. Returns how
 /// many rows the origin listed (not how many changed).
+#[cfg(test)]
 pub(crate) fn sync_listing_into(
     state: &RwLock<HashMap<String, BucketState>>,
     bucket: &str,
@@ -423,6 +495,51 @@ pub(crate) fn sync_listing_into(
         found += 1;
     }
     found
+}
+
+/// Fold one origin LIST page only when it still belongs to the bucket's current rebuild.
+/// The generation check and every row application happen under the same lock, which is
+/// what prevents a superseded rebuild from slipping a stale page in after a newer reset.
+fn sync_listing_into_generation(
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    generation: u64,
+    rows: impl IntoIterator<Item = (String, ObjEntry)>,
+) -> Option<usize> {
+    let mut g = state.write().unwrap();
+    let b = g.entry(bucket.to_owned()).or_default();
+    if b.sync_generation != generation {
+        return None;
+    }
+    let mut found = 0usize;
+    for (key, entry) in rows {
+        let ts = entry.last_modified;
+        if b.gone.get(&key).is_none_or(|dead| *dead < ts)
+            && b.keys
+                .get(&key)
+                .is_none_or(|current| current.last_modified <= ts)
+        {
+            b.keys.insert(key, entry);
+        }
+        found += 1;
+    }
+    Some(found)
+}
+
+/// Publish completion for `generation`; false means a newer rebuild owns the bucket.
+fn finish_bucket_sync_generation(
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    generation: u64,
+) -> bool {
+    let mut g = state.write().unwrap();
+    let b = g.entry(bucket.to_owned()).or_default();
+    if b.sync_generation != generation {
+        return false;
+    }
+    b.synced = true;
+    b.uncertain_keys.clear();
+    true
 }
 
 /// Full paginated LIST of a bucket into `state`, then mark it synced. Merges (never
@@ -437,6 +554,32 @@ pub(crate) async fn sync_bucket_into(
     client: &aws_sdk_s3::Client,
     state: &RwLock<HashMap<String, BucketState>>,
     bucket: &str,
+) -> anyhow::Result<usize> {
+    let generation = {
+        let mut g = state.write().unwrap();
+        g.entry(bucket.to_owned()).or_default().sync_generation
+    };
+    let result = sync_bucket_generation(client, state, bucket, generation).await;
+    if result.is_err() {
+        // A failed page must not remain to be mistaken for part of a later successful
+        // snapshot. If another fence already moved the generation, it owns the reset.
+        restart_bucket_resync_if_current(state, bucket, generation);
+    }
+    result
+}
+
+/// Full paginated LIST for one already-established rebuild generation. A newer reset
+/// aborts this run before any later page or completion flag can become visible.
+///
+/// # Errors
+///
+/// The upstream LIST error, or an error indicating that a newer rebuild superseded this
+/// one. In both cases the bucket remains origin-serving.
+pub(crate) async fn sync_bucket_generation(
+    client: &aws_sdk_s3::Client,
+    state: &RwLock<HashMap<String, BucketState>>,
+    bucket: &str,
+    generation: u64,
 ) -> anyhow::Result<usize> {
     let mut token: Option<String> = None;
     let mut found = 0usize;
@@ -476,7 +619,10 @@ pub(crate) async fn sync_bucket_into(
                 },
             ))
         });
-        found += sync_listing_into(state, bucket, rows);
+        let Some(page_len) = sync_listing_into_generation(state, bucket, generation, rows) else {
+            anyhow::bail!("bucket sync superseded by a newer origin rebuild");
+        };
+        found += page_len;
         if resp.is_truncated().unwrap_or(false) {
             token = resp.next_continuation_token().map(str::to_owned);
             if token.is_none() {
@@ -486,12 +632,9 @@ pub(crate) async fn sync_bucket_into(
             break;
         }
     }
-    state
-        .write()
-        .unwrap()
-        .entry(bucket.to_owned())
-        .or_default()
-        .synced = true;
+    if !finish_bucket_sync_generation(state, bucket, generation) {
+        anyhow::bail!("bucket sync superseded by a newer origin rebuild");
+    }
     info!("synced bucket `{bucket}` into index: {found} keys");
     Ok(found)
 }
@@ -500,8 +643,10 @@ pub(crate) async fn sync_bucket_into(
 mod tests {
     use super::{
         BODY_MTIME_SLACK, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del,
-        apply_put, complete_entry, entry_matches_body, head_object_from_index,
-        list_objects_v2_from_index, standard_class, sync_listing_into,
+        apply_put, begin_bucket_resync, complete_entry, entry_matches_body,
+        finish_bucket_sync_generation, head_object_from_index, list_objects_v2_from_index,
+        restart_bucket_resync_if_current, standard_class, sync_listing_into,
+        sync_listing_into_generation,
     };
     use crate::tier::CachedObject;
     use std::collections::HashMap;
@@ -612,6 +757,93 @@ mod tests {
         // And a listing of a key nobody has touched still lands.
         sync_listing_into(&state, "b", [("fresh".to_owned(), entry(3, 40))]);
         assert_eq!(size_of(&state, "fresh"), Some(3));
+    }
+
+    /// Once a newer uncertainty fences a bucket, an older rebuild may neither publish a
+    /// late page nor clear the newer key's origin-only marker at completion.
+    #[test]
+    fn a_superseded_rebuild_cannot_clear_a_newer_uncertainty() {
+        let state: Index = RwLock::new(HashMap::new());
+        let older = begin_bucket_resync(&state, "b", Some("first"));
+        let current = begin_bucket_resync(&state, "b", Some("second"));
+
+        assert_eq!(
+            sync_listing_into_generation(&state, "b", older, [("stale".to_owned(), entry(1, 10))]),
+            None,
+            "a stale page is rejected atomically with its generation check"
+        );
+        assert!(!finish_bucket_sync_generation(&state, "b", older));
+        {
+            let g = state.read().unwrap();
+            let bucket = &g["b"];
+            assert!(!bucket.synced);
+            assert_eq!(
+                bucket
+                    .uncertain_keys
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["first", "second"]
+            );
+            assert!(!bucket.keys.contains_key("stale"));
+        }
+
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                current,
+                [("fresh".to_owned(), entry(2, 20))]
+            ),
+            Some(1)
+        );
+        assert!(finish_bucket_sync_generation(&state, "b", current));
+        let g = state.read().unwrap();
+        assert!(g["b"].synced);
+        assert!(g["b"].uncertain_keys.is_empty());
+        assert!(g["b"].keys.contains_key("fresh"));
+    }
+
+    /// A failed paginated attempt may have published rows before the failing page. The
+    /// clean retry must not retain one that the origin no longer lists, or completing the
+    /// retry would make that absent key authoritative again.
+    #[test]
+    fn a_retry_discards_rows_from_its_failed_partial_attempt() {
+        let state: Index = RwLock::new(HashMap::new());
+        let failed = begin_bucket_resync(&state, "b", Some("writer"));
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                failed,
+                [("deleted-before-retry".to_owned(), entry(1, 10))]
+            ),
+            Some(1)
+        );
+
+        let retry = restart_bucket_resync_if_current(&state, "b", failed)
+            .expect("the failed attempt still owns the generation");
+        assert!(
+            !state.read().unwrap()["b"]
+                .keys
+                .contains_key("deleted-before-retry"),
+            "the retry starts from a clean origin snapshot"
+        );
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                retry,
+                [("still-present".to_owned(), entry(2, 20))]
+            ),
+            Some(1)
+        );
+        assert!(finish_bucket_sync_generation(&state, "b", retry));
+
+        let g = state.read().unwrap();
+        assert!(g["b"].synced);
+        assert!(!g["b"].keys.contains_key("deleted-before-retry"));
+        assert!(g["b"].keys.contains_key("still-present"));
     }
 
     use s3s::dto::{ETag, ListObjectsV2Input, ListObjectsV2Output};

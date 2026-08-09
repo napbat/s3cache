@@ -31,8 +31,10 @@ endpoint to this proxy; no client code changes.
   [Cache tiers](#cache-tiers).
 - **Write-through + invalidation, and fill-on-write.** `PutObject` / `DeleteObject` /
   multipart / `CopyObject` forward to the upstream (which stays the authority for
-  conditional/OCC writes — identical semantics), then update the index **and invalidate
-  the object cache** for that key, so reads are never stale. A `PutObject` goes one
+  conditional/OCC writes — identical semantics). A `PutObject` **invalidates the object
+  cache before forwarding**, then updates the index after success, so even an origin write
+  whose response is lost cannot leave an old hot or disk body behind. Ambiguous failures
+  fence the key and rebuild its bucket index from the origin. A successful PUT goes one
   further: its body is already in hand, so the writing node **keeps it** (`write_fill`)
   instead of leaving the object's first read to be a guaranteed origin GET. Peers are
   still invalidated over the write feed — only the writer, which knows the new bytes, is
@@ -41,7 +43,7 @@ endpoint to this proxy; no client code changes.
   response, a body within `S3CACHE_MAX_OBJECT_BYTES`, and none of the request forms whose
   stored object or response headers a kept copy could not reproduce (SSE-C, an append, a
   named storage class, object lock, tagging, a website redirect, `Expires`). Everything
-  else — and every refused write — behaves exactly as before.
+  else streams through; refused writes retain the origin's response semantics.
 - **Full passthrough for everything else** — all 98 S3 operations are implemented
   (generated from the `s3s` S3 trait), so arbitrary S3 clients work, not just one.
 
