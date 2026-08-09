@@ -12,7 +12,7 @@ helm:
     # number; replicas join by name off pod-0 when this is raised again.
     replicaCount: 1
     image:
-      tag: 0accdfb068d6103c09ce64b0ded2e3b9fce2382c
+      tag: f8e7d8a0e8bc842d1720f0090829f8f3a0ea9398
     upstream:
       endpoint: https://e340c486028724e7b58d09928fdf10e2.r2.cloudflarestorage.com
       buckets: docres
