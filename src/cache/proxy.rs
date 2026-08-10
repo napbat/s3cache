@@ -5,10 +5,9 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use s3s::dto::{
     ETag, ETagCondition, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    ListObjectsV2Input, ListObjectsV2Output, ObjectStorageClass, PutObjectInput, StreamingBlob,
-    Timestamp,
+    ListObjectsV2Input, ListObjectsV2Output, ObjectStorageClass, PutObjectInput, Timestamp,
 };
-use s3s::{S3, S3Request, S3Response, S3Result};
+use s3s::{S3, S3Error, S3Request, S3Response, S3Result};
 use tracing::info;
 
 use crate::index::{
@@ -88,6 +87,16 @@ pub(super) struct ObservedObject {
     content_type: Option<String>,
     storage_class: ObjectStorageClass,
     meta: ObjMeta,
+}
+
+/// A whole-object cache fill can fail normally, or discover from the origin's
+/// response that the object is too large to retain. The latter must hand the
+/// original streaming response back to the leader instead of manufacturing an
+/// error; followers re-probe after the per-key gate is released and stream their
+/// own copies, since an uncacheable body cannot be replayed.
+enum WholeGetFillError {
+    Origin(S3Error),
+    Uncacheable(Box<S3Response<GetObjectOutput>>),
 }
 
 /// The storage class a write puts a key in: what the request asked for, or S3's default.
@@ -1035,45 +1044,67 @@ impl CachingProxy {
             self.metrics.get_hit();
             return Ok(S3Response::new(obj.to_get()));
         }
+        if !cacheable {
+            self.metrics.get_bypass();
+            return self.inner.get_object(req).await;
+        }
+        // LIST/write-through already tells us when a body cannot fit. Preserve
+        // streaming throughput for those objects instead of putting them through
+        // the fill gate only to rediscover the cap from GET's Content-Length.
+        let known_oversized = self.index_size(&ckey.0, &ckey.1).is_some_and(|sz| {
+            sz >= 0 && usize::try_from(sz).unwrap_or(usize::MAX) > self.max_obj_bytes
+        });
+        if known_oversized {
+            self.metrics.get_bypass();
+            return self.inner.get_object(req).await;
+        }
+
         // Read before the fetch, not after it: a remediation that distrusts the cache
         // while this round-trip is in flight must leave the copy it lands suspect.
+        // Whole-object misses use the SAME probe-then-gate singleflight as range
+        // promotion. The old path fetched directly here, so a burst of identical cold
+        // Docres reads issued one R2 GET per waiter even though the tier already had the
+        // machinery to make them share one fill. Different keys still fetch fully in
+        // parallel; only duplicate work for this exact key waits on the gate.
         let generation = self.obj_cache.suspect_gen();
-        let mut resp = self.inner.get_object(req).await?;
-        let len = resp.output.content_length.unwrap_or(-1);
-        let small = len >= 0 && usize::try_from(len).unwrap_or(usize::MAX) <= self.max_obj_bytes;
-        if cacheable
-            && small
-            && let Some(body) = resp.output.body.take()
-        {
-            match tier::buffer_body(body, self.max_obj_bytes).await {
-                Some(bytes) => {
-                    // Stamped current as of *before* the fetch: these bytes are what the
-                    // origin held then, so nothing has to prove them again until the
-                    // generation moves on.
-                    let filled = CachedObject::from_get(&resp.output, bytes.clone());
-                    filled.mark_trusted(generation);
-                    self.obj_cache.insert(ckey.clone(), Arc::new(filled)).await;
-                    // The whole of what a HEAD reports is in hand, so the index entry is
-                    // completed here too — a body fill is the cheapest place to turn a
-                    // skeletal entry faithful, and it costs the origin nothing extra.
-                    self.observe(&ckey.0, &ckey.1, &observed!(&resp.output));
-                    self.metrics.get_miss();
-                    resp.output.body =
-                        Some(StreamingBlob::wrap(futures::stream::once(async move {
-                            Ok::<Bytes, std::io::Error>(bytes)
-                        })));
-                }
-                None => {
-                    return Err(s3s::s3_error!(
-                        InternalError,
-                        "s3cache: failed to buffer body"
-                    ));
-                }
+        let cap = self.max_obj_bytes;
+        let inner = &self.inner;
+        let origin = async {
+            let mut resp = inner
+                .get_object(req)
+                .await
+                .map_err(WholeGetFillError::Origin)?;
+            let len = resp.output.content_length.unwrap_or(-1);
+            if len < 0 || usize::try_from(len).unwrap_or(usize::MAX) > cap {
+                return Err(WholeGetFillError::Uncacheable(Box::new(resp)));
             }
-        } else {
-            self.metrics.get_bypass();
+            let Some(body) = resp.output.body.take() else {
+                return Err(WholeGetFillError::Uncacheable(Box::new(resp)));
+            };
+            let bytes = tier::buffer_body(body, cap).await.ok_or_else(|| {
+                WholeGetFillError::Origin(s3s::s3_error!(
+                    InternalError,
+                    "s3cache: failed to buffer body"
+                ))
+            })?;
+            let observed = observed!(&resp.output);
+            let filled = CachedObject::from_get(&resp.output, bytes);
+            filled.mark_trusted(generation);
+            // The whole of what a HEAD reports is in hand, so the index entry is
+            // completed here too — a body fill is the cheapest place to turn a
+            // skeletal entry faithful, and it costs the origin nothing extra.
+            self.observe(&ckey.0, &ckey.1, &observed);
+            self.metrics.get_miss();
+            Ok(Arc::new(filled))
+        };
+        match self.obj_cache.get_or_fetch_with(&ckey, origin).await {
+            Ok(filled) => Ok(S3Response::new(filled.to_get())),
+            Err(WholeGetFillError::Origin(error)) => Err(error),
+            Err(WholeGetFillError::Uncacheable(resp)) => {
+                self.metrics.get_bypass();
+                Ok(*resp)
+            }
         }
-        Ok(resp)
     }
 
     /// The HEAD decision tree, with the `response-*` overrides already lifted off `req`

@@ -327,3 +327,38 @@ async fn concurrent_misses_share_one_origin_fetch() {
         "the fetch was singleflighted"
     );
 }
+
+/// The gate is keyed, not global: coalescing duplicate work must not serialize
+/// independent cold objects or trade away aggregate origin throughput.
+#[tokio::test]
+async fn different_keys_fetch_concurrently() {
+    let dir = TempDir::new("parallel-keys");
+    let cache = cache(&dir, 1024 * 1024, AMPLE, NO_CAP);
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let peak = Arc::new(AtomicU64::new(0));
+
+    let origin = |name: &'static str| {
+        let in_flight = Arc::clone(&in_flight);
+        let peak = Arc::clone(&peak);
+        async move {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok::<_, String>(object(name, 256))
+        }
+    };
+    let first_key = key("first");
+    let second_key = key("second");
+    let (first, second) = tokio::join!(
+        cache.get_or_fetch(&first_key, origin("first")),
+        cache.get_or_fetch(&second_key, origin("second")),
+    );
+
+    assert!(first.is_ok() && second.is_ok());
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        2,
+        "different keys retain full origin parallelism"
+    );
+}

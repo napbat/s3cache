@@ -26,9 +26,10 @@ endpoint to this proxy; no client code changes.
   / conditional headers) of objects up to `S3CACHE_MAX_OBJECT_BYTES` are served from a
   **hot** node-local in-memory LRU (`S3CACHE_CACHE_BYTES`) in front of an optional **warm**
   node-local *disk* cache (`S3CACHE_DISK_CACHE`), falling through to **cold** — the S3
-  origin — on a miss. Always layered, no mode to pick. Ranged reads slice the cached whole
-  object; HEAD is served from the same cache; larger objects stream straight through. See
-  [Cache tiers](#cache-tiers).
+  origin — on a miss. Concurrent misses for the same cacheable object share one origin
+  fill; different keys remain fully concurrent, and known oversized objects stream
+  straight through. Always layered, no mode to pick. Ranged reads slice the cached whole
+  object; HEAD is served from the same cache. See [Cache tiers](#cache-tiers).
 - **Write-through + invalidation, and fill-on-write.** `PutObject` / `DeleteObject` /
   multipart / `CopyObject` forward to the upstream (which stays the authority for
   conditional/OCC writes — identical semantics). A `PutObject` **invalidates the object

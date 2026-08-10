@@ -11,12 +11,15 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::{
     Origin, delete, get, get_if_none_match, get_range, head, head_if_none_match, list, list_entry,
     node, put, put_conditional, put_typed, put_typed_conditional, wait_for_index,
 };
 use s3s::S3ErrorCode;
 use s3s::dto::{ETag, ETagCondition};
+use tokio::sync::Barrier;
 
 /// Once a bucket's background sync completes, LIST is answered from the index: the keys
 /// are right, they carry the origin's own size and `ETag`, and the origin is never asked
@@ -61,6 +64,40 @@ async fn a_get_misses_once_and_is_served_locally_after() {
     assert_eq!(origin.ops.get(), 1, "the hit did not");
 }
 
+/// Concurrent misses for one whole object share the tier's per-key fill. Docres can
+/// ask for the same cold shard object from many requests at once; sending every waiter
+/// to R2 turns one miss into an origin stampede and makes all of them slower.
+#[tokio::test]
+async fn concurrent_whole_get_misses_share_one_origin_fetch() {
+    const READERS: usize = 32;
+    let origin = Origin::start("e2e-get-singleflight").await;
+    let body = vec![b'x'; 1 << 20];
+    origin.seed("obj", &body).await;
+    let proxy = Arc::new(node(&origin, body.len() * 2));
+    let barrier = Arc::new(Barrier::new(READERS + 1));
+    let mut reads = tokio::task::JoinSet::new();
+
+    for _ in 0..READERS {
+        let proxy = Arc::clone(&proxy);
+        let barrier = Arc::clone(&barrier);
+        let bucket = origin.bucket().to_owned();
+        reads.spawn(async move {
+            barrier.wait().await;
+            get(&proxy, &bucket, "obj").await
+        });
+    }
+    barrier.wait().await;
+    while let Some(read) = reads.join_next().await {
+        assert_eq!(read.expect("reader task"), body);
+    }
+
+    assert_eq!(
+        origin.ops.get(),
+        1,
+        "all concurrent misses must share one origin GET"
+    );
+}
+
 /// An object past `max_obj_bytes` is never cached — it streams through, correctly, every
 /// time, and each read is an origin read.
 #[tokio::test]
@@ -70,6 +107,7 @@ async fn objects_over_the_cap_stream_through_uncached() {
     let big = vec![b'x'; CAP * 4];
     origin.seed("big", &big).await;
     let proxy = node(&origin, CAP);
+    wait_for_index(&proxy, &origin, origin.bucket()).await;
 
     for expected_gets in 1..=2 {
         assert_eq!(get(&proxy, origin.bucket(), "big").await, big);

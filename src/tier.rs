@@ -487,6 +487,19 @@ impl TieredCache {
     where
         Fut: Future<Output = Result<Arc<CachedObject>, String>> + Send,
     {
+        self.get_or_fetch_with(key, origin).await
+    }
+
+    /// The typed-error form used by the S3 proxy, whose leader must preserve an
+    /// origin [`s3s::S3Error`] or an uncacheable streaming response verbatim.
+    pub(crate) async fn get_or_fetch_with<Fut, E>(
+        &self,
+        key: &CacheKey,
+        origin: Fut,
+    ) -> Result<Arc<CachedObject>, E>
+    where
+        Fut: Future<Output = Result<Arc<CachedObject>, E>> + Send,
+    {
         if let Some(obj) = self.core.lookup(key).await {
             return Ok(obj);
         }
