@@ -13,6 +13,7 @@
 //! feed (see [`crate::sync`]): peers' writes fold into the index and invalidate local
 //! copies; strict reads barrier on feed heads.
 
+mod copy;
 /// Cache configuration, proxy state, and core tier/index behavior.
 pub mod proxy;
 mod service;

@@ -11,6 +11,7 @@ use s3s::dto::{
 };
 use s3s::{S3Error, S3Request, S3Response, S3Result};
 
+use crate::cache::copy;
 use crate::cache::proxy::{
     CachingProxy, IndexedWrite, ReadRoute, ResponseOverrides, observed_entry, write_storage_class,
     written_object,
@@ -329,21 +330,39 @@ impl s3s::S3 for CachingProxy {
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let bucket = req.input.bucket.clone();
         let key = req.input.key.clone();
-        let mut resp = self.inner.copy_object(req).await?;
+        let source = req.input.copy_source.clone();
+        let storage_class = write_storage_class(req.input.storage_class.as_ref());
+        let mut resp = copy::forward(&self.copy_inner, req).await?;
         self.obj_cache
             .invalidate(&(bucket.clone(), key.clone()))
             .await;
-        // A copy's metadata is the source's (or the request's, per the directive) and
-        // its size is whatever the origin assembled, neither of which the response
-        // carries: one HEAD is what tells us what we just created.
-        let observed = self.upstream_meta(&bucket, &key).await;
-        let mut entry = observed_entry(observed.as_ref());
-        entry.etag = resp
+        let copied_etag = resp
             .output
             .copy_object_result
             .as_ref()
-            .and_then(|result| result.e_tag.clone())
-            .or(entry.etag);
+            .and_then(|result| result.e_tag.clone());
+        let mut entry = if let Some(size) = copied_etag
+            .as_ref()
+            .and_then(|etag| copy::indexed_source_size(self, &source, etag))
+        {
+            // The matching ETag proves the copied bytes have the indexed source's
+            // length. Keep the row skeletal because metadata can change without the
+            // ETag changing; a later HEAD/GET completes it if anyone needs those fields.
+            self.metrics.copy_head_avoided();
+            ObjEntry {
+                size: Some(size),
+                last_modified: SystemTime::UNIX_EPOCH,
+                etag: copied_etag.clone(),
+                storage_class,
+                content_type: None,
+                meta: None,
+            }
+        } else {
+            self.metrics.copy_head_fallback();
+            let observed = self.upstream_meta(&bucket, &key).await;
+            observed_entry(observed.as_ref())
+        };
+        entry.etag = copied_etag.or(entry.etag);
         let token = self
             .record_put(IndexedWrite::Copy, &bucket, &key, entry)
             .await;
