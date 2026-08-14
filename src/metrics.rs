@@ -82,6 +82,10 @@ counters! {
     writes_indexed_put => write_indexed_put,
     /// Record a `CopyObject` folded into the LIST index.
     writes_indexed_copy => write_indexed_copy,
+    /// Record a copy whose ETag-matched source index row avoided a metadata HEAD.
+    copy_head_avoided => copy_head_avoided,
+    /// Record a copy that required a metadata HEAD because its source was unproved.
+    copy_head_fallbacks => copy_head_fallback,
     /// Record a `CompleteMultipartUpload` folded into the LIST index.
     writes_indexed_multipart => write_indexed_multipart,
     /// Record a key folded into the LIST index from a read-path observation

@@ -98,6 +98,7 @@ pub struct Ops {
     put: AtomicU64,
     delete: AtomicU64,
     copy: AtomicU64,
+    conditional_copy: AtomicU64,
     other: AtomicU64,
 }
 
@@ -114,7 +115,7 @@ macro_rules! op_readers {
         }
     };
 }
-op_readers!(list, get, head, put, delete, copy, other);
+op_readers!(list, get, head, put, delete, copy, conditional_copy, other);
 
 impl Ops {
     /// Classify one forwarded request the way S3 bills it, and count it. Path-style
@@ -123,6 +124,20 @@ impl Ops {
     fn record(&self, method: &Method, uri: &Uri, headers: &HeaderMap) {
         let path = uri.path().trim_start_matches('/');
         let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
+        if method == Method::PUT
+            && on_key
+            && headers.contains_key("x-amz-copy-source")
+            && headers
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                == Some("*")
+            && headers
+                .get("cf-copy-destination-if-none-match")
+                .and_then(|value| value.to_str().ok())
+                == Some("*")
+        {
+            self.conditional_copy.fetch_add(1, Ordering::Relaxed);
+        }
         let counter = match (method, on_key) {
             (&Method::GET, false) => &self.list,
             (&Method::GET, true) => &self.get,

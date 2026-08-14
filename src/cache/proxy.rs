@@ -10,6 +10,7 @@ use s3s::dto::{
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result};
 use tracing::info;
 
+use crate::cache::copy;
 use crate::index::{
     BucketState, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del, apply_put,
     begin_bucket_resync, bucket_resync_is_current, complete_entry, entry_matches_body,
@@ -292,6 +293,8 @@ pub(super) async fn affirm_after(
 #[derive(Clone)]
 pub struct CachingProxy {
     pub(super) inner: Arc<s3s_aws::Proxy>,
+    /// Copy-only upstream with the pre-signing destination-condition adapter.
+    pub(super) copy_inner: Arc<s3s_aws::Proxy>,
     /// Direct client used only for the background full LIST warm-up sync.
     pub(super) client: aws_sdk_s3::Client,
     /// The LIST index, `Arc` so the background warm-up task shares it with the serving
@@ -320,8 +323,10 @@ impl CachingProxy {
         sync: Option<Arc<WriteSync>>,
         metrics: Arc<Metrics>,
     ) -> Self {
+        let copy_client = copy::conditioned_client(&client);
         Self {
             inner: Arc::new(inner),
+            copy_inner: Arc::new(s3s_aws::Proxy::from(copy_client)),
             client,
             state: Arc::new(RwLock::new(HashMap::new())),
             obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),

@@ -15,10 +15,12 @@ use std::sync::Arc;
 
 use common::{
     Origin, delete, get, get_if_none_match, get_range, head, head_if_none_match, list, list_entry,
-    node, put, put_conditional, put_typed, put_typed_conditional, wait_for_index,
+    node, put, put_conditional, put_typed, put_typed_conditional, request, wait_for_index,
 };
-use s3s::S3ErrorCode;
-use s3s::dto::{ETag, ETagCondition};
+use http::HeaderValue;
+use http::header::IF_NONE_MATCH;
+use s3s::dto::{CopyObjectInput, CopySource, ETag, ETagCondition};
+use s3s::{S3, S3ErrorCode};
 use tokio::sync::Barrier;
 
 /// Once a bucket's background sync completes, LIST is answered from the index: the keys
@@ -47,6 +49,55 @@ async fn list_is_served_from_the_index_after_the_warm_up_sync() {
         origin.ops.list(),
         baseline,
         "a synced bucket costs the origin no LIST at all"
+    );
+}
+
+/// Destination conditions on `CopyObject` survive both protocol adapters: AWS-compatible
+/// origins get the standard header and R2 gets its `cf-copy-destination-*` equivalent.
+/// A successful copy whose result `ETag` matches the indexed source also needs no metadata
+/// HEAD. `MinIO` does not implement destination-conditional `CopyObject`, so this structural
+/// test proves forwarding; the production R2 check proves rejection of an overwrite.
+#[tokio::test]
+async fn conditional_copy_headers_reach_origin_and_proved_size_skips_head() {
+    let origin = Origin::start("e2e-conditional-copy").await;
+    origin.seed("source", b"first source").await;
+    let proxy = node(&origin, 1024 * 1024);
+    wait_for_index(&proxy, &origin, origin.bucket()).await;
+
+    let copy_request = || {
+        let mut input = CopyObjectInput::builder();
+        input.set_bucket(origin.bucket().to_owned());
+        input.set_key("destination".to_owned());
+        input.set_copy_source(CopySource::Bucket {
+            bucket: origin.bucket().to_owned().into(),
+            key: "source".into(),
+            version_id: None,
+        });
+        let mut req = request(input.build().expect("a complete copy request"));
+        req.headers
+            .insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        req
+    };
+
+    proxy
+        .copy_object(copy_request())
+        .await
+        .expect("the absent destination is created");
+    assert_eq!(
+        origin.ops.head(),
+        0,
+        "an ETag-matched source size avoids the copy metadata HEAD"
+    );
+    assert_eq!(
+        origin.stored("destination").await.as_deref(),
+        Some(&b"first source"[..])
+    );
+
+    assert_eq!(origin.ops.copy(), 1, "the copy reached the origin once");
+    assert_eq!(
+        origin.ops.conditional_copy(),
+        1,
+        "both standard and R2 destination conditions reached the origin"
     );
 }
 
