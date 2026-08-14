@@ -653,7 +653,7 @@ impl CachingProxy {
     /// observation, stamped with the origin's own mtime (the truest clock available for
     /// something the origin just described) and advertised to nobody: peers learn real
     /// writes from their writers.
-    fn observe(&self, bucket: &str, key: &str, observed: &ObservedObject) {
+    pub(super) fn observe(&self, bucket: &str, key: &str, observed: &ObservedObject) {
         let fill = EntryFill {
             size: observed.size,
             etag: observed.etag.clone(),
