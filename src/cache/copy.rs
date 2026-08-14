@@ -31,6 +31,15 @@ impl DestinationConditions {
     }
 }
 
+/// Whether this copy is the create-only form used for immutable destinations.
+/// A 412 from the origin then proves the destination exists, even if this
+/// proxy's LIST index has not observed it yet.
+pub(super) fn destination_must_be_absent(req: &S3Request<CopyObjectInput>) -> bool {
+    req.headers
+        .get(IF_NONE_MATCH)
+        .is_some_and(|value| value == HeaderValue::from_static("*"))
+}
+
 tokio::task_local! {
     static DESTINATION_CONDITIONS: DestinationConditions;
 }

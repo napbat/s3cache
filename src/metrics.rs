@@ -86,6 +86,12 @@ counters! {
     copy_head_avoided => copy_head_avoided,
     /// Record a copy that required a metadata HEAD because its source was unproved.
     copy_head_fallbacks => copy_head_fallback,
+    /// Record a create-only copy conflict whose existing destination was folded
+    /// into the local index from one authoritative HEAD.
+    copy_conflict_reconciled => copy_conflict_reconciled,
+    /// Record a create-only copy conflict whose destination remained unobservable
+    /// after the bounded authoritative metadata probe.
+    copy_conflict_reconcile_misses => copy_conflict_reconcile_miss,
     /// Record a `CompleteMultipartUpload` folded into the LIST index.
     writes_indexed_multipart => write_indexed_multipart,
     /// Record a key folded into the LIST index from a read-path observation

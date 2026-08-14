@@ -74,6 +74,10 @@ fn uncertain_put_error(error: &S3Error, locally_vouched: bool) -> Option<&'stati
     }
 }
 
+fn copy_conflict_needs_reconcile(error: &S3Error, create_only: bool) -> bool {
+    create_only && error.status_code() == Some(http::StatusCode::PRECONDITION_FAILED)
+}
+
 #[async_trait]
 impl s3s::S3 for CachingProxy {
     // LIST served from the index when the bucket is synced; else passthrough.
@@ -332,10 +336,33 @@ impl s3s::S3 for CachingProxy {
         let key = req.input.key.clone();
         let source = req.input.copy_source.clone();
         let storage_class = write_storage_class(req.input.storage_class.as_ref());
-        let mut resp = copy::forward(&self.copy_inner, req).await?;
+        let create_only = copy::destination_must_be_absent(&req);
+        // Invalidate before forwarding, for the same crash boundary as PUT: a
+        // successful overwrite must never leave an old body trusted locally.
         self.obj_cache
             .invalidate(&(bucket.clone(), key.clone()))
             .await;
+        let mut resp = match copy::forward(&self.copy_inner, req).await {
+            Ok(resp) => resp,
+            Err(error) => {
+                if copy_conflict_needs_reconcile(&error, create_only) {
+                    // The origin's 412 proves an immutable create-only
+                    // destination already exists. That can race ahead of this
+                    // proxy's LIST index (for example after an interrupted
+                    // response), where an immediate HEAD would otherwise be a
+                    // false local 404. One authoritative HEAD folds the proven
+                    // object into this node before the 412 reaches the caller;
+                    // the caller can then confirm it without replaying COPYs.
+                    if let Some(observed) = self.upstream_meta(&bucket, &key).await {
+                        self.observe(&bucket, &key, &observed);
+                        self.metrics.copy_conflict_reconciled();
+                    } else {
+                        self.metrics.copy_conflict_reconcile_miss();
+                    }
+                }
+                return Err(error);
+            }
+        };
         let copied_etag = resp
             .output
             .copy_object_result
@@ -975,7 +1002,7 @@ impl s3s::S3 for CachingProxy {
 
 #[cfg(test)]
 mod tests {
-    use super::uncertain_put_error;
+    use super::{copy_conflict_needs_reconcile, uncertain_put_error};
     use s3s::{S3Error, S3ErrorCode};
 
     #[test]
@@ -992,5 +1019,15 @@ mod tests {
             uncertain_put_error(&failed, false),
             Some("origin returned an ambiguous server failure")
         );
+    }
+
+    #[test]
+    fn only_a_create_only_412_requests_copy_conflict_reconciliation() {
+        let conflict = S3Error::new(S3ErrorCode::PreconditionFailed);
+        assert!(copy_conflict_needs_reconcile(&conflict, true));
+        assert!(!copy_conflict_needs_reconcile(&conflict, false));
+
+        let failed = S3Error::new(S3ErrorCode::InternalError);
+        assert!(!copy_conflict_needs_reconcile(&failed, true));
     }
 }
