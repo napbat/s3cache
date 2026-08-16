@@ -1,0 +1,15 @@
+{{- if and .Values.availability.podDisruptionBudget (gt (int .Values.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: s3cache
+  labels:
+    app.kubernetes.io/name: s3cache
+spec:
+  # Preserve all but one ready endpoint during voluntary disruption. StatefulSet
+  # rolling updates are already ordinal and one-at-a-time; this covers evictions.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3cache
+{{- end }}

@@ -8,9 +8,10 @@ labels:
 helm:
   releaseName: s3cache
   values:
-    # One replica is sufficient for the current workload. Scaling is only this
-    # number; replicas join by name off pod-0 when this is raised again.
-    replicaCount: 1
+    # Keep one ready endpoint while Fleet replaces the other ordinal. The replicas
+    # remain coherent through the chart's always-on gossip feed; each keeps its own
+    # hot tier and persistent warm PVC.
+    replicaCount: 2
     image:
       tag: 6ba70932f2ae532af7a2e4951b33278ddfd2a27e
     upstream:

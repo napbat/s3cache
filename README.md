@@ -99,6 +99,11 @@ every other peer resolves through gossiped advertisements.
 With the feed on, **multiple replicas are safe** — this lifts the historical
 single-replica constraint with zero extra services.
 
+The Helm chart preserves that availability during routine operations: replicated
+releases wait for a new ordinal to remain ready before advancing a rollout and
+render a `PodDisruptionBudget` with `maxUnavailable: 1`. Each ordinal owns its own
+warm PVC, so rollout availability does not require sharing cache files.
+
 ## Consistency
 
 Clients should never have to know s3cache exists. In the default mode they don't:
