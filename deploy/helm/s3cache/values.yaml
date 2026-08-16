@@ -3,6 +3,14 @@
 # coherent replicas with no other configuration.
 replicaCount: 1
 
+# Rollout and voluntary-disruption safety. StatefulSet updates already replace
+# ordinals one at a time; minReadySeconds keeps the survivor/new peer overlap long
+# enough for endpoint programming and gossip convergence. The PDB is rendered only
+# for replicated releases, where maxUnavailable=1 cannot deadlock a singleton.
+availability:
+  minReadySeconds: 5
+  podDisruptionBudget: true
+
 image:
   repository: ghcr.io/napbat/s3cache
   tag: latest

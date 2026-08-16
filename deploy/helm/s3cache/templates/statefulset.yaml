@@ -11,6 +11,9 @@ spec:
   replicas: {{ .Values.replicaCount }}
   serviceName: s3cache-gossip
   podManagementPolicy: Parallel
+  # A new ordinal must remain ready before a rolling update advances to the next
+  # one. This gives the Service and gossip feed a stable overlap window.
+  minReadySeconds: {{ .Values.availability.minReadySeconds | int64 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: s3cache

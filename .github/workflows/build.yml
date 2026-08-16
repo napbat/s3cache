@@ -49,6 +49,15 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: helm lint deploy/helm/s3cache --set upstream.endpoint=https://example.com
       - run: helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com
+      - name: Render replicated availability path
+        run: |
+          set -euo pipefail
+          rendered="$(helm template deploy/helm/s3cache \
+            --set upstream.endpoint=https://example.com \
+            --set replicaCount=2)"
+          grep -q '^kind: PodDisruptionBudget$' <<<"$rendered"
+          grep -q '^  maxUnavailable: 1$' <<<"$rendered"
+          grep -q '^  minReadySeconds: 5$' <<<"$rendered"
 
   # Image build + push (inlined from cicd/build-push.yml): SHA tag (deploys pin to
   # it) + mutable latest, registry-backed BuildKit cache so the heavy cargo layers
