@@ -124,6 +124,45 @@ impl WarmHeader {
     }
 }
 
+/// Borrowing view of the original all-bincode `CachedObject` layout. `Bytes`
+/// serialized its body as a byte string; deserializing that field as `&[u8]`
+/// lets legacy cache files use the same mmap slice as current framed records.
+#[derive(Deserialize)]
+struct LegacyWarmObject<'a> {
+    #[serde(borrow)]
+    body: &'a [u8],
+    content_length: Option<i64>,
+    content_type: Option<String>,
+    e_tag: Option<ETag>,
+    last_modified: Option<Timestamp>,
+    cache_control: Option<String>,
+    content_encoding: Option<String>,
+    content_language: Option<String>,
+    content_disposition: Option<String>,
+    accept_ranges: Option<String>,
+    metadata: Option<Metadata>,
+}
+
+impl LegacyWarmObject<'_> {
+    fn finish(self, key: CacheKey, body: Bytes) -> (CacheKey, Arc<CachedObject>) {
+        let object = CachedObject {
+            body,
+            content_length: self.content_length,
+            content_type: self.content_type,
+            e_tag: self.e_tag,
+            last_modified: self.last_modified,
+            cache_control: self.cache_control,
+            content_encoding: self.content_encoding,
+            content_language: self.content_language,
+            content_disposition: self.content_disposition,
+            accept_ranges: self.accept_ranges,
+            metadata: self.metadata,
+            trusted_gen: AtomicU64::new(0),
+        };
+        (key, Arc::new(object))
+    }
+}
+
 /// Replays the cached response fields into `$out`, defaulting the rest. `GetObjectOutput`
 /// and `HeadObjectOutput` spell these fields identically, so one list drives both: a
 /// cached HEAD reports exactly what a cached GET does, and neither can drift from the
@@ -351,8 +390,26 @@ fn encode_warm_record(
 /// all-bincode entries remain readable and age out naturally under LRU.
 fn decode_warm_record(bytes: &Bytes) -> Result<(CacheKey, Arc<CachedObject>), tierstore::BoxError> {
     if !bytes.starts_with(WARM_MAGIC) {
-        let (key, object): (CacheKey, CachedObject) = bincode::deserialize(bytes)?;
-        return Ok((key, Arc::new(object)));
+        let (key, legacy): (CacheKey, LegacyWarmObject<'_>) = bincode::deserialize(bytes)?;
+        let body = if legacy.body.is_empty() {
+            Bytes::new()
+        } else {
+            let start = legacy
+                .body
+                .as_ptr()
+                .addr()
+                .checked_sub(bytes.as_ptr().addr())
+                .filter(|start| *start <= bytes.len())
+                .ok_or_else(|| -> tierstore::BoxError {
+                    "legacy warm body is outside its record".into()
+                })?;
+            let end = start
+                .checked_add(legacy.body.len())
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| -> tierstore::BoxError { "legacy warm body is truncated".into() })?;
+            bytes.slice(start..end)
+        };
+        return Ok(legacy.finish(key, body));
     }
 
     let header_len_bytes = bytes
@@ -787,14 +844,25 @@ mod tests {
         let key = ck("b", "legacy");
         let object = sample();
         let legacy = Bytes::from(bincode::serialize(&(&key, &object)).expect("legacy encode"));
-        disk.put(super::warm_key(&key.0, &key.1), legacy)
+        let disk_key = super::warm_key(&key.0, &key.1);
+        disk.put(disk_key.clone(), legacy)
             .await
             .expect("seed legacy record");
+        let mapped = disk
+            .get(&disk_key)
+            .await
+            .expect("disk get")
+            .expect("mapped legacy record");
+        let mapping = mapped.as_ptr().addr()..mapped.as_ptr().addr() + mapped.len();
 
         let decoded = warm.get(&key).await.expect("warm get").expect("hit");
 
         assert_eq!(decoded.body, object.body);
         assert_eq!(decoded.e_tag, object.e_tag);
+        assert!(
+            mapping.contains(&decoded.body.as_ptr().addr()),
+            "legacy bodies must borrow the mmap too"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
