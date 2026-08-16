@@ -49,6 +49,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: helm lint deploy/helm/s3cache --set upstream.endpoint=https://example.com
       - run: helm template deploy/helm/s3cache --set upstream.endpoint=https://example.com
+      - name: Keep Fleet on the proven-safe topology
+        run: grep -q '^    replicaCount: 1$' deploy/helm/s3cache/fleet.yaml
       - name: Render replicated availability path
         run: |
           set -euo pipefail
