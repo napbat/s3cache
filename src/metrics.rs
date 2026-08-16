@@ -13,14 +13,13 @@ use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use tierstore_mmap::MmapDiskStats;
 use tokio::net::TcpListener;
 use tracing::info;
 
-/// Declares the counter set once: the fields, a bump method per counter, the stats
-/// line, and the Prometheus exposition — all generated in declaration order, so a
-/// counter can never be added without being logged *and* scrapeable. The `warm_*`
-/// counters cover the disk (warm) tier, the `feed_*` counters the gossip write feed, and
-/// the rest the index and hot path.
+/// Declares the event-counter set once: the fields, a bump method per counter, the stats
+/// line, and the Prometheus exposition — all generated in declaration order. Warm
+/// residency gauges sourced from Tierstore follow the generated event counters.
 macro_rules! counters {
     ($( $(#[$doc:meta])* $field:ident => $bump:ident ),+ $(,)?) => {
         /// Cache-effectiveness counters, shared by the proxy, the tiers, the write feed
@@ -29,6 +28,12 @@ macro_rules! counters {
         #[derive(Default)]
         pub struct Metrics {
             $($field: AtomicU64,)+
+            warm_entries: AtomicU64,
+            warm_mapped_entries: AtomicU64,
+            warm_disk_bytes: AtomicU64,
+            warm_disk_budget_bytes: AtomicU64,
+            warm_evictions: AtomicU64,
+            warm_evicted_bytes: AtomicU64,
         }
 
         impl Metrics {
@@ -38,6 +43,26 @@ macro_rules! counters {
                     self.$field.fetch_add(1, Ordering::Relaxed);
                 }
             )+
+
+            /// Refresh the mmap tier's non-faulting residency gauges and
+            /// lifetime eviction totals.
+            pub(crate) fn observe_warm(&self, stats: MmapDiskStats) {
+                self.warm_entries.store(
+                    u64::try_from(stats.entries).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                self.warm_mapped_entries.store(
+                    u64::try_from(stats.mapped_entries).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                self.warm_disk_bytes.store(stats.disk_bytes, Ordering::Relaxed);
+                self.warm_disk_budget_bytes.store(
+                    stats.budget_bytes.unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                self.warm_evictions.store(stats.evictions, Ordering::Relaxed);
+                self.warm_evicted_bytes.store(stats.evicted_bytes, Ordering::Relaxed);
+            }
 
             /// The counters as one `name=value …` line.
             fn stats_line(&self) -> String {
@@ -49,6 +74,17 @@ macro_rules! counters {
                         self.$field.load(Ordering::Relaxed),
                     );
                 )+
+                let _ = write!(
+                    line,
+                    " warm_entries={} warm_mapped_entries={} warm_disk_bytes={} \
+                     warm_disk_budget_bytes={} warm_evictions={} warm_evicted_bytes={}",
+                    self.warm_entries.load(Ordering::Relaxed),
+                    self.warm_mapped_entries.load(Ordering::Relaxed),
+                    self.warm_disk_bytes.load(Ordering::Relaxed),
+                    self.warm_disk_budget_bytes.load(Ordering::Relaxed),
+                    self.warm_evictions.load(Ordering::Relaxed),
+                    self.warm_evicted_bytes.load(Ordering::Relaxed),
+                );
                 line
             }
 
@@ -67,6 +103,21 @@ macro_rules! counters {
                         self.$field.load(Ordering::Relaxed),
                     );
                 )+
+                let _ = writeln!(
+                    out,
+                    "# TYPE s3cache_warm_entries gauge\ns3cache_warm_entries {}\
+                     \n# TYPE s3cache_warm_mapped_entries gauge\ns3cache_warm_mapped_entries {}\
+                     \n# TYPE s3cache_warm_disk_bytes gauge\ns3cache_warm_disk_bytes {}\
+                     \n# TYPE s3cache_warm_disk_budget_bytes gauge\ns3cache_warm_disk_budget_bytes {}\
+                     \n# TYPE s3cache_warm_evictions counter\ns3cache_warm_evictions {}\
+                     \n# TYPE s3cache_warm_evicted_bytes counter\ns3cache_warm_evicted_bytes {}",
+                    self.warm_entries.load(Ordering::Relaxed),
+                    self.warm_mapped_entries.load(Ordering::Relaxed),
+                    self.warm_disk_bytes.load(Ordering::Relaxed),
+                    self.warm_disk_budget_bytes.load(Ordering::Relaxed),
+                    self.warm_evictions.load(Ordering::Relaxed),
+                    self.warm_evicted_bytes.load(Ordering::Relaxed),
+                );
                 out
             }
         }
@@ -280,6 +331,7 @@ fn scrape(metrics: &Metrics, method: &Method, path: &str) -> Response<Full<Bytes
 mod tests {
     use super::{Metrics, scrape};
     use http::{Method, StatusCode};
+    use tierstore_mmap::MmapDiskStats;
 
     #[test]
     fn the_stats_line_reports_every_counter() {
@@ -296,7 +348,8 @@ mod tests {
         assert!(line.contains(" get_hit=2 "), "{line}");
         assert!(line.contains(" warm_hit=1 "), "{line}");
         assert!(line.contains(" head_index=1 "), "{line}");
-        assert!(line.ends_with(" index_backfills=0"), "{line}");
+        assert!(line.contains(" index_backfills=0 "), "{line}");
+        assert!(line.ends_with(" warm_evicted_bytes=0"), "{line}");
     }
 
     /// The exposition is generated from the same declaration as the stats line, so
@@ -310,8 +363,19 @@ mod tests {
         let mut counted = 0;
         for entry in metrics.stats_line().split_whitespace() {
             let (name, value) = entry.split_once('=').expect("name=value");
+            let kind = if matches!(
+                name,
+                "warm_entries"
+                    | "warm_mapped_entries"
+                    | "warm_disk_bytes"
+                    | "warm_disk_budget_bytes"
+            ) {
+                "gauge"
+            } else {
+                "counter"
+            };
             assert!(
-                text.contains(&format!("# TYPE s3cache_{name} counter\n")),
+                text.contains(&format!("# TYPE s3cache_{name} {kind}\n")),
                 "{name} has no TYPE line"
             );
             assert!(
@@ -325,6 +389,31 @@ mod tests {
             counted * 2,
             "the exposition holds a TYPE + sample line per counter and nothing else"
         );
+    }
+
+    #[test]
+    fn warm_residency_and_evictions_are_exported_from_one_snapshot() {
+        let metrics = Metrics::default();
+        metrics.observe_warm(MmapDiskStats {
+            entries: 17,
+            mapped_entries: 5,
+            disk_bytes: 4096,
+            budget_bytes: Some(8192),
+            evictions: 3,
+            evicted_bytes: 768,
+        });
+
+        let text = metrics.prometheus_text();
+        for sample in [
+            "s3cache_warm_entries 17",
+            "s3cache_warm_mapped_entries 5",
+            "s3cache_warm_disk_bytes 4096",
+            "s3cache_warm_disk_budget_bytes 8192",
+            "s3cache_warm_evictions 3",
+            "s3cache_warm_evicted_bytes 768",
+        ] {
+            assert!(text.contains(sample), "missing {sample}: {text}");
+        }
     }
 
     #[test]
