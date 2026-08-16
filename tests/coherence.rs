@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use common::{
     Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, gossip_pair, head, list,
-    list_entry, proxy_over, put, put_conditional, put_typed, wait_for_index, warm_proxy_over,
+    list_entry, proxy_over, proxy_over_with_metrics, put, put_conditional, put_typed,
+    wait_for_index, warm_proxy_over,
 };
 use s3cache::cache::proxy::CachingProxy;
 use s3cache::metrics::Metrics;
@@ -27,21 +28,31 @@ const CAP: usize = 1024 * 1024;
 /// never share an identity. Built after the origin's fixtures are seeded, so both
 /// warm-up syncs see them.
 async fn two_nodes(origin: &Origin, ids: (&str, &str)) -> (CachingProxy, CachingProxy) {
+    let (node_a, node_b, _, _) = two_nodes_with_metrics(origin, ids).await;
+    (node_a, node_b)
+}
+
+/// [`two_nodes`] with each node's counters retained by the caller. The proxy and
+/// its coherence apply loop share the same `Arc`, exactly as the binary does.
+async fn two_nodes_with_metrics(
+    origin: &Origin,
+    ids: (&str, &str),
+) -> (CachingProxy, CachingProxy, Arc<Metrics>, Arc<Metrics>) {
     let bucket = origin.bucket();
     let client = origin.counted_client();
     let (sync_a, sync_b) = gossip_pair(ids.0, ids.1).await;
 
-    let mut nodes = Vec::new();
-    for sync in [sync_a, sync_b] {
-        let proxy = proxy_over(&client, CAP, Some(sync));
+    let metrics_a = Arc::new(Metrics::default());
+    let metrics_b = Arc::new(Metrics::default());
+    let node_a = proxy_over_with_metrics(&client, CAP, Some(sync_a), &metrics_a);
+    let node_b = proxy_over_with_metrics(&client, CAP, Some(sync_b), &metrics_b);
+    for proxy in [&node_a, &node_b] {
         proxy.start_coherence(&[bucket.to_owned()]);
         proxy.spawn_background_sync(vec![bucket.to_owned()]);
-        nodes.push(proxy);
     }
-    let (node_b, node_a) = (nodes.pop().expect("b"), nodes.pop().expect("a"));
     wait_for_index(&node_a, origin, bucket).await;
     wait_for_index(&node_b, origin, bucket).await;
-    (node_a, node_b)
+    (node_a, node_b, metrics_a, metrics_b)
 }
 
 /// Wait until the two nodes have actually found each other, by the only signal that
@@ -146,6 +157,76 @@ async fn a_write_on_a_folds_into_bs_index() {
         origin.ops.head(),
         heads,
         "the completed entry answers every HEAD after it"
+    );
+}
+
+/// A write feed is one gossiped state entry. Its item-count capacity is deliberately
+/// much larger than one UDP frame, so sustained writes must retire the oldest encoded
+/// events by bytes while a healthy peer keeps applying the tail. Before Groupnet's
+/// byte bound, this workload grew the entry past the transport envelope: B's applied
+/// counter froze, every later strong write timed out, and B could return false misses.
+#[tokio::test]
+async fn sustained_writes_keep_the_coherence_feed_moving() {
+    const WRITES: u64 = 640;
+
+    let origin = Origin::start("coherence-sustained").await;
+    let bucket = origin.bucket();
+    let (node_a, node_b, metrics_a, metrics_b) =
+        two_nodes_with_metrics(&origin, ("sustain-a", "sustain-b")).await;
+    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+
+    let published = counter(&metrics_a, "feed_published");
+    let applied = counter(&metrics_b, "feed_applied");
+    let timeouts = counter(&metrics_a, "ack_timeouts");
+    let lapses = counter(&metrics_a, "write_lease_lapses");
+    let gaps = counter(&metrics_b, "feed_gaps");
+    let suffix = "x".repeat(160);
+    let mut last = String::new();
+
+    for seq in 0..WRITES {
+        last = format!(
+            "fixtures/long-object-keys/tenant-0000000000000000/shard-0000000000000000/\
+             {seq:016x}-{suffix}"
+        );
+        put(&node_a, bucket, &last, b"x").await;
+        assert_eq!(
+            counter(&metrics_a, "ack_timeouts"),
+            timeouts,
+            "the coherence feed arrested at sustained write {seq}"
+        );
+        assert_eq!(
+            counter(&metrics_b, "feed_applied"),
+            applied + seq + 1,
+            "strong mode returned write {seq} before B applied it"
+        );
+    }
+
+    assert_eq!(counter(&metrics_a, "feed_published"), published + WRITES);
+    assert_eq!(
+        counter(&metrics_a, "write_lease_lapses"),
+        lapses,
+        "a healthy peer must not need the lapse escape path"
+    );
+    assert_eq!(
+        counter(&metrics_b, "feed_gaps"),
+        gaps,
+        "a peer acknowledged after every write, so it never fell behind the byte window"
+    );
+
+    let origin_lists = origin.ops.list();
+    let keys = list(&node_b, bucket).await;
+    assert_eq!(
+        keys.len(),
+        usize::try_from(WRITES).expect("the fixed regression count fits usize")
+    );
+    assert!(
+        keys.contains(&last),
+        "B retained the tail of the sustained run"
+    );
+    assert_eq!(
+        origin.ops.list(),
+        origin_lists,
+        "B served the final bucket view from its continuously updated index"
     );
 }
 

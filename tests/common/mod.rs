@@ -532,6 +532,18 @@ pub fn proxy_over(
     max_obj_bytes: usize,
     sync: Option<Arc<WriteSync>>,
 ) -> CachingProxy {
+    proxy_over_with_metrics(client, max_obj_bytes, sync, &Arc::new(Metrics::default()))
+}
+
+/// [`proxy_over`] with caller-owned metrics, for tests whose black-box assertion
+/// depends on which internal path produced the externally visible answer.
+#[must_use]
+pub fn proxy_over_with_metrics(
+    client: &aws_sdk_s3::Client,
+    max_obj_bytes: usize,
+    sync: Option<Arc<WriteSync>>,
+    metrics: &Arc<Metrics>,
+) -> CachingProxy {
     CachingProxy::new(
         s3s_aws::Proxy::from(client.clone()),
         client.clone(),
@@ -541,7 +553,7 @@ pub fn proxy_over(
         },
         None,
         sync,
-        Arc::new(Metrics::default()),
+        Arc::clone(metrics),
     )
 }
 

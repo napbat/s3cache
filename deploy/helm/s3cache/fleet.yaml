@@ -8,12 +8,11 @@ labels:
 helm:
   releaseName: s3cache
   values:
-    # Keep production single-replica until the gossip feed's sustained-write gate
-    # proves that its encoded ring remains within the transport frame budget. A
-    # two-replica run on 2026-08-16 stalled both apply frontiers while leases kept
-    # renewing, which let a peer answer a false 404 for a newly written object.
-    # The bounded mmap warm tier keeps this pod's memory safe; its PVC survives
-    # restarts, and the second ordinal's existing PVC is retained for a later rollout.
+    # Staged coherence rollout: first let CI build and bump the byte-bounded feed
+    # image while production remains a safe cluster of one. Fleet applies this
+    # source revision before that image bump, so changing the replica count here
+    # would briefly start a second copy of the known-bad old image. A follow-up
+    # revision restores two replicas only after the new singleton is live.
     replicaCount: 1
     image:
       tag: ed0fb9a8d218b0c05c14fb1fff5b519e3c90d079
