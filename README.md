@@ -94,7 +94,10 @@ read path). Loss is **detected, never silent**: a peer that falls behind the fee
 or a peer restart, surfaces as a *gap* — the node distrusts every local body and resyncs
 its index from the origin, which is the authority the index caches, so a copy is served
 again only once that index has proved it current. Only seeds need static addressing;
-every other peer resolves through gossiped advertisements.
+every other peer resolves through gossiped advertisements. The ring is bounded by both
+event count and encoded bytes: sustained long-key writes shorten its replay window and
+surface the same explicit gap instead of growing one state entry past the transport
+envelope and silently arresting peer application.
 
 With the feed on, **multiple replicas are safe** — this lifts the historical
 single-replica constraint with zero extra services.
@@ -294,7 +297,9 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
   and cache consistent with the outcome. `tests/coherence.rs` does the same with two
   nodes gossiping over loopback UDP: a write on A is in B's index by the time it
   returns, an overwrite on A drops B's cached body, a delete on A makes B's HEAD a
-  local 404, and a contested create-if-absent is arbitrated by the origin.
+  local 404, a contested create-if-absent is arbitrated by the origin, and 640 long-key
+  writes prove the feed keeps advancing after it crosses the old transport-envelope
+  arrest point.
 - **Differential tests** (`tests/differential.rs`, same Docker origin): every row asks
   one question twice — once through the proxy, once straight at MinIO — and asserts a
   client could not tell which answered, over the status, the body and the headers it
