@@ -8,12 +8,10 @@ labels:
 helm:
   releaseName: s3cache
   values:
-    # Staged coherence rollout: first let CI build and bump the byte-bounded feed
-    # image while production remains a safe cluster of one. Fleet applies this
-    # source revision before that image bump, so changing the replica count here
-    # would briefly start a second copy of the known-bad old image. A follow-up
-    # revision restores two replicas only after the new singleton is live.
-    replicaCount: 1
+    # Two replicas share byte-bounded coherence feeds. Each ordinal keeps its own
+    # warm-cache PVC, while Fleet and the PDB retain one serving replica during
+    # routine image rollouts.
+    replicaCount: 2
     image:
       tag: cadfcee0ad2e0e59232328e3d82f38059a3c7b05
     upstream:
