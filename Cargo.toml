@@ -87,3 +87,7 @@ opt-level = 2
 testcontainers.workspace = true
 # The tests' counting forwarder needs hyper's client half; the binary only ever serves.
 hyper = { workspace = true, features = ["client"] }
+
+[[bench]]
+name = "warm_decode"
+harness = false

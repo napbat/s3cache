@@ -64,8 +64,13 @@ hot (in-memory, small)  ->  warm (node-local disk, large, optional)  ->  cold (S
 - **warm** — an optional node-local **disk** cache under `S3CACHE_DISK_CACHE`
   (`S3CACHE_DISK_CACHE_BYTES`). It's *inclusive* (every object written to hot is also
   written to disk) and **survives restarts** — a fresh pod re-indexes the on-disk files
-  and comes up warm instead of stampeding the origin. Size it larger than hot to help.
-  All disk ops are best-effort: an I/O error is a miss, never a data-plane failure.
+  and comes up warm instead of stampeding the origin. Entries are retained by LRU.
+  Bodies are served as `memmap2`-backed `Bytes`; only the small metadata header is
+  decoded onto the heap, so mapped pages remain kernel-evictable and warm-hit memory
+  is bounded by I/O/page-cache pressure rather than the disk-cache size. Existing
+  all-bincode cache files remain readable and age out normally. Size warm larger than
+  hot to help. All disk ops are best-effort: an I/O error is a miss, never a
+  data-plane failure.
 - **cold** — the S3 origin.
 
 Both tiers are node-local; cross-node coherence is handled separately (below): a peer's
@@ -378,8 +383,11 @@ writes folded into the index by operation (`writes_indexed_put` / `_copy` / `_mu
 each a separately billed upstream class-A call, plus `_observed` for keys learned on the
 read path), `write_fill` (writes whose body was kept rather than dropped — each one an
 origin GET the object's first read no longer costs), `index_backfills` (index entries
-completed from a forwarded answer — see below), the warm tier (`warm_hit` / `warm_miss` / `warm_error`, with `warm_rejects` for
-objects the per-object cap declined, kept apart so `warm_error` stays alertable) and the
+completed from a forwarded answer — see below), the warm tier (`warm_hit` / `warm_miss` /
+`warm_error`, with `warm_rejects` for objects the per-object cap declined, kept apart so
+`warm_error` stays alertable), its live Tierstore view (`warm_entries`,
+`warm_mapped_entries`, `warm_disk_bytes`, `warm_disk_budget_bytes`, `warm_evictions`, and
+`warm_evicted_bytes`), and the
 gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`, `lease_lapse_resyncs`,
 `lapse_barrier_retains`, `lapse_barrier_fallbacks`, `unhealthy_bypasses`).
 

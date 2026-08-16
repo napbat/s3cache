@@ -2,9 +2,10 @@
 //! on-disk cache) in front of **cold** (the S3 origin). Always layered — there is no mode
 //! to pick. Built on `tierstore`: the hot tier is a byte-weighted moka cache (sharded,
 //! `TinyLFU` admission, via `tierstore-moka`), the warm
-//! tier is a byte-budgeted, restart-surviving mmap-disk store (values served as
-//! kernel-evictable mapped bytes) reached through a codec (bincode of `(key, object)`)
-//! and a blocking-I/O offload pool. Warm is inclusive (fills write hot *and* disk) and
+//! tier is a byte-budgeted, restart-surviving mmap-disk store. Its record codec keeps
+//! metadata in a small bincode header and the body as a raw mmap-backed tail, so warm
+//! reads parse metadata without copying object bytes back onto the heap. Blocking file
+//! I/O runs on a dedicated offload pool. Warm is inclusive (fills write hot *and* disk) and
 //! best-effort by policy: a disk error or oversize rejection never blocks the hot fill or
 //! the data plane. Origin fetches are singleflighted probe-then-gate, so only misses
 //! contend and concurrent callers share one round-trip. Cross-node coherence is separate
@@ -12,6 +13,7 @@
 //! strict reads barrier on feed heads.
 
 use std::future::Future;
+use std::mem::size_of;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use s3s::dto::{ETag, GetObjectOutput, HeadObjectOutput, Metadata, StreamingBlob, Timestamp};
 use serde::{Deserialize, Serialize};
-use tierstore::{CodecTier, KeyStatus, OffloadTier, SingleFlight};
+use tierstore::{CodecTier, Eviction, KeyStatus, OffloadTier, SingleFlight};
 use tierstore_mmap::MmapDiskTier;
 use tierstore_moka::MokaTier;
 
@@ -31,7 +33,9 @@ use crate::metrics::Metrics;
 pub type CacheKey = (String, String);
 
 /// A cached object body plus the response metadata needed to reconstruct a GET/HEAD.
-/// `Serialize`/`Deserialize` so the warm disk tier can round-trip it.
+/// `Serialize`/`Deserialize` are retained for backward reads of the original
+/// all-bincode warm record; new records encode only metadata and keep `body`
+/// as an mmap-backed tail.
 ///
 /// Deliberately **not** `Clone`: the tiers hand out `Arc<CachedObject>`, and a copy's
 /// trust stamp (below) is bookkeeping about *that* copy — a clone would have to decide
@@ -62,6 +66,62 @@ pub struct CachedObject {
     /// vouch for what happened to those objects while it was down.
     #[serde(skip)]
     trusted_gen: AtomicU64,
+}
+
+/// Small serialized prefix for the current warm record format. The body is
+/// deliberately absent: it follows this header verbatim and becomes a
+/// zero-copy [`Bytes::slice`] of the mmap on decode.
+#[derive(Serialize, Deserialize)]
+struct WarmHeader {
+    key: CacheKey,
+    body_len: u64,
+    content_length: Option<i64>,
+    content_type: Option<String>,
+    e_tag: Option<ETag>,
+    last_modified: Option<Timestamp>,
+    cache_control: Option<String>,
+    content_encoding: Option<String>,
+    content_language: Option<String>,
+    content_disposition: Option<String>,
+    accept_ranges: Option<String>,
+    metadata: Option<Metadata>,
+}
+
+impl WarmHeader {
+    fn capture(key: &CacheKey, object: &CachedObject) -> Self {
+        Self {
+            key: key.clone(),
+            body_len: u64::try_from(object.body.len()).unwrap_or(u64::MAX),
+            content_length: object.content_length,
+            content_type: object.content_type.clone(),
+            e_tag: object.e_tag.clone(),
+            last_modified: object.last_modified.clone(),
+            cache_control: object.cache_control.clone(),
+            content_encoding: object.content_encoding.clone(),
+            content_language: object.content_language.clone(),
+            content_disposition: object.content_disposition.clone(),
+            accept_ranges: object.accept_ranges.clone(),
+            metadata: object.metadata.clone(),
+        }
+    }
+
+    fn finish(self, body: Bytes) -> (CacheKey, Arc<CachedObject>) {
+        let object = CachedObject {
+            body,
+            content_length: self.content_length,
+            content_type: self.content_type,
+            e_tag: self.e_tag,
+            last_modified: self.last_modified,
+            cache_control: self.cache_control,
+            content_encoding: self.content_encoding,
+            content_language: self.content_language,
+            content_disposition: self.content_disposition,
+            accept_ranges: self.accept_ranges,
+            metadata: self.metadata,
+            trusted_gen: AtomicU64::new(0),
+        };
+        (self.key, Arc::new(object))
+    }
 }
 
 /// Replays the cached response fields into `$out`, defaulting the rest. `GetObjectOutput`
@@ -256,6 +316,65 @@ fn warm_key(bucket: &str, key: &str) -> String {
     h.finalize().to_hex().to_string()
 }
 
+/// Current warm-record discriminator. A legacy bincode tuple starts with a
+/// string length, so no valid legacy record can collide with these bytes.
+const WARM_MAGIC: &[u8; 8] = b"S3CWRM01";
+const WARM_PREFIX_LEN: usize = WARM_MAGIC.len() + size_of::<u32>();
+
+/// Encodes the metadata header and raw body tail. `None` means the complete
+/// record exceeds the configured per-object cap; codec failures stay errors.
+fn encode_warm_record(
+    key: &CacheKey,
+    object: &CachedObject,
+    max_bytes: usize,
+) -> Result<Option<Bytes>, tierstore::BoxError> {
+    let header = bincode::serialize(&WarmHeader::capture(key, object))?;
+    let header_len = u32::try_from(header.len())
+        .map_err(|_| -> tierstore::BoxError { "warm record header exceeds u32".into() })?;
+    let total = WARM_PREFIX_LEN
+        .checked_add(header.len())
+        .and_then(|len| len.checked_add(object.body.len()))
+        .ok_or_else(|| -> tierstore::BoxError { "warm record length overflow".into() })?;
+    if total > max_bytes {
+        return Ok(None);
+    }
+
+    let mut encoded = Vec::with_capacity(total);
+    encoded.extend_from_slice(WARM_MAGIC);
+    encoded.extend_from_slice(&header_len.to_le_bytes());
+    encoded.extend_from_slice(&header);
+    encoded.extend_from_slice(&object.body);
+    Ok(Some(Bytes::from(encoded)))
+}
+
+/// Decodes current framed records without copying the body. Original
+/// all-bincode entries remain readable and age out naturally under LRU.
+fn decode_warm_record(bytes: &Bytes) -> Result<(CacheKey, Arc<CachedObject>), tierstore::BoxError> {
+    if !bytes.starts_with(WARM_MAGIC) {
+        let (key, object): (CacheKey, CachedObject) = bincode::deserialize(bytes)?;
+        return Ok((key, Arc::new(object)));
+    }
+
+    let header_len_bytes = bytes
+        .get(WARM_MAGIC.len()..WARM_PREFIX_LEN)
+        .ok_or_else(|| -> tierstore::BoxError { "truncated warm record prefix".into() })?;
+    let header_len =
+        usize::try_from(u32::from_le_bytes(header_len_bytes.try_into().map_err(
+            |_| -> tierstore::BoxError { "invalid warm header length".into() },
+        )?))
+        .map_err(|_| -> tierstore::BoxError { "warm header length exceeds usize".into() })?;
+    let body_start = WARM_PREFIX_LEN
+        .checked_add(header_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| -> tierstore::BoxError { "truncated warm record header".into() })?;
+    let header: WarmHeader = bincode::deserialize(&bytes[WARM_PREFIX_LEN..body_start])?;
+    let body = bytes.slice(body_start..);
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) != header.body_len {
+        return Err("warm record body length mismatch".into());
+    }
+    Ok(header.finish(body))
+}
+
 /// The warm tier: typed objects over a byte-budgeted, restart-surviving mmap-disk store,
 /// with the blocking file I/O on a dedicated worker pool. The codec embeds the cache key
 /// in the encoding, so entries the disk tier evicts decode back fully typed.
@@ -288,26 +407,22 @@ pub fn open_warm(
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<WarmPair> {
     let budget = NonZeroU64::new(disk_bytes.max(1)).unwrap_or(NonZeroU64::MIN);
-    let disk = Arc::new(MmapDiskTier::open_bounded(dir, budget)?);
+    let disk = Arc::new(MmapDiskTier::open_bounded(dir, budget)?.with_eviction(Eviction::Lru));
+    metrics.observe_warm(disk.stats());
     let codec = CodecTier::new(
         Arc::clone(&disk),
         |key: &CacheKey| warm_key(&key.0, &key.1),
         move |key: &CacheKey, obj: &Arc<CachedObject>| {
-            let bytes =
-                bincode::serialize(&(key, obj.as_ref())).map_err(tierstore::BoxError::from)?;
-            if bytes.len() > max_obj_bytes {
+            if let Some(bytes) = encode_warm_record(key, obj, max_obj_bytes)? {
+                Ok(bytes)
+            } else {
                 // The configured cap doing its job, not a failure — kept out of
                 // `warm_error` so that counter stays something an operator can page on.
                 metrics.warm_reject();
-                return Err(WARM_TOO_LARGE.into());
+                Err(WARM_TOO_LARGE.into())
             }
-            Ok(Bytes::from(bytes))
         },
-        |bytes: Bytes| {
-            let (key, obj): (CacheKey, CachedObject) =
-                bincode::deserialize(&bytes).map_err(tierstore::BoxError::from)?;
-            Ok((key, Arc::new(obj)))
-        },
+        |bytes: Bytes| decode_warm_record(&bytes),
     );
     let warm = OffloadTier::new(
         codec,
@@ -337,6 +452,12 @@ struct Core {
 }
 
 impl Core {
+    fn observe_warm(&self) {
+        if let Some(disk) = &self.warm_disk {
+            self.metrics.observe_warm(disk.stats());
+        }
+    }
+
     /// One routed lookup with tier provenance for the warm metrics: a hit below the hot
     /// tier is a warm hit (and is promoted into hot by policy); an incomplete report means
     /// a tier failed and was routed around.
@@ -348,11 +469,13 @@ impl Core {
         if let KeyStatus::Hit { tier, value } = status {
             if tier > 0 {
                 self.metrics.warm_hit();
+                self.observe_warm();
             }
             Some(value)
         } else {
             if self.has_warm {
                 self.metrics.warm_miss();
+                self.observe_warm();
             }
             None
         }
@@ -366,6 +489,7 @@ impl Core {
         if self.cache.put(key, obj).await.is_err() {
             self.metrics.warm_error();
         }
+        self.observe_warm();
     }
 
     /// Drop an object from every local tier. A tier that fails to delete is counted; its
@@ -374,6 +498,7 @@ impl Core {
         if self.cache.invalidate(key).await.is_err() {
             self.metrics.warm_error();
         }
+        self.observe_warm();
     }
 
     /// Drop EVERY local copy: the hot tier empties immediately, the disk store unlinks
@@ -390,6 +515,7 @@ impl Core {
             if !matches!(cleared, Ok(Ok(()))) {
                 self.metrics.warm_error();
             }
+            self.observe_warm();
         }
     }
 }
@@ -594,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_object_bincode_roundtrip() {
+    fn legacy_cached_object_bincode_roundtrip() {
         let obj = sample();
         let bytes = bincode::serialize(&obj).unwrap();
         let back: CachedObject = bincode::deserialize(&bytes).unwrap();
@@ -604,6 +730,72 @@ mod tests {
         assert_eq!(obj.e_tag, back.e_tag);
         assert_eq!(obj.last_modified, back.last_modified);
         assert_eq!(obj.metadata, back.metadata);
+    }
+
+    #[test]
+    fn framed_warm_decode_slices_the_record_body_without_copying() {
+        let key = ck("b", "k");
+        let object = sample();
+        let encoded = super::encode_warm_record(&key, &object, 1024)
+            .expect("encode")
+            .expect("within cap");
+        let mapping = encoded.as_ptr().addr()..encoded.as_ptr().addr() + encoded.len();
+
+        let (decoded_key, decoded) = super::decode_warm_record(&encoded).expect("decode");
+
+        assert_eq!(decoded_key, key);
+        assert_eq!(decoded.body, object.body);
+        assert!(
+            mapping.contains(&decoded.body.as_ptr().addr()),
+            "the decoded body must remain a slice of the encoded owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_warm_records_keep_the_body_mmap_backed() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (warm, disk) =
+            open_warm(dir.clone(), 10 * 1024 * 1024, 8 * 1024 * 1024, metrics()).unwrap();
+        let key = ck("b", "mapped");
+        warm.put(key.clone(), Arc::new(sample()))
+            .await
+            .expect("put");
+        let mapped = disk
+            .get(&super::warm_key(&key.0, &key.1))
+            .await
+            .expect("disk get")
+            .expect("mapped record");
+        let mapping = mapped.as_ptr().addr()..mapped.as_ptr().addr() + mapped.len();
+
+        let decoded = warm.get(&key).await.expect("warm get").expect("hit");
+
+        assert!(
+            mapping.contains(&decoded.body.as_ptr().addr()),
+            "the served body must point into the mmap rather than anonymous heap"
+        );
+        assert_eq!(disk.stats().mapped_entries, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_warm_records_remain_readable() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (warm, disk) =
+            open_warm(dir.clone(), 10 * 1024 * 1024, 8 * 1024 * 1024, metrics()).unwrap();
+        let key = ck("b", "legacy");
+        let object = sample();
+        let legacy = Bytes::from(bincode::serialize(&(&key, &object)).expect("legacy encode"));
+        disk.put(super::warm_key(&key.0, &key.1), legacy)
+            .await
+            .expect("seed legacy record");
+
+        let decoded = warm.get(&key).await.expect("warm get").expect("hit");
+
+        assert_eq!(decoded.body, object.body);
+        assert_eq!(decoded.e_tag, object.e_tag);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The trust stamp is bookkeeping about a *copy*, not part of the object, and

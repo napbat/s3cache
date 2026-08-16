@@ -15,6 +15,7 @@ use bytes::Bytes;
 use s3cache::metrics::Metrics;
 use s3cache::tier::{CacheKey, CachedObject, TieredCache, buffer_body, open_warm};
 use s3s::dto::{ETag, GetObjectOutput};
+use tierstore::{TierRead, TierWrite};
 
 /// Room for every warm tier that isn't the subject of the test.
 const AMPLE: u64 = 8 * 1024 * 1024;
@@ -215,7 +216,7 @@ async fn oversize_objects_skip_the_disk_fill_and_still_serve() {
     );
 }
 
-/// The warm tier stays inside `S3CACHE_DISK_CACHE_BYTES`, FIFO-evicting to get there.
+/// The warm tier stays inside `S3CACHE_DISK_CACHE_BYTES`, LRU-evicting to get there.
 #[tokio::test]
 async fn the_warm_tier_stays_inside_its_disk_budget() {
     const DISK_BYTES: u64 = 16 * 1024;
@@ -254,6 +255,29 @@ async fn the_warm_tier_stays_inside_its_disk_budget() {
         .await
         .expect("the newest key is still on disk");
     assert_eq!(served_body(&obj).await, body(&newest, BODY));
+}
+
+/// `open_warm` opts into Tierstore's access-aware ordering: a disk hit refreshes
+/// recency, so a later fill evicts the untouched peer rather than the useful entry.
+#[tokio::test]
+async fn the_warm_tier_retains_a_recently_read_entry() {
+    const DISK_BYTES: u64 = 10 * 1024;
+    const BODY: usize = 4 * 1024;
+
+    let dir = TempDir::new("lru");
+    let (warm, _disk) = open_warm(dir.path(), DISK_BYTES, NO_CAP, Arc::new(Metrics::default()))
+        .expect("warm tier opens");
+    warm.put(key("a"), object("a", BODY)).await.expect("put a");
+    warm.put(key("b"), object("b", BODY)).await.expect("put b");
+    assert!(warm.get(&key("a")).await.expect("touch a").is_some());
+    warm.put(key("c"), object("c", BODY)).await.expect("put c");
+
+    assert!(warm.get(&key("a")).await.expect("get a").is_some());
+    assert!(
+        warm.get(&key("b")).await.expect("get b").is_none(),
+        "the untouched entry should be evicted first"
+    );
+    assert!(warm.get(&key("c")).await.expect("get c").is_some());
 }
 
 /// A cached key never reaches the origin again: the second fetch is served locally, with

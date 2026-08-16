@@ -56,12 +56,12 @@ src/
     recovery.rs  # staged lease-lapse recovery and its correctness argument
     wire.rs      # write-event and session-token codec
     tests.rs     # coherence unit tests
-  metrics.rs    # counters + periodic stats logging
+  metrics.rs    # counters, warm-residency gauges, and periodic stats logging
 tests/          # integration tests (link against the library crate)
 deploy/helm/s3cache/   # Helm chart
 scripts/
 Dockerfile
-.dockerignore   # image context allowlist: manifests, lockfile, and src only
+    .dockerignore   # image context allowlist: manifests, lockfile, src, and benches
 .github/workflows/build.yml   # locked Rust/docs/chart gate, image push, Fleet bump
 ```
 
