@@ -8,10 +8,13 @@ labels:
 helm:
   releaseName: s3cache
   values:
-    # Keep one ready endpoint while Fleet replaces the other ordinal. The replicas
-    # remain coherent through the chart's always-on gossip feed; each keeps its own
-    # hot tier and persistent warm PVC.
-    replicaCount: 2
+    # Keep production single-replica until the gossip feed's sustained-write gate
+    # proves that its encoded ring remains within the transport frame budget. A
+    # two-replica run on 2026-08-16 stalled both apply frontiers while leases kept
+    # renewing, which let a peer answer a false 404 for a newly written object.
+    # The bounded mmap warm tier keeps this pod's memory safe; its PVC survives
+    # restarts, and the second ordinal's existing PVC is retained for a later rollout.
+    replicaCount: 1
     image:
       tag: ed0fb9a8d218b0c05c14fb1fff5b519e3c90d079
     upstream:
