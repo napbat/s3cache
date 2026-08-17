@@ -1,0 +1,16 @@
+{
+  "apiVersion": "platform.napbat.ca/v1alpha1",
+  "kind": "FleetRelease",
+  "status": "ready",
+  "bundles": [
+    {
+      "path": "deploy/helm/s3cache",
+      "images": [
+        {
+          "name": "s3cache",
+          "reference": "ghcr.io/napbat/s3cache:2162402ddc10e709b912af657199c4a258362fd9@sha256:18188a937d1a1891af54199c7e9be26fed8a6293dfea4c82056dbe2c0a4d5647"
+        }
+      ]
+    }
+  ]
+}

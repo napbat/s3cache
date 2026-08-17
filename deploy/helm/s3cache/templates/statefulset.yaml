@@ -37,7 +37,7 @@ spec:
       {{- end }}
       containers:
         - name: s3cache
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "s3cache.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: s3
