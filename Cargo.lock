@@ -3616,7 +3616,7 @@ dependencies = [
 [[package]]
 name = "tierstore"
 version = "0.1.0"
-source = "git+https://github.com/napbat/tierstore?branch=main#63a8aa1223ad60181f509eb277fe51c7fd3b7afa"
+source = "git+https://github.com/napbat/tierstore?branch=main#dd017c6973534bcea0785a0b9e791fb7842775f2"
 dependencies = [
  "tierstore-core",
 ]
@@ -3624,12 +3624,12 @@ dependencies = [
 [[package]]
 name = "tierstore-core"
 version = "0.1.0"
-source = "git+https://github.com/napbat/tierstore?branch=main#63a8aa1223ad60181f509eb277fe51c7fd3b7afa"
+source = "git+https://github.com/napbat/tierstore?branch=main#dd017c6973534bcea0785a0b9e791fb7842775f2"
 
 [[package]]
 name = "tierstore-mmap"
 version = "0.1.0"
-source = "git+https://github.com/napbat/tierstore?branch=main#63a8aa1223ad60181f509eb277fe51c7fd3b7afa"
+source = "git+https://github.com/napbat/tierstore?branch=main#dd017c6973534bcea0785a0b9e791fb7842775f2"
 dependencies = [
  "bytes",
  "memmap2",
@@ -3639,7 +3639,7 @@ dependencies = [
 [[package]]
 name = "tierstore-moka"
 version = "0.1.0"
-source = "git+https://github.com/napbat/tierstore?branch=main#63a8aa1223ad60181f509eb277fe51c7fd3b7afa"
+source = "git+https://github.com/napbat/tierstore?branch=main#dd017c6973534bcea0785a0b9e791fb7842775f2"
 dependencies = [
  "moka",
  "tierstore-core",
