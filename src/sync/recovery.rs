@@ -11,7 +11,9 @@
 //! A write `W` by peer `P` completed only after every lease-holder had either
 //! applied it or lapsed in `P`'s engine. If we applied it, our
 //! [`Frontier`](groupnet::consistency::Frontier) covers it and the apply loop
-//! already evicted the key. If it proceeded via *our* lapse, then `W` was in
+//! already folded the index and removed the stale hot copy. A retained warm copy has
+//! no trust stamp and must validate against that updated index. If the write proceeded
+//! via *our* lapse, then `W` was in
 //! `P`'s ring before `P`'s wait resolved, so `P`'s advertised head is
 //! `≥ token(W)` from completion onward. And `P` adopts our post-lapse renewal
 //! strictly *after* resolving every wait against our old entry — so `P`'s feed
@@ -24,9 +26,10 @@
 //! Hence: a head sampled after the confirmation moves *plus* the settle window
 //! dominates every lapse-era completed write, and
 //! [`FrontierView::reached`](groupnet::consistency::FrontierView::reached) on
-//! that head means the apply loop has evicted exactly the keys that changed.
-//! Every other body is provably untouched and keeps its proof — no flush, no
-//! re-LIST, no distrust.
+//! that head means the apply loop has updated every changed key and made each stale hot
+//! copy unservable. Every other hot body is provably untouched and keeps its proof;
+//! retained warm bodies still validate against the updated index — no flush, no re-LIST,
+//! no global distrust.
 //!
 //! The argument has two hinges, and both are checked rather than assumed.
 //!
@@ -81,77 +84,6 @@ use crate::sync::coherence::{
     AFFIRM_DEADLINE, AFFIRM_POLL, WRITE_WAIT_SLACK, WriteSync, node_names,
 };
 use crate::tier::LocalCache;
-
-/// How long this node's view of the cluster must have held still before it trusts its
-/// own index enough to answer an authoritative 404: one full failure-detection cycle, as
-/// the group itself is configured to run it. Inside this window a peer may be writing
-/// keys this node will never hear about while [`WriteSync::cluster_healthy`] still says
-/// everything is fine.
-///
-/// This is the **pre-lease** licence, and it survives only for
-/// [`Consistency::StrongAcks`](crate::sync::coherence::Consistency::StrongAcks) and
-/// [`Consistency::Bounded`](crate::sync::coherence::Consistency::Bounded). A heuristic is what it
-/// is — "the picture has held still, so probably nobody is writing behind my back" —
-/// and replacing it with a mechanism a reader holds and a writer can wait out is the
-/// whole of the lease migration. In
-/// [`Consistency::Strong`](crate::sync::coherence::Consistency::Strong) nothing reads it.
-///
-/// Read off the group's *effective* config — what the builder actually spawned this node
-/// with, not the library defaults — and off the membership it currently has to sweep,
-/// which is why it is computed per call rather than frozen at construction. Two caveats
-/// come with the number:
-///
-/// * groupnet's bound holds for **at most two concurrent silences**; past that a suspect
-///   peer can stall the probe ring more than once and the sweep overruns. Two is the
-///   right envelope for a cluster this size — a fleet of pods, not a datacentre — and a
-///   deployment that outgrows it should be running `bounded` and cells anyway.
-/// * `.max(2)` is a floor, not a fudge: a node that has just booted and not yet heard
-///   from its peer sees a membership of one, and must not size its trust window as if it
-///   were alone in the world — that is precisely the moment a peer it cannot see is
-///   writing keys it has never heard of.
-pub(super) fn settle_window(group: &Group) -> Duration {
-    Duration::from_millis(
-        group
-            .config()
-            .detection_window_ms(group.members().len().max(2)),
-    )
-}
-
-/// How long this node's picture of the cluster has been unchanged. A membership or
-/// status change, a write held past its ack window, or a write-feed gap each mean the
-/// picture may be incomplete, and each restarts the clock.
-pub(super) struct Stability {
-    /// The last observed `(member, status)` view and when it was first seen.
-    seen: Mutex<(Vec<(NodeId, Status)>, Instant)>,
-}
-
-impl Stability {
-    pub(super) fn new() -> Self {
-        Self {
-            seen: Mutex::new((Vec::new(), Instant::now())),
-        }
-    }
-
-    /// Note that something happened this node's index may not have caught up with.
-    pub(super) fn disturb(&self) {
-        self.seen.lock().unwrap().1 = Instant::now();
-    }
-
-    /// Whether the view has held still for the whole detection window (see
-    /// [`settle_window`], which this re-reads on every call — the window a two-member
-    /// cluster needs is not the window it needs after it scales out).
-    pub(super) fn settled(&self, group: &Group) -> bool {
-        let window = settle_window(group);
-        let now = Instant::now();
-        let statuses = group.statuses();
-        let mut seen = self.seen.lock().unwrap();
-        if seen.0 != statuses {
-            seen.0 = statuses;
-            seen.1 = now;
-        }
-        now.duration_since(seen.1) >= window
-    }
-}
 
 /// Whether an affirmation was accepted, declined for now, or belongs to a
 /// resync that a later one has already replaced.
@@ -599,8 +531,9 @@ impl LapseWatch {
     }
 
     /// **Stage 4.** Wait until every sampled head has been applied locally, which is
-    /// the whole proof: past it, the apply loop has evicted exactly the keys the
-    /// lapse era changed and every body still held is provably untouched.
+    /// the whole proof: past it, changed keys have an updated index and no stale hot
+    /// copy; every other hot body still held is provably untouched, while a retained
+    /// warm copy must validate against that index before serving.
     ///
     /// The deadline is one lease duration plus [`WRITE_WAIT_SLACK`] — the same
     /// budget a leased *write* gets, because it is bounded by the same thing: the
@@ -732,9 +665,9 @@ impl LapseWatch {
             return self.fall_back();
         }
 
-        // Stage 6. No flush, no re-LIST, no resync: every body still held was
-        // proved untouched by the barrier, and the ones that were not are already
-        // gone — the apply loop evicted them on the way past.
+        // Stage 6. No flush, no re-LIST, no resync: every trusted hot body still held
+        // was proved untouched by the barrier; changed hot copies are gone, and retained
+        // warm copies remain suspect until the updated index validates them.
         self.metrics.lapse_barrier_retain();
         let elapsed = started.elapsed();
         info!(

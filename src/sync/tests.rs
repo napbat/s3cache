@@ -17,7 +17,7 @@ use crate::sync::coherence::{
     waits_on, waits_on_unleased,
 };
 use crate::sync::config::{parse_lease_ms, parse_seeds};
-use crate::sync::recovery::{lapse_poll, settle_window};
+use crate::sync::recovery::lapse_poll;
 use crate::sync::wire::{
     IndexEvent, IndexOp, WIRE_MAGIC, decode_event, encode_event, from_micros, to_micros, wire_stamp,
 };
@@ -59,6 +59,26 @@ fn written(size: i64) -> ObjEntry {
         content_type: Some("text/x-fixture".to_owned()),
         meta: None,
     }
+}
+
+#[test]
+fn only_acknowledged_strong_waits_retire_feed_history() {
+    for consistency in [Consistency::Strong, Consistency::StrongAcks] {
+        assert!(WriteWait::Applied.retires_feed(consistency));
+        assert!(WriteWait::Lapsed(Vec::new()).retires_feed(consistency));
+        assert!(
+            !(WriteWait::Stalled {
+                waiting_on: Vec::new(),
+                lapsed: Vec::new(),
+            })
+            .retires_feed(consistency)
+        );
+    }
+    assert!(
+        !WriteWait::Applied.retires_feed(Consistency::Bounded),
+        "bounded Applied is immediate, not an all-readers watermark"
+    );
+    assert!(!WriteWait::Lapsed(Vec::new()).retires_feed(Consistency::Bounded));
 }
 
 fn spawn_node(net: &Network, id: &str, peer: &str) -> (NodeId, Node<MemTransport>, Group) {
@@ -477,46 +497,6 @@ async fn the_transition_wait_covers_exactly_what_the_lease_cannot() {
     );
 }
 
-/// The settle window is computed per call, from the group's own config
-/// and the membership it currently has to sweep — and never from a view
-/// of one, which is what a node that has not yet met its peer sees.
-#[tokio::test]
-async fn the_settle_window_is_sized_per_call_and_floors_at_two_members() {
-    let alone_net = Network::new();
-    let alone_id = NodeId::new("win-alone");
-    // The same timings the pair below runs, so the comparison at the end is about
-    // membership size and nothing else.
-    let alone_node = Node::builder(alone_id.clone(), alone_net.endpoint(alone_id))
-        .config(brisk())
-        .spawn();
-    let alone = alone_node.join_group("s3cache");
-    assert_eq!(alone.members().len(), 1, "nobody to gossip with");
-    let cfg = alone.config();
-    assert_eq!(
-        settle_window(&alone),
-        Duration::from_millis(cfg.detection_window_ms(2)),
-        "a node that has not seen its peer still budgets for one"
-    );
-    assert!(
-        settle_window(&alone) > Duration::from_millis(cfg.detection_window_ms(1)),
-        "the floor is strictly longer than the group-of-one bound it replaces"
-    );
-
-    let net = Network::new();
-    let (_a_id, _a_node, a_group) = spawn_node(&net, "win-a", "win-b");
-    let (_b_id, _b_node, _b_group) = spawn_node(&net, "win-b", "win-a");
-    let (_c_id, _c_node, _c_group) = spawn_node(&net, "win-c", "win-a");
-    eventually(
-        || a_group.members().len() == 3,
-        "a three-member view to converge",
-    )
-    .await;
-    assert!(
-        settle_window(&a_group) > settle_window(&alone),
-        "the window grows with the membership the detector has to sweep"
-    );
-}
-
 #[test]
 fn event_codec_round_trips_and_rejects_garbage() {
     let event = IndexEvent {
@@ -710,12 +690,9 @@ async fn write_tokens_upgrade_reads_to_strict() {
 /// The pre-lease mode's contract, kept exactly as it was for the one release it
 /// survives: the write-ack wait has to actually fire when a peer does not
 /// acknowledge — the counter operators watch is only worth watching if it moves —
-/// and an unacked write stands this node's authoritative 404s down, because a peer
-/// that did not apply our write in time is a peer whose writes we may equally be
-/// missing. (In `strong` there is no cluster-wide clock to stand down: each reader's
-/// own lease carries that honesty, on that reader's own clock.)
+/// and the stalled outcome must not retire feed history the peer still needs.
 #[tokio::test]
-async fn in_strong_acks_an_unacked_write_is_counted_and_stands_the_404_down() {
+async fn in_strong_acks_an_unacked_write_is_counted_and_not_retired() {
     let net = Network::new();
     let (_sync_a, sync_b, _state, _cache) =
         wired_pair_named(&net, ("acks-a", "acks-b"), Consistency::StrongAcks);
@@ -753,8 +730,12 @@ async fn in_strong_acks_an_unacked_write_is_counted_and_stands_the_404_down() {
         "the ack timeout is counted"
     );
     assert!(
-        !sync_b.may_answer_404(),
-        "and an index miss is no longer an authoritative 404"
+        !(WriteWait::Stalled {
+            waiting_on: Vec::new(),
+            lapsed: Vec::new(),
+        })
+        .retires_feed(Consistency::StrongAcks),
+        "the timed-out write remains advertised for a lagging peer"
     );
 }
 
@@ -888,17 +869,12 @@ async fn the_readers_licence_is_its_lease_and_only_a_current_resync_restores_it(
         !sync_b.may_serve_local(),
         "a booting reader has missed every invalidation issued while it was down"
     );
-    assert!(
-        !sync_b.may_answer_404(),
-        "and an index miss is certainly not an authoritative absence"
-    );
 
     // The shell's reader boot guard latches after one detection window plus two
     // anti-entropy rounds, and declines the affirmation until it does — so the
     // affirmation polls rather than treating one refusal as a verdict.
     sync_b.affirm_resynced(sync_b.resync_gen()).await;
     assert!(sync_b.may_serve_local(), "an affirmed lease is the licence");
-    assert!(sync_b.may_answer_404());
 
     sync_b.require_resync();
     assert!(

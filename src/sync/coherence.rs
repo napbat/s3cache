@@ -15,9 +15,7 @@ use tracing::{info, warn};
 
 use crate::index::{BucketState, ObjEntry, apply_del, apply_put, standard_class};
 use crate::metrics::Metrics;
-use crate::sync::recovery::{
-    Affirmation, LapseWatch, ResyncGate, Stability, remediate, watch_lapses,
-};
+use crate::sync::recovery::{Affirmation, LapseWatch, ResyncGate, remediate, watch_lapses};
 use crate::sync::wire::{
     IndexEvent, IndexOp, decode_event, encode_event, etag_to_wire, from_micros, parse_token,
     to_micros,
@@ -34,7 +32,7 @@ pub(super) const FEED_CAPACITY: usize = 4096;
 pub enum Consistency {
     /// Indistinguishable from a single S3 node with zero client cooperation,
     /// bought with **coherence leases** (groupnet's T3): a node may answer a
-    /// read — or an authoritative 404 — from local state only while it holds
+    /// local positive read only while it holds
     /// an unexpired serve-lease its peers granted it, so a write ends when
     /// every lease-holder has either applied the invalidation (the fast path,
     /// exactly one ack round) or had its lease lapse (the slow path, bounded
@@ -56,8 +54,8 @@ pub enum Consistency {
     /// section, and in groupnet's `consistency::lease` honesty box.
     Strong,
     /// [`Strong`](Self::Strong) bought with acknowledgements alone — the ack
-    /// round and nothing above it, with the view-stability heuristic
-    /// (`Stability`) as the read-side licence. Deprecated on arrival: it
+    /// round and nothing above it, with a fully-alive membership view as the
+    /// read-side licence. Deprecated on arrival: it
     /// exists so a deployment can pin the pre-lease mechanism for exactly one
     /// release while the lease tier rolls through the fleet. Nothing new
     /// should choose it, and the next release removes it.
@@ -318,6 +316,18 @@ pub(crate) enum WriteWait {
     },
 }
 
+impl WriteWait {
+    /// Whether this outcome is an application acknowledgement that makes the
+    /// corresponding feed prefix safe to retire.
+    ///
+    /// `bounded` reports `Applied` without waiting for readers, so its result is not a
+    /// retirement watermark. A stalled strong wait carries no guarantee either.
+    pub(crate) fn retires_feed(&self, consistency: Consistency) -> bool {
+        matches!(consistency, Consistency::Strong | Consistency::StrongAcks)
+            && matches!(self, Self::Applied | Self::Lapsed(_))
+    }
+}
+
 /// The publishing half of the write feed, plus the barrier view.
 pub struct WriteSync {
     feed: WriteFeed<IndexEvent>,
@@ -326,10 +336,6 @@ pub struct WriteSync {
     consistency: Consistency,
     /// Set by [`start_apply`](Self::start_apply); the freshness barrier reads it.
     view: OnceLock<groupnet::consistency::FrontierView>,
-    /// Shared with the apply loop, which restarts the clock on a feed gap.
-    /// The read-side licence in `strong-acks` and `bounded`; in `strong` the
-    /// lease is, and this stays untouched.
-    stability: Arc<Stability>,
     /// This node's participation in the coherence-lease tier — `Some` only in
     /// [`Consistency::Strong`]. Held here because **dropping it stops the
     /// protocol**: no renewals (this node's own window closes within `D`), no
@@ -392,7 +398,6 @@ impl WriteSync {
             me,
             consistency,
             view: OnceLock::new(),
-            stability: Arc::new(Stability::new()),
             leases,
             lease_view: lease_view.clone(),
             resync: Arc::new(ResyncGate::new(lease_view)),
@@ -417,24 +422,6 @@ impl WriteSync {
             Consistency::Strong => self.lease_view.as_ref().is_some_and(LeaseView::valid),
             Consistency::StrongAcks => self.cluster_healthy(),
             Consistency::Bounded => true,
-        }
-    }
-
-    /// Whether this node's index may be treated as authoritative for a key's *absence*.
-    ///
-    /// In `strong` this is the same lease that licenses any other local answer, which is
-    /// the point of the tier: "may I answer a 404?" stops being a hand-rolled
-    /// view-stability heuristic and becomes "do I hold a lease". In the other two modes
-    /// it stays what it was — an index miss is only a 404 if no peer could be holding a
-    /// write this node has not seen, which needs both a fully-alive view and that view
-    /// having held still for the failure detector's whole `settle_window`.
-    /// Otherwise the origin answers: slower, never a 404 for a key that exists.
-    pub(crate) fn may_answer_404(&self) -> bool {
-        match self.consistency {
-            Consistency::Strong => self.lease_view.as_ref().is_some_and(LeaseView::valid),
-            Consistency::StrongAcks | Consistency::Bounded => {
-                self.cluster_healthy() && self.stability.settled(&self.group)
-            }
         }
     }
 
@@ -732,6 +719,7 @@ impl WriteSync {
         metrics: &Metrics,
     ) {
         let outcome: WriteWait = self.wait_cluster_applied(token, timeout).await;
+        let retires_feed = outcome.retires_feed(self.consistency);
         match outcome {
             WriteWait::Applied => {}
             WriteWait::Lapsed(stragglers) => {
@@ -765,15 +753,13 @@ impl WriteSync {
                     );
                     metrics.write_lease_lapse();
                 }
-                // The settle clock is the read-side licence in `strong-acks` only, so
-                // only `strong-acks` restarts it: a peer that did not ack in time is a
-                // peer whose writes this node may also be missing. In `strong` the
-                // lease carries that honesty per reader, on the reader's own clock, and
-                // there is no cluster-wide clock here to disturb.
-                if self.consistency == Consistency::StrongAcks {
-                    self.stability.disturb();
-                }
             }
+        }
+        // Only a real all-readers watermark may shorten the advertised history.
+        // `retire_through` retains the current head as an anchor and re-advertises the
+        // compacted window; a dropped advertisement is carried by the next publish.
+        if retires_feed {
+            self.feed.retire_through(token).await;
         }
     }
 
@@ -812,7 +798,7 @@ impl WriteSync {
     }
 
     /// Spawn the apply loop: peers' events fold into the LIST index and drop
-    /// the local body copies; a gap distrusts every local body and triggers
+    /// the local hot body copy; a gap distrusts every local body and triggers
     /// `resync` (an origin re-LIST) since the stale subset is unknowable.
     ///
     /// In `strong` this also spawns [`watch_lapses`], because a gap is not the only
@@ -854,13 +840,7 @@ impl WriteSync {
             .acks()
             .then(|| AckLedger::new(self.group.clone()));
         let mut peers = PeerWrites::new(self.group.clone(), self.me.clone(), decode_event);
-        let stability = Arc::clone(&self.stability);
         let gate = Arc::clone(&self.resync);
-        // The settle clock is the read-side licence wherever the lease is not — see
-        // `may_answer_404`. In `strong` the gap arm stands the lease down instead, and
-        // disturbing a clock nothing reads would only be a lie about what protects the
-        // node.
-        let disturbs = self.lease_view.is_none();
         tokio::spawn(async move {
             while let Some(event) = peers.next().await {
                 match event {
@@ -898,7 +878,12 @@ impl WriteSync {
                                 apply_del(&state, &event.bucket, &event.key, ts);
                             }
                         }
-                        local.invalidate(&(event.bucket, event.key)).await;
+                        // The index must move first: a warm body promoted after this hot
+                        // eviction decodes suspect and is checked against the new entry
+                        // before it can be served. Awaiting moka removal before the ack
+                        // closes the stale-hot window without putting disk I/O on the
+                        // feed frontier.
+                        local.invalidate_hot(&(event.bucket, event.key)).await;
                         frontier.advance(&peer, token);
                         if let Some(ledger) = &ledger {
                             ledger.record(&peer, token).await;
@@ -921,9 +906,6 @@ impl WriteSync {
                         // is down, and the other modes refuse a suspect body in a
                         // bucket the re-LIST has put back to passthrough.
                         remediate(&gate, &local, &resync);
-                        if disturbs {
-                            stability.disturb();
-                        }
                         frontier.advance(&peer, missed_through);
                         if let Some(ledger) = &ledger {
                             ledger.record(&peer, missed_through).await;

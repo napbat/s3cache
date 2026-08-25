@@ -203,8 +203,8 @@ counters! {
     /// still behind when the wait's deadline passed. In `strong` that is the lease
     /// tier's one unbounded shape — a holder renewing but not applying, whose remedy is
     /// operational rather than a longer deadline — plus any transitional (unleased) peer
-    /// that did not ack; in `strong-acks` it is an unresponsive peer, and it also stands
-    /// this node's authoritative 404s down. Alertable in every mode.
+    /// that did not ack; in `strong-acks` it is an unresponsive peer. Replicated index
+    /// misses already fail through to the origin in every mode. Alertable in every mode.
     ack_timeouts => ack_timeout,
     /// Record a write that completed on a **lease lapse** rather than an acknowledgement:
     /// a peer stopped acking and its serve-lease expired here, so it serves nothing
