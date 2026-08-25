@@ -11,13 +11,12 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, gossip_pair, head, list,
-    list_entry, proxy_over, proxy_over_with_metrics, put, put_conditional, put_typed,
-    wait_for_index, warm_proxy_over,
+    Origin, WarmDir, counter, delete, free_udp_port, get, get_with_read_token, gossip_node,
+    gossip_pair, head, list, list_entry, proxy_over, proxy_over_with_metrics, put, put_conditional,
+    put_typed, wait_for_index, warm_proxy_over,
 };
 use s3cache::cache::proxy::CachingProxy;
 use s3cache::metrics::Metrics;
-use s3s::S3ErrorCode;
 use s3s::dto::{ETag, ETagCondition};
 
 /// Nothing here is about the size cap; keep every object cacheable.
@@ -60,12 +59,7 @@ async fn two_nodes_with_metrics(
 /// returns. Until membership is established there is no peer to wait for an ack from,
 /// so A's write returns without B having applied anything — a startup window, not the
 /// steady-state semantics the tests below assert.
-async fn settle_cluster(
-    origin: &Origin,
-    node_a: &CachingProxy,
-    node_b: &CachingProxy,
-    bucket: &str,
-) {
+async fn settle_cluster(node_a: &CachingProxy, node_b: &CachingProxy, bucket: &str) {
     let mut probe = 0;
     eventually!("the gossip cluster to establish", {
         probe += 1;
@@ -81,20 +75,6 @@ async fn settle_cluster(
     eventually!("the probe keys to clear from both indexes", {
         cleared(list(node_a, bucket).await) && cleared(list(node_b, bucket).await)
     });
-    // A node only answers the index-authoritative 404 once its view of the cluster has
-    // held still for the failure detector's whole window — inside it a peer could be
-    // holding a write this node has not seen, and a 404 for a key that exists is a lie
-    // no retry fixes. Steady state includes that window having elapsed, and the only
-    // signal for it a test should use is the black-box one: a 404 that costs nothing.
-    eventually!(
-        "the index-authoritative 404 to be trustworthy on both nodes",
-        {
-            let heads = origin.ops.head();
-            let _ = head(node_a, bucket, "never-written").await;
-            let _ = head(node_b, bucket, "never-written").await;
-            origin.ops.head() == heads
-        }
-    );
 }
 
 /// A write on A is in B's index by the time the write returns — no polling: strong mode
@@ -106,7 +86,7 @@ async fn a_write_on_a_folds_into_bs_index() {
     let origin = Origin::start("coherence-fold").await;
     let bucket = origin.bucket();
     let (node_a, node_b) = two_nodes(&origin, ("fold-a", "fold-b")).await;
-    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
     let (lists, heads) = (origin.ops.list(), origin.ops.head());
 
     put(&node_a, bucket, "shared", b"from-a").await;
@@ -160,11 +140,71 @@ async fn a_write_on_a_folds_into_bs_index() {
     );
 }
 
+/// A replicated index can prove a faithful positive, but never absence: an object
+/// created directly at the origin has no feed event. The first HEAD must therefore
+/// forward, and its faithful answer may complete the local index for the next one.
+#[tokio::test]
+async fn a_replicated_index_miss_forwards_instead_of_returning_a_false_404() {
+    let origin = Origin::start("coherence-origin-only").await;
+    let bucket = origin.bucket();
+    let (node_a, node_b) = two_nodes(&origin, ("origin-only-a", "origin-only-b")).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
+
+    origin.seed("out-of-band", b"exists-at-origin").await;
+    let heads = origin.ops.head();
+    let first = head(&node_b, bucket, "out-of-band")
+        .await
+        .expect("replicated miss forwards to the origin");
+    assert_eq!(first.content_length, Some(16));
+    assert_eq!(
+        origin.ops.head(),
+        heads + 1,
+        "the origin, not the replicated miss, decided existence"
+    );
+
+    let second = head(&node_b, bucket, "out-of-band")
+        .await
+        .expect("the observed faithful positive remains available");
+    assert_eq!(second.content_length, first.content_length);
+    assert_eq!(
+        origin.ops.head(),
+        heads + 1,
+        "the forwarded positive completed the local index entry"
+    );
+}
+
+/// An origin route is terminal for this request. In particular a whole-object GET must
+/// not enter the cache's probe-then-gate fill path, which would re-probe and hand back a
+/// stale trusted hot body after the read token already rejected local service.
+#[tokio::test]
+async fn an_origin_routed_whole_get_cannot_reprobe_a_stale_cached_body() {
+    let origin = Origin::start("coherence-origin-route").await;
+    let bucket = origin.bucket();
+    origin.seed("body", b"version-1").await;
+    let (node_a, node_b) = two_nodes(&origin, ("route-a", "route-b")).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
+
+    assert_eq!(get(&node_b, bucket, "body").await, "version-1");
+    let fetched = origin.ops.get();
+    origin.seed("body", b"version-2").await;
+
+    assert_eq!(
+        get_with_read_token(&node_b, bucket, "body", "unknown-writer:1:1").await,
+        "version-2",
+        "the unsatisfied token routes around the stale cached body"
+    );
+    assert_eq!(
+        origin.ops.get(),
+        fetched + 1,
+        "the whole-object origin route reached upstream exactly once"
+    );
+}
+
 /// A write feed is one gossiped state entry. Its item-count capacity is deliberately
-/// much larger than one UDP frame, so sustained writes must retire the oldest encoded
-/// events by bytes while a healthy peer keeps applying the tail. Before Groupnet's
-/// byte bound, this workload grew the entry past the transport envelope: B's applied
-/// counter froze, every later strong write timed out, and B could return false misses.
+/// much larger than one UDP frame, so each acknowledged strong write retires the safe
+/// prefix while retaining the current head anchor. Before acknowledged retirement, the
+/// frame stayed at the transport envelope under sustained writes: B's applied counter
+/// froze and every later strong write timed out.
 #[tokio::test]
 async fn sustained_writes_keep_the_coherence_feed_moving() {
     const WRITES: u64 = 640;
@@ -173,7 +213,7 @@ async fn sustained_writes_keep_the_coherence_feed_moving() {
     let bucket = origin.bucket();
     let (node_a, node_b, metrics_a, metrics_b) =
         two_nodes_with_metrics(&origin, ("sustain-a", "sustain-b")).await;
-    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
 
     let published = counter(&metrics_a, "feed_published");
     let applied = counter(&metrics_b, "feed_applied");
@@ -241,7 +281,7 @@ async fn an_overwrite_on_a_invalidates_bs_cached_body() {
     let bucket = origin.bucket();
     origin.seed("obj", b"version-1").await;
     let (node_a, node_b) = two_nodes(&origin, ("inval-a", "inval-b")).await;
-    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
 
     assert_eq!(get(&node_b, bucket, "obj").await, "version-1");
     let fetched = origin.ops.get();
@@ -277,14 +317,14 @@ async fn an_overwrite_on_a_invalidates_bs_cached_body() {
     );
 }
 
-/// A delete on A unindexes the key on B: it leaves B's LIST, and B's HEAD answers the
-/// authoritative 404 from its own index rather than asking the origin.
+/// A delete on A unindexes the key on B: it leaves B's LIST, but replicated absence is
+/// never authoritative, so B forwards one HEAD and the origin returns the 404.
 #[tokio::test]
 async fn a_delete_on_a_removes_the_key_from_bs_index() {
     let origin = Origin::start("coherence-delete").await;
     let bucket = origin.bucket();
     let (node_a, node_b) = two_nodes(&origin, ("del-a", "del-b")).await;
-    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
 
     put(&node_a, bucket, "doomed", b"briefly here").await;
     assert_eq!(list(&node_b, bucket).await, ["doomed"]);
@@ -299,12 +339,67 @@ async fn a_delete_on_a_removes_the_key_from_bs_index() {
     let err = head(&node_b, bucket, "doomed")
         .await
         .expect_err("the key is gone");
-    assert_eq!(*err.code(), S3ErrorCode::NoSuchKey);
     assert_eq!(err.status_code().map(|status| status.as_u16()), Some(404));
     assert_eq!(
         origin.ops.head(),
-        heads,
-        "the 404 came from B's index, not from the origin"
+        heads + 1,
+        "the replicated 404 was decided by the origin"
+    );
+}
+
+/// Applying a peer overwrite updates the index and awaits only hot eviction before
+/// acknowledging. Warm disk remains off the frontier: the changed copy is retained
+/// suspect and rejected against the new index on demand, while unrelated entries keep
+/// their proof and remain free to serve.
+#[tokio::test]
+async fn a_peer_overwrite_keeps_warm_disk_off_the_apply_frontier() {
+    let origin = Origin::start("coherence-warm-apply").await;
+    let bucket = origin.bucket();
+    origin.seed("kept", b"never-touched").await;
+    origin.seed("changed", b"version-1").await;
+    let dir = WarmDir::new("warm-apply");
+    let (sync_a, sync_b) = gossip_pair("warm-live-a", "warm-live-b").await;
+    let metrics_a = Arc::new(Metrics::default());
+    let metrics_b = Arc::new(Metrics::default());
+    let client = origin.counted_client();
+    let node_a = proxy_over_with_metrics(&client, CAP, Some(sync_a), &metrics_a);
+    let node_b = warm_proxy_over(&client, CAP, Some(sync_b), &dir, &metrics_b);
+    for proxy in [&node_a, &node_b] {
+        proxy.start_coherence(&[bucket.to_owned()]);
+        proxy.spawn_background_sync(vec![bucket.to_owned()]);
+    }
+    wait_for_index(&node_a, &origin, bucket).await;
+    wait_for_index(&node_b, &origin, bucket).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
+
+    assert_eq!(get(&node_b, bucket, "kept").await, "never-touched");
+    assert_eq!(get(&node_b, bucket, "changed").await, "version-1");
+    eventually!("both bodies to reach warm disk", dir.files() == 2);
+    let fetched = origin.ops.get();
+    let evictions = counter(&metrics_b, "body_revalidation_evictions");
+
+    put_typed(&node_a, bucket, "changed", b"version-2", "text/x-fixture").await;
+    assert_eq!(
+        dir.files(),
+        2,
+        "the applied acknowledgement did not wait for or enqueue warm deletion"
+    );
+    assert_eq!(get(&node_b, bucket, "kept").await, "never-touched");
+    assert_eq!(
+        origin.ops.get(),
+        fetched,
+        "the unrelated trusted hot body remains locally serveable"
+    );
+    assert_eq!(get(&node_b, bucket, "changed").await, "version-2");
+    assert_eq!(
+        origin.ops.get(),
+        fetched + 1,
+        "only the contradicted warm body was refetched"
+    );
+    assert_eq!(
+        counter(&metrics_b, "body_revalidation_evictions"),
+        evictions + 1,
+        "the retained warm copy was checked against the already-updated index"
     );
 }
 
@@ -320,12 +415,10 @@ async fn a_delete_on_a_removes_the_key_from_bs_index() {
 /// same `ETag`, an mtime the index has not moved past — and is served off disk for
 /// nothing.
 ///
-/// `changed` is the other half, and it never gets that far: a subscriber that has never
-/// seen a peer starts at that peer's earliest still-visible write, so rejoining replays
-/// the overwrite out of the peer's ring and applying it evicts exactly that key. Had the
-/// write aged out of the ring — or had the peer restarted too — the index would have
-/// contradicted the copy on the read and dropped it there instead. Both routes are one
-/// origin GET, which is why the assertion is the counter and not the route.
+/// `changed` is the other half: the re-read index contradicts the retained suspect warm
+/// copy, so the read drops exactly that key and refetches it. Both replay and a full
+/// gap recovery land on the same validation rule, which is why the assertion is the
+/// counter and not the route.
 ///
 /// One origin GET for the whole restart, then. A node that had thrown its tier away
 /// instead would have paid two, and the counter is what tells the two apart.
@@ -380,7 +473,7 @@ async fn a_restart_onto_a_warm_tier_pays_only_for_what_changed() {
     node_b.start_coherence(&[bucket.to_owned()]);
     node_b.spawn_background_sync(vec![bucket.to_owned()]);
     wait_for_index(&node_b, &origin, bucket).await;
-    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
 
     let fetched = origin.ops.get();
     assert_eq!(
@@ -420,7 +513,7 @@ async fn a_contested_create_is_arbitrated_by_the_origin() {
     let origin = Origin::start("coherence-cas").await;
     let bucket = origin.bucket();
     let (node_a, node_b) = two_nodes(&origin, ("cas-a", "cas-b")).await;
-    settle_cluster(&origin, &node_a, &node_b, bucket).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
 
     let (from_a, from_b) = tokio::join!(
         put_conditional(

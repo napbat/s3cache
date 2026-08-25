@@ -785,6 +785,27 @@ pub async fn get(proxy: &CachingProxy, bucket: &str, key: &str) -> Bytes {
     read_body(out).await
 }
 
+/// A whole-object GET carrying s3cache's read-after-write token header.
+pub async fn get_with_read_token(
+    proxy: &CachingProxy,
+    bucket: &str,
+    key: &str,
+    token: &str,
+) -> Bytes {
+    let input = GetObjectInput {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        ..Default::default()
+    };
+    let mut req = request(input);
+    req.headers.insert(
+        "x-s3cache-read-token",
+        token.parse().expect("a valid read-token header value"),
+    );
+    let out = proxy.get_object(req).await.expect("get succeeds").output;
+    read_body(out).await
+}
+
 /// A ranged GET through the proxy: the sliced bytes and the `Content-Range` header.
 pub async fn get_range(
     proxy: &CachingProxy,

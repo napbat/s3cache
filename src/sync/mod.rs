@@ -16,8 +16,7 @@
 //! once that index has proved it current. The strict-LIST barrier
 //! (`coherence::WriteSync::await_fresh`) waits until every peer's
 //! currently-advertised feed head has been applied locally — freshness
-//! bounded by one push/gossip hop, degrading to serving current state on
-//! timeout.
+//! bounded by one push/gossip hop and failing closed to the origin on timeout.
 //!
 //! Write responses surface the feed token in `x-s3cache-write-token`; a client
 //! can echo it as `x-s3cache-read-token` to make a later read wait until that

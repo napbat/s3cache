@@ -1,14 +1,16 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use groupnet::consistency::LeaseConfig;
+use groupnet::consistency::{LeaseConfig, WriteFeed, advertised_head};
 use groupnet::core::{Config, NodeId};
 use groupnet::runtime::Node;
 use groupnet::transport::mem::{MemTransport, Network};
+use http::HeaderMap;
 use s3s::dto::{ETag, GetObjectOutput, Timestamp};
 
-use crate::cache::proxy::{CacheConfig, CachingProxy, affirm_after};
+use crate::cache::proxy::{CacheConfig, CachingProxy, ReadRoute, affirm_after};
 use crate::index::{ObjEntry, apply_put, standard_class};
 use crate::metrics::Metrics;
 use crate::sync::coherence::{Consistency, WriteSync};
@@ -66,8 +68,8 @@ async fn the_boot_affirmation_is_immediate_with_no_buckets() {
 }
 
 /// With a bucket, the licence waits for that bucket's warm-up to land. A node whose
-/// index is still filling from the origin must not answer a LIST — or an
-/// authoritative 404 — out of it.
+/// index is still filling from the origin must not answer a LIST or positive local read
+/// out of it.
 #[tokio::test]
 async fn the_boot_affirmation_waits_for_every_bucket_warmup() {
     let (_node, sync) = solo("boot-one");
@@ -185,6 +187,71 @@ fn counter(proxy: &CachingProxy, name: &str) -> u64 {
         .find_map(|line| line.strip_prefix(&prefix))
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| panic!("{name} is not exposed:\n{text}"))
+}
+
+/// A peer can advertise a head before its frame is usable locally. The read barrier
+/// must fail closed rather than serve the best stale state this node currently has.
+#[tokio::test]
+async fn a_freshness_timeout_routes_to_origin_and_is_counted() {
+    let net = Network::new();
+    let a_id = NodeId::new("barrier-a");
+    let b_id = NodeId::new("barrier-b");
+    let a_node = Node::builder(a_id.clone(), net.endpoint(a_id.clone()))
+        .seed(b_id.clone())
+        .config(brisk())
+        .spawn();
+    let b_node = Node::builder(b_id.clone(), net.endpoint(b_id.clone()))
+        .seed(a_id.clone())
+        .config(brisk())
+        .spawn();
+    let a_group = a_node.join_group("s3cache");
+    let b_group = b_node.join_group("s3cache");
+    let sync = Arc::new(WriteSync::attach(
+        b_group.clone(),
+        b_id,
+        Consistency::Bounded,
+        LeaseConfig::for_duration(Duration::from_millis(300)),
+        None,
+    ));
+    let proxy = proxy(Some(sync));
+    proxy.start_coherence(&[]);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if b_group.members().contains(&a_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the peers converge");
+
+    // This is a valid Groupnet frame whose payload is not an IndexEvent. The peer
+    // cursor observes it, but s3cache cannot apply it and therefore cannot advance its
+    // frontier to the advertised head.
+    let feed = WriteFeed::new(
+        a_group,
+        NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
+        |_value: &u8| vec![0],
+    );
+    let token = feed.publish(&1).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if advertised_head(&b_group, &a_id) == Some(token) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the unusable head is advertised");
+
+    assert!(matches!(
+        proxy.read_barrier(&HeaderMap::new()).await,
+        ReadRoute::Origin
+    ));
+    assert_eq!(counter(&proxy, "unhealthy_bypasses"), 1);
 }
 
 /// Single node: no feed, so this proxy is the only writer and its own tiers cannot

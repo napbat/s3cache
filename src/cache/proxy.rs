@@ -52,8 +52,8 @@ pub(super) enum ReadRoute {
 /// [`WriteSync::wait_cluster_applied`](crate::sync::coherence::WriteSync).
 const WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a strict read waits for the freshness barrier before serving
-/// current state anyway (degrading to eventual rather than hanging).
+/// How long a strict read waits for the freshness barrier before failing closed to the
+/// origin. A healthy cluster resolves this immediately.
 const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// First and longest wait between attempts at a bucket's warm-up sync. A bucket whose
@@ -337,7 +337,7 @@ impl CachingProxy {
     }
 
     /// Start the gossip apply loop: peers' events fold into this node's LIST index and
-    /// invalidate its body copies; a gap — or, in `strong`, a serve-lease lapse with no
+    /// invalidate its hot body copies; a gap — or, in `strong`, a serve-lease lapse with no
     /// gap behind it whose staged recovery could not prove the cache — *distrusts* every
     /// local body copy (nothing is dropped; each has to prove itself again) and resyncs
     /// `buckets` from the origin. A no-op without gossip — single-node is already strict.
@@ -399,7 +399,7 @@ impl CachingProxy {
     /// or a hot/disk body copy), wait until every peer's currently-advertised write-feed
     /// head has been applied locally, so a peer's just-completed write is not read stale.
     /// Freshness is bounded by one push/gossip hop (see [`crate::sync`]); degrades to
-    /// serving current state on timeout. No-op without gossip (single-node is strict).
+    /// the origin on timeout. No-op without gossip (single-node is strict).
     pub(super) async fn read_barrier(&self, headers: &HeaderMap) -> ReadRoute {
         let Some(sync) = &self.sync else {
             return ReadRoute::Local; // single node: the sole writer is strict
@@ -414,7 +414,9 @@ impl CachingProxy {
             return ReadRoute::Origin;
         }
         if !sync.await_fresh(READ_BARRIER_TIMEOUT).await {
-            tracing::debug!("freshness barrier timed out; serving current state");
+            tracing::debug!("freshness barrier timed out; serving via origin");
+            self.metrics.unhealthy_bypass();
+            return ReadRoute::Origin;
         }
         // A client-echoed write token upgrades the read to strict
         // read-after-write for that write, independent of propagation timing.
@@ -902,13 +904,11 @@ impl CachingProxy {
         head_object_from_index(g.get(bucket).map(|b| &b.keys), key)
     }
 
-    /// Whether an index miss may be answered as an authoritative 404. Single-node — no
-    /// write feed — always: the sole writer's index is the truth. With gossip it is the
-    /// mode's own licence for a local answer (see [`WriteSync::may_answer_404`]): a
-    /// valid coherence lease in `strong`, a settled view in `strong-acks`/`bounded`.
-    /// Without one the origin answers instead, which is slower and never wrong.
+    /// Whether an index miss may be answered as an authoritative 404. Only single-node
+    /// mode can prove absence from its index. With replication, a direct origin write
+    /// has no feed event, so every miss is forwarded even under a healthy lease/view.
     fn index_404_trustworthy(&self) -> bool {
-        self.sync.as_ref().is_none_or(|sync| sync.may_answer_404())
+        self.sync.is_none()
     }
 
     /// A cached body this node is entitled to serve, or `None` — every read that answers
@@ -1049,7 +1049,9 @@ impl CachingProxy {
             self.metrics.get_hit();
             return Ok(S3Response::new(obj.to_get()));
         }
-        if !cacheable {
+        // An Origin route must not enter `get_or_fetch_with`: its gate re-probes cache
+        // state and could return the same stale hot body the barrier just rejected.
+        if !cacheable || !local_ok {
             self.metrics.get_bypass();
             return self.inner.get_object(req).await;
         }

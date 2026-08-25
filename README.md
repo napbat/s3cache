@@ -14,9 +14,10 @@ endpoint to this proxy; no client code changes.
   `ListObjectsV2` is answered locally with **no upstream LIST call**. LISTs are the
   expensive S3 tier (R2 Class A), and clients that poll/list constantly (e.g. a
   log-structured store allocating slots) dominate the bill; this removes them. The same
-  index answers `HeadObject` for a synced bucket — an immediate 404 for a key it does not
-  hold, and the full record for one it does — so a per-key existence probe (the class-B
-  volume driver) costs no upstream call either, cached body or not. An entry only answers
+  index answers `HeadObject` for a synced bucket: a faithful full record is local, and in
+  single-node mode an absent key is an immediate 404. With replication, an index miss is
+  forwarded because an out-of-band origin write has no feed event; a replicated cache
+  therefore never invents a false 404. An entry only answers
   a HEAD once it is *faithful*: a bootstrap LIST row or a peer's gossiped write proves the
   key exists and carries what LIST reports, but not the `Content-Type` or `x-amz-meta-*`
   a HEAD does, so the first HEAD of such a key is forwarded once and its answer completes
@@ -74,7 +75,8 @@ hot (in-memory, small)  ->  warm (node-local disk, large, optional)  ->  cold (S
 - **cold** — the S3 origin.
 
 Both tiers are node-local; cross-node coherence is handled separately (below): a peer's
-write invalidates the local hot *and* disk copies, and strict reads barrier on feed heads.
+write updates the index and awaits removal of the local hot copy. The warm copy remains
+on disk, decodes suspect, and must prove itself against that newer index before serving.
 
 ## Cross-node coherence (gossip write feed)
 
@@ -86,8 +88,10 @@ consistency layer, no broker, no consensus service, no extra infrastructure:
 - every durable write publishes one compact event (`put`/`del` + bucket/key/size/ts)
   into this node's feed, pushed to live peers at network latency;
 - every replica runs an apply loop that folds peers' events into its own LIST index
-  (per-key last-writer-wins; deletes win timestamp ties via tombstones) and drops the
-  key from its local hot *and* disk copies.
+  (per-key last-writer-wins; deletes win timestamp ties via tombstones), then awaits hot
+  invalidation before advancing its frontier/ack. Warm-disk deletion is not on this
+  latency path: a retained warm body is suspect and the updated index either proves it
+  or evicts/refetches only that key.
 
 The fast path stays in local memory (LIST is served from RAM; nothing remote is on the
 read path). Loss is **detected, never silent**: a peer that falls behind the feed's ring,
@@ -98,6 +102,11 @@ every other peer resolves through gossiped advertisements. The ring is bounded b
 event count and encoded bytes: sustained long-key writes shorten its replay window and
 surface the same explicit gap instead of growing one state entry past the transport
 envelope and silently arresting peer application.
+After a `strong`/`strong-acks` write has a real all-readers acknowledgement (or every
+straggler has lost serving authority), its safe feed prefix is retired while the newest
+head remains advertised as an anchor. Healthy feeds therefore carry an anchor plus only
+in-flight writes instead of remaining pinned near the encoded-frame ceiling. `bounded`
+writes and stalled waits never retire history because neither is an all-readers watermark.
 
 With the feed on, **multiple replicas are safe** — this lifts the historical
 single-replica constraint with zero extra services.
@@ -118,12 +127,13 @@ heuristic earlier releases used:
 
 - **A node may serve locally only while it holds a lease.** Every node continuously
   renews a *serve-lease* (one small gossip entry every `D/3`), and every other node
-  grants the renewals it has adopted. A node answers a LIST from its index, a GET from
-  its cache, or an authoritative 404 **only** while a lease confirmed by every peer
-  covers this instant. It is one mechanism for all three questions, not three
-  heuristics — and `false` covers everything: booting, warming up, lapsed, awaiting a
-  resync, a peer gone silent, a partition. Every one of them sends the read to the
-  origin: slower, never stale (`unhealthy_bypasses`).
+  grants the renewals it has adopted. A node answers a LIST, a faithful positive HEAD,
+  or a GET from local state **only** while a lease confirmed by every peer covers this
+  instant. Replicated index misses always go to the origin; no lease can prove that an
+  object was not created there out of band. The lease is one mechanism for every local
+  positive, not an absence oracle, and `false` covers everything: booting, warming up,
+  lapsed, awaiting a resync, a peer gone silent, or a partition. Every one of them sends
+  the read to the origin: slower, never stale (`unhealthy_bypasses`).
 - **Writes end at an ack *or* at a lapse.** A write returns only after the origin acked
   it AND every lease-holder either applied the invalidation (the fast path — one
   in-cluster ack round, ~2 gossip hops, behind the origin round-trip already paid) or
@@ -156,8 +166,9 @@ heuristic earlier releases used:
   live at the lapse has vanished from membership since, and then barriers on every peer's
   advertised feed head — re-running the vanished check once more afterwards, because the
   barrier waits and a reap can land inside that wait. Past the barrier the apply loop has
-  evicted exactly the keys the lapse era changed and every remaining body is provably
-  untouched, so the node re-affirms warm (`lapse_barrier_retains`). Any stage that cannot
+  updated every changed key and removed its stale hot copy; retained warm bodies must
+  validate against that index, while unrelated hot bodies keep their proof. The node then
+  re-affirms warm (`lapse_barrier_retains`). Any stage that cannot
   get its proof — a live peer reaped before the recovery could affirm, so its feed frame
   went with it; a head that never arrives; a granter that never re-grants — falls back to
   the gap's remediation instead (`lapse_barrier_fallbacks`, the same set
@@ -203,9 +214,9 @@ box is the long form):
 **`strong-acks` (`S3CACHE_CONSISTENCY=strong-acks`) — deprecated, one release only.**
 The pre-lease *coherence mechanism*, kept so a deployment can roll the lease tier
 through the fleet in stages: writes wait on every alive peer that participates in the
-ack tier, an ack timeout ends in a degradation rather than a guarantee, and the
-read-side licence is the old view-stability heuristic (a fully-alive membership view,
-unchanged for the failure detector's whole window).
+ack tier, an ack timeout ends without a coherence guarantee, and the
+read-side licence is a fully-alive membership view. Replicated index misses still go to
+the origin in every mode.
 
 It is a rollback lever for that mechanism, **not a time machine**. Three things changed
 underneath every mode, and this one gets them too:
@@ -216,11 +227,9 @@ underneath every mode, and this one gets them too:
   partition outliving that lands on the write-feed **gap** path (distrust + origin
   re-LIST) rather than reconciling through a digest catch-up: loud, correct, and not what
   this mode did before.
-- **The 404 trust window is computed per call, not fixed.** It was a constant 650ms off
-  groupnet's *default* probe timings. It is now `detection_window_ms` read off the
-  **effective** config and the membership actually being swept (floored at two members)
-  — a correction of a window that was too short, and a larger number: 700ms for a pair,
-  growing with the cluster.
+- **There is no replicated 404 trust window.** A healthy view or valid lease proves feed
+  participation, not the absence of writes made directly at the origin. A synced
+  replicated index miss always forwards; faithful positive entries remain local.
 - **The ack wait skips peers that declare themselves bounded.** A peer advertising
   `s3cache:bounded` is no longer waited out per write. A peer that advertises *nothing*
   still is — absence is not non-participation — so a pre-upgrade fleet is unaffected.
@@ -232,7 +241,8 @@ the ordinary ack round, since they publish no lease for it to wait on or expire.
 
 **`bounded` (`S3CACHE_CONSISTENCY=bounded`, set uniformly).** For clusters too large to
 pay a per-write ack round: writes return on the origin ack, reads are fresh within ~one
-push hop (the freshness barrier), and no ack-ledger traffic flows. Session tokens then
+push hop (the freshness barrier), and no ack-ledger traffic flows. A barrier that cannot
+reach an advertised head by its deadline fails closed to the origin. Session tokens then
 offer per-client strictness: every write response carries
 `x-s3cache-write-token: <writer>:<epoch>:<seq>`; echoing it on a read as
 `x-s3cache-read-token` barriers on that specific write, and an unverifiable token
@@ -284,7 +294,8 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
 - **Unit / protocol tests** (included in
   `cargo test --locked --workspace --all-features`): the unit cases are fully
   in-process — real groupnet nodes over an in-memory transport, no external services.
-  They cover peer-write index folding + hot invalidation, out-of-order LWW convergence
+  They cover peer-write index folding + hot-only invalidation (including retained,
+  suspect warm bodies), out-of-order LWW convergence
   (tombstones, delete-wins-ties, no-resurrection), the freshness barrier, the gap path,
   and the staged lapse recovery — what it retains, and every way it falls back.
 - **Integration tests** (`cargo test --locked --workspace --all-features`, needs a
@@ -296,10 +307,11 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
   (`If-None-Match: *`, `If-Match`) keep the origin's 412 semantics and leave the index
   and cache consistent with the outcome. `tests/coherence.rs` does the same with two
   nodes gossiping over loopback UDP: a write on A is in B's index by the time it
-  returns, an overwrite on A drops B's cached body, a delete on A makes B's HEAD a
-  local 404, a contested create-if-absent is arbitrated by the origin, and 640 long-key
-  writes prove the feed keeps advancing after it crosses the old transport-envelope
-  arrest point.
+  returns, an overwrite on A makes B validate/refetch only the changed body, replicated
+  misses and deletes ask the origin rather than inventing a 404, an origin-routed whole
+  GET cannot re-probe stale cache state, a contested create-if-absent is arbitrated by
+  the origin, and 640 long-key writes prove acknowledged feed retirement keeps apply
+  advancing past the old transport-envelope arrest point.
 - **Differential tests** (`tests/differential.rs`, same Docker origin): every row asks
   one question twice — once through the proxy, once straight at MinIO — and asserts a
   client could not tell which answered, over the status, the body and the headers it
@@ -388,7 +400,8 @@ from one declaration, so a counter cannot exist in one and not the other.
 
 What they attribute: LIST (`list_from_index` vs `list_passthrough`), GET
 (`get_hit` / `get_miss` / `get_bypass`, `range_*`), HEAD (`head_hit` from a cached body,
-`head_index` and `head_404` from the key index, `head_miss` forwarded upstream), the
+`head_index` and single-node-only `head_404` from the key index, `head_miss` forwarded
+upstream), the
 writes folded into the index by operation (`writes_indexed_put` / `_copy` / `_multipart`,
 each a separately billed upstream class-A call, plus `_observed` for keys learned on the
 read path), `write_fill` (writes whose body was kept rather than dropped — each one an
@@ -409,8 +422,9 @@ unresponsive and each such write cost up to one lease duration, but no read was 
 stale. **`ack_timeouts` is the absence of the guarantee**: peers still live and still
 behind when the wait's deadline passed (in `strong`, the fail-slow reader — renewing but
 not applying — plus any un-leased peer that did not ack). Alert on that one.
-`unhealthy_bypasses` counts reads sent to the origin because this node held no licence to
-answer them locally; it is expected to be non-zero at every startup and after every gap.
+`unhealthy_bypasses` counts reads sent to the origin because this node held no licence or
+could not reach every advertised feed head before the freshness-barrier deadline.
+It is expected to be non-zero at every startup and after every gap.
 The lapse pair is the read side of the same story: this node's *own* lease lapsed with no
 gap to explain it (a peer stopped granting). `lapse_barrier_retains` is the cheap arm —
 the staged recovery proved the cache and kept it, so the node came back **warm** — and

@@ -9,8 +9,8 @@
 //! best-effort by policy: a disk error or oversize rejection never blocks the hot fill or
 //! the data plane. Origin fetches are singleflighted probe-then-gate, so only misses
 //! contend and concurrent callers share one round-trip. Cross-node coherence is separate
-//! (see `sync`): a peer's write invalidates the local hot *and* disk copies, and
-//! strict reads barrier on feed heads.
+//! (see `sync`): a peer's write updates the index and invalidates the local hot copy;
+//! retained warm copies decode suspect and must validate against that newer index.
 
 use std::future::Future;
 use std::mem::size_of;
@@ -558,6 +558,13 @@ impl Core {
         self.observe_warm();
     }
 
+    /// Drop only the in-memory copy. Moka removal is awaited so callers can publish an
+    /// applied frontier only after a stale hot body is unservable; warm disk I/O is kept
+    /// off that acknowledgement path.
+    async fn invalidate_hot(&self, key: &CacheKey) {
+        self.hot.inner().invalidate(key).await;
+    }
+
     /// Drop EVERY local copy: the hot tier empties immediately, the disk store unlinks
     /// its files on a blocking worker.
     ///
@@ -710,9 +717,20 @@ pub struct LocalCache {
 }
 
 impl LocalCache {
-    /// Drop a key from every node-local tier so a peer's overwrite is never read stale.
+    /// Drop a key from every node-local tier. Local writes and failed revalidation need
+    /// this stronger operation because the next tier probe must not rediscover the copy.
     pub async fn invalidate(&self, key: &CacheKey) {
         self.core.invalidate(key).await;
+    }
+
+    /// Drop a peer-written key from hot memory before acknowledging the feed event.
+    ///
+    /// The apply loop updates its index first. A retained warm copy therefore decodes
+    /// with trust generation zero and must validate against the new entry; only a copy
+    /// for this changed key is fully evicted and fetched again. No disk deletion delays
+    /// the peer frontier or its acknowledgement.
+    pub(crate) async fn invalidate_hot(&self, key: &CacheKey) {
+        self.core.invalidate_hot(key).await;
     }
 
     /// Distrust every node-local copy without dropping one: the generation moves on, so
@@ -971,6 +989,42 @@ mod tests {
         );
         held.mark_trusted(cache.suspect_gen());
         assert!(obj.trusted(cache.suspect_gen()), "one copy, one stamp");
+    }
+
+    /// Peer apply acknowledges after the stale hot copy is gone, without waiting for
+    /// or deleting warm storage. The changed warm copy is retained but comes back
+    /// suspect; an unrelated hot copy keeps its proof.
+    #[tokio::test]
+    async fn hot_only_invalidation_retains_a_suspect_warm_copy() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        let warm = open_warm(dir.clone(), 10 * 1024 * 1024, 8 * 1024 * 1024, metrics()).unwrap();
+        let cache = TieredCache::new(1024 * 1024, Some(warm), metrics());
+        let changed = ck("b", "changed");
+        let unaffected = ck("b", "unaffected");
+        let changed_obj = Arc::new(sample());
+        let unaffected_obj = Arc::new(sample());
+        changed_obj.mark_trusted(cache.suspect_gen());
+        unaffected_obj.mark_trusted(cache.suspect_gen());
+        cache.insert(changed.clone(), changed_obj).await;
+        cache
+            .insert(unaffected.clone(), Arc::clone(&unaffected_obj))
+            .await;
+
+        cache.local().invalidate_hot(&changed).await;
+
+        let retained = cache.get(&changed).await.expect("warm copy retained");
+        assert!(
+            !retained.trusted(cache.suspect_gen()),
+            "a warm-decoded copy must validate against the updated index"
+        );
+        let still_hot = cache.get(&unaffected).await.expect("unaffected hot copy");
+        assert!(
+            still_hot.trusted(cache.suspect_gen()),
+            "the peer event does not distrust unrelated bodies"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
