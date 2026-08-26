@@ -8,10 +8,12 @@ use groupnet::core::{Config, NodeId};
 use groupnet::runtime::Node;
 use groupnet::transport::mem::{MemTransport, Network};
 use http::HeaderMap;
-use s3s::dto::{ETag, GetObjectOutput, Timestamp};
+use s3s::dto::{ETag, GetObjectOutput, ListObjectsV2Input, Timestamp};
+use s3s::{S3, S3ErrorCode, S3Request};
 
 use crate::cache::proxy::{CacheConfig, CachingProxy, ReadRoute, affirm_after};
 use crate::index::{ObjEntry, apply_put, standard_class};
+use crate::list_token;
 use crate::metrics::Metrics;
 use crate::sync::coherence::{Consistency, WriteSync};
 use crate::tier::CachedObject;
@@ -178,6 +180,55 @@ fn synced(proxy: &CachingProxy) {
         .entry("b".to_owned())
         .or_default()
         .synced = true;
+}
+
+fn request<T>(input: T) -> S3Request<T> {
+    S3Request {
+        input,
+        method: http::Method::GET,
+        uri: http::Uri::default(),
+        headers: HeaderMap::new(),
+        extensions: http::Extensions::new(),
+        credentials: None,
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_mismatched_owned_list_tokens_are_invalid_arguments() {
+    let proxy = proxy(None);
+    synced(&proxy);
+
+    let malformed = ListObjectsV2Input {
+        bucket: "b".to_owned(),
+        continuation_token: Some("s3cache:list-token:v1:not_base64!".to_owned()),
+        ..Default::default()
+    };
+    let error = proxy
+        .list_objects_v2(request(malformed))
+        .await
+        .expect_err("a malformed owned token is rejected before routing");
+    assert_eq!(*error.code(), S3ErrorCode::InvalidArgument);
+
+    let shape = ListObjectsV2Input {
+        bucket: "b".to_owned(),
+        prefix: Some("expected/".to_owned()),
+        ..Default::default()
+    };
+    let token = list_token::encode(&shape, "expected/cursor");
+    let mismatch = ListObjectsV2Input {
+        bucket: "b".to_owned(),
+        prefix: Some("changed/".to_owned()),
+        continuation_token: Some(token),
+        ..Default::default()
+    };
+    let error = proxy
+        .list_objects_v2(request(mismatch))
+        .await
+        .expect_err("a token cannot be reused with another request shape");
+    assert_eq!(*error.code(), S3ErrorCode::InvalidArgument);
 }
 
 fn counter(proxy: &CachingProxy, name: &str) -> u64 {

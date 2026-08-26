@@ -892,9 +892,17 @@ impl CachingProxy {
 
     /// Build a `ListObjectsV2` response from this bucket's index; `None` when the index
     /// cannot answer without inventing a value. See [`list_objects_v2_from_index`].
-    pub(super) fn list_from_index(&self, inp: &ListObjectsV2Input) -> Option<ListObjectsV2Output> {
+    pub(super) fn list_from_index(
+        &self,
+        inp: &ListObjectsV2Input,
+        resume_after: Option<&str>,
+    ) -> Option<ListObjectsV2Output> {
         let g = self.state.read().unwrap();
-        list_objects_v2_from_index(g.get(inp.bucket.as_str()).map(|b| &b.keys), inp)
+        list_objects_v2_from_index(
+            g.get(inp.bucket.as_str()).map(|b| &b.keys),
+            inp,
+            resume_after,
+        )
     }
 
     /// What this bucket's index can say about a key's HEAD (see

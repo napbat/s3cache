@@ -15,11 +15,14 @@ use std::sync::Arc;
 
 use common::{
     Origin, delete, get, get_if_none_match, get_range, head, head_if_none_match, list, list_entry,
-    node, put, put_conditional, put_typed, put_typed_conditional, request, wait_for_index,
+    node, proxy_over, put, put_conditional, put_typed, put_typed_conditional, request,
+    wait_for_index,
 };
 use http::HeaderValue;
 use http::header::IF_NONE_MATCH;
-use s3s::dto::{CopyObjectInput, CopySource, ETag, ETagCondition};
+use s3s::dto::{
+    CopyObjectInput, CopySource, ETag, ETagCondition, ListObjectsV2Input, ListObjectsV2Output,
+};
 use s3s::{S3, S3ErrorCode};
 use tokio::sync::Barrier;
 
@@ -49,6 +52,107 @@ async fn list_is_served_from_the_index_after_the_warm_up_sync() {
         origin.ops.list(),
         baseline,
         "a synced bucket costs the origin no LIST at all"
+    );
+}
+
+#[tokio::test]
+async fn indexed_continuation_token_survives_an_origin_routed_next_page() {
+    let origin = Origin::start("e2e-list-route-change").await;
+    let bucket = origin.bucket();
+    for key in ["a", "b", "c", "d"] {
+        origin.seed(key, key.as_bytes()).await;
+    }
+    let indexed_a = node(&origin, 1024 * 1024);
+    let indexed_b = node(&origin, 1024 * 1024);
+    wait_for_index(&indexed_a, &origin, bucket).await;
+    wait_for_index(&indexed_b, &origin, bucket).await;
+    let origin_lists = origin.ops.list();
+    let page_keys = |output: &ListObjectsV2Output| {
+        output
+            .contents
+            .iter()
+            .flatten()
+            .filter_map(|object| object.key.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let first = indexed_a
+        .list_objects_v2(request(ListObjectsV2Input {
+            bucket: bucket.to_owned(),
+            max_keys: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .expect("replica A serves the first indexed page")
+        .output;
+    assert_eq!(page_keys(&first), ["a"]);
+    let token = first
+        .next_continuation_token
+        .expect("the indexed page is truncated");
+    assert!(token.starts_with("s3cache:list-token:v1:"));
+
+    let second = indexed_b
+        .list_objects_v2(request(ListObjectsV2Input {
+            bucket: bucket.to_owned(),
+            max_keys: Some(1),
+            continuation_token: Some(token.clone()),
+            ..Default::default()
+        }))
+        .await
+        .expect("replica B resumes replica A's token locally")
+        .output;
+    assert_eq!(page_keys(&second), ["b"]);
+    assert_eq!(second.continuation_token.as_deref(), Some(token.as_str()));
+    let token = second
+        .next_continuation_token
+        .expect("another indexed page remains");
+    assert_eq!(
+        origin.ops.list(),
+        origin_lists,
+        "both replicas resumed the portable token without origin traffic"
+    );
+
+    let origin_routed = proxy_over(&origin.counted_client(), 1024 * 1024, None);
+    let third = origin_routed
+        .list_objects_v2(request(ListObjectsV2Input {
+            bucket: bucket.to_owned(),
+            max_keys: Some(1),
+            continuation_token: Some(token.clone()),
+            ..Default::default()
+        }))
+        .await
+        .expect("an unsynced replica translates the indexed token for the origin")
+        .output;
+    assert_eq!(page_keys(&third), ["c"]);
+    assert_eq!(third.continuation_token.as_deref(), Some(token.as_str()));
+    assert!(
+        third.start_after.is_none(),
+        "the translated cursor is not exposed as the client's start-after"
+    );
+    let origin_token = third
+        .next_continuation_token
+        .expect("the origin has one final page");
+    assert!(!origin_token.starts_with("s3cache:list-token:"));
+
+    let fourth = indexed_a
+        .list_objects_v2(request(ListObjectsV2Input {
+            bucket: bucket.to_owned(),
+            max_keys: Some(1),
+            continuation_token: Some(origin_token.clone()),
+            ..Default::default()
+        }))
+        .await
+        .expect("an origin token bypasses a healthy local index unchanged")
+        .output;
+    assert_eq!(page_keys(&fourth), ["d"]);
+    assert_eq!(
+        fourth.continuation_token.as_deref(),
+        Some(origin_token.as_str())
+    );
+    assert_eq!(
+        origin.ops.list(),
+        origin_lists + 2,
+        "the translated page and origin-token page each reach upstream exactly once"
     );
 }
 

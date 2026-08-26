@@ -26,6 +26,7 @@ use s3s::dto::{
 };
 use tracing::info;
 
+use crate::list_token;
 use crate::tier::CachedObject;
 
 /// S3's default storage class, and what an object reports when it carries no
@@ -347,15 +348,17 @@ pub(crate) fn complete_entry(
 
 /// The `ListObjectsV2` algorithm over an already-borrowed key index — free-standing so it
 /// is unit-testable without a live proxy. Matches S3: sorted keys, prefix filter,
-/// delimiter roll-up into common prefixes, max-keys paging with a key continuation token
-/// (resumed *inclusively*, since the token is the next key to return), and `start_after`
-/// (exclusive, first page only).
+/// delimiter roll-up into common prefixes, max-keys paging with an exclusive underlying
+/// key cursor, and `start_after` (exclusive, first page only). The cursor is supplied
+/// separately because the service has already distinguished s3cache's token namespace
+/// from an origin's opaque token and validated the bound request shape.
 ///
 /// `None` when the index cannot answer this request without inventing something — a row
 /// it would have to emit has no known size — and the caller must forward to the origin.
 pub(crate) fn list_objects_v2_from_index(
     keys: Option<&BTreeMap<String, ObjEntry>>,
     inp: &ListObjectsV2Input,
+    resume_after: Option<&str>,
 ) -> Option<ListObjectsV2Output> {
     let bucket = inp.bucket.as_str();
     let prefix = inp.prefix.clone().unwrap_or_default();
@@ -369,12 +372,13 @@ pub(crate) fn list_objects_v2_from_index(
     let mut common: BTreeSet<String> = BTreeSet::new();
     let mut truncated = false;
     let mut next_token = None;
+    let mut last_scanned = None;
 
     if let Some(keys) = keys
         && max > 0
     {
-        let lower = if let Some(token) = &inp.continuation_token {
-            Bound::Included(token.clone())
+        let lower = if let Some(cursor) = resume_after {
+            Bound::Excluded(cursor.to_owned())
         } else if let Some(sa) = &inp.start_after {
             Bound::Excluded(sa.clone())
         } else {
@@ -395,17 +399,19 @@ pub(crate) fn list_objects_v2_from_index(
                     if !common.contains(&cp) {
                         if count >= max {
                             truncated = true;
-                            next_token = Some(key.clone());
                             break;
                         }
                         common.insert(cp);
                     }
+                    // A collapsed key is consumed even when its common prefix was
+                    // already emitted. Keeping the cursor on the underlying key is what
+                    // prevents that prefix from reappearing on the next page.
+                    last_scanned = Some(key.as_str());
                     continue;
                 }
             }
             if count >= max {
                 truncated = true;
-                next_token = Some(key.clone());
                 break;
             }
             // A row whose size was never learned cannot be emitted: reporting `0` is a
@@ -419,6 +425,10 @@ pub(crate) fn list_objects_v2_from_index(
                 storage_class: Some(entry.storage_class.clone()),
                 ..Default::default()
             });
+            last_scanned = Some(key.as_str());
+        }
+        if truncated {
+            next_token = last_scanned.map(|cursor| list_token::encode(inp, cursor));
         }
     }
 
@@ -648,6 +658,7 @@ mod tests {
         restart_bucket_resync_if_current, standard_class, sync_listing_into,
         sync_listing_into_generation,
     };
+    use crate::list_token::{Continuation, classify};
     use crate::tier::CachedObject;
     use std::collections::HashMap;
     use std::sync::RwLock;
@@ -891,7 +902,13 @@ mod tests {
         idx: Option<&BTreeMap<String, ObjEntry>>,
         inp: &ListObjectsV2Input,
     ) -> ListObjectsV2Output {
-        list_objects_v2_from_index(idx, inp).expect("the index can answer this list")
+        let cursor = match classify(inp).expect("test continuation token is valid") {
+            Continuation::Absent => None,
+            Continuation::Local { cursor, .. } => Some(cursor),
+            Continuation::Origin => panic!("an origin token cannot use the local index"),
+        };
+        list_objects_v2_from_index(idx, inp, cursor.as_deref())
+            .expect("the index can answer this list")
     }
 
     fn page_keys(out: &ListObjectsV2Output) -> Vec<String> {
@@ -961,6 +978,26 @@ mod tests {
     }
 
     #[test]
+    fn list_delimiter_cursor_consumes_every_collapsed_key() {
+        let idx = index(&["a/1", "a/2", "a/3", "b/1"]);
+        let first = listed(Some(&idx), &list_input(1, None, "", Some("/"), None));
+        assert_eq!(page_prefixes(&first), ["a/"]);
+        let token = first
+            .next_continuation_token
+            .as_deref()
+            .expect("another prefix remains");
+        let resumed = list_input(1, Some(token), "", Some("/"), None);
+        assert_eq!(
+            classify(&resumed),
+            Ok(Continuation::Local {
+                token: token.to_owned(),
+                cursor: "a/3".to_owned(),
+            })
+        );
+        assert_eq!(page_prefixes(&listed(Some(&idx), &resumed)), ["b/"]);
+    }
+
+    #[test]
     fn list_start_after_is_exclusive() {
         let idx = index(&["a", "b", "c", "d"]);
         let out = listed(Some(&idx), &list_input(1000, None, "", None, Some("b")));
@@ -995,7 +1032,7 @@ mod tests {
         let mut idx = index(&["a", "b"]);
         idx.get_mut("b").expect("seeded key").size = None;
         assert!(
-            list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "", None, None))
+            list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "", None, None), None,)
                 .is_none(),
             "no fabricated size is ever listed"
         );

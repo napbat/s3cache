@@ -17,6 +17,7 @@ use crate::cache::proxy::{
     written_object,
 };
 use crate::index::{ObjEntry, ObjMeta};
+use crate::list_token::{Continuation, classify, rewrite_for_origin};
 use crate::tier::CachedObject;
 
 /// Moves the `response-*` fields out of an input into a [`ResponseOverrides`]; one macro
@@ -83,7 +84,7 @@ impl s3s::S3 for CachingProxy {
     // LIST served from the index when the bucket is synced; else passthrough.
     async fn list_objects_v2(
         &self,
-        req: S3Request<ListObjectsV2Input>,
+        mut req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
         // Three things the index cannot answer without guessing at the origin's own
         // wire format or authorisation, so they are forwarded verbatim:
@@ -97,15 +98,38 @@ impl s3s::S3 for CachingProxy {
         let origin_only = req.input.encoding_type.is_some()
             || req.input.fetch_owner.unwrap_or(false)
             || req.input.expected_bucket_owner.is_some();
+        let continuation =
+            classify(&req.input).map_err(|error| s3s::s3_error!(InvalidArgument, "{error}"))?;
+        // An origin token is opaque and may encode state no local replica has. It must
+        // stay on the origin route unchanged even when this node's index is healthy.
+        if continuation == Continuation::Origin {
+            self.metrics.list_passthrough();
+            return self.inner.list_objects_v2(req).await;
+        }
+        let resume_after = match &continuation {
+            Continuation::Local { cursor, .. } => Some(cursor.as_str()),
+            Continuation::Absent | Continuation::Origin => None,
+        };
         if !origin_only
             && self.is_synced(req.input.bucket.as_str())
             && self.read_barrier(&req.headers).await == ReadRoute::Local
-            && let Some(out) = self.list_from_index(&req.input)
+            && let Some(out) = self.list_from_index(&req.input, resume_after)
         {
             self.metrics.list_from_index();
             return Ok(S3Response::new(out));
         }
         self.metrics.list_passthrough();
+        // s3cache's cursor is an exclusive underlying key, exactly the shape S3's
+        // `start-after` accepts. An unsynced/unhealthy replica (or an origin-only request)
+        // translates it rather than leaking a proxy-private token to the origin. The
+        // origin's next token is deliberately preserved, making every later page stay
+        // origin-routed until that walk ends.
+        if let Continuation::Local { token, cursor } = continuation {
+            let envelope = rewrite_for_origin(&mut req.input, token, cursor);
+            let mut response = self.inner.list_objects_v2(req).await?;
+            envelope.restore(&mut response.output);
+            return Ok(response);
+        }
         self.inner.list_objects_v2(req).await
     }
 

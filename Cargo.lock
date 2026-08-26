@@ -3018,6 +3018,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "base64",
  "bincode",
  "blake3",
  "bytes",
