@@ -269,15 +269,19 @@ pub(crate) struct BucketState {
     /// Deleted keys and when: consulted by [`apply_put`], pruned amortized.
     pub(crate) gone: BTreeMap<String, SystemTime>,
     /// Generation of the origin rebuild currently allowed to publish into this bucket.
-    /// Fencing an ambiguous key advances it without discarding the retained snapshot,
-    /// so an older in-flight LIST cannot publish across that uncertainty.
+    /// Only whole-bucket rebuild lifecycle changes this generation; per-key HEAD
+    /// reconciliation is independent and cannot restart a long-running LIST.
     pub(crate) sync_generation: u64,
     /// `Some(generation)` only while that generation began by clearing the bucket. This
     /// prevents a merge-only retry from treating retained partial rows as proof that an
-    /// absent key is gone and clearing its fence.
+    /// absent key is gone.
     rebuild_generation: Option<u64>,
+    /// Last per-key reconciliation token allocated in this bucket. It survives the
+    /// remove/recreate implementation of full resync so an old async HEAD can never
+    /// acquire a later fence by token reuse.
+    uncertainty_epoch: u64,
     /// Keys whose last mutation outcome is not yet reconciled with the origin, paired
-    /// with the generation that fenced each key. Reads of these keys stay origin-only;
+    /// with the token that fenced each key. Reads of these keys stay origin-only;
     /// only an exact-token HEAD result or a newer definitive mutation may clear one.
     pub(crate) uncertain_keys: BTreeMap<String, u64>,
     stats: IndexStats,
@@ -361,33 +365,34 @@ fn apply_put_with_authority(
     true
 }
 
-/// Fence one ambiguous key without disturbing the bucket's authoritative snapshot,
-/// synced state, or aggregate accounting. Advancing the bucket generation invalidates
-/// any full LIST that began before this uncertainty. Returns the key's reconciliation
-/// token.
+/// Fence one ambiguous key without disturbing a full-LIST generation, the retained
+/// snapshot, synced state, or aggregate accounting. Returns a bucket-local token that
+/// is never reused by a later fence.
 pub(crate) fn fence_uncertain_key(state: &KeyIndex, bucket: &str, key: &str) -> u64 {
     let mut index = state.inner.write().unwrap();
     let bucket = index.buckets.entry(bucket.to_owned()).or_default();
-    let generation = bucket.sync_generation.wrapping_add(1);
-    bucket.sync_generation = generation;
-    bucket.rebuild_generation = None;
-    bucket.uncertain_keys.insert(key.to_owned(), generation);
-    generation
+    let token = bucket
+        .uncertainty_epoch
+        .checked_add(1)
+        .expect("per-bucket uncertainty token exhausted");
+    bucket.uncertainty_epoch = token;
+    bucket.uncertain_keys.insert(key.to_owned(), token);
+    token
 }
 
-/// Whether `generation` still owns reconciliation of this exact key.
+/// Whether `token` still owns reconciliation of this exact key.
 pub(crate) fn uncertain_key_is_current(
     state: &KeyIndex,
     bucket: &str,
     key: &str,
-    generation: u64,
+    token: u64,
 ) -> bool {
     state
         .read()
         .unwrap()
         .get(bucket)
         .and_then(|bucket| bucket.uncertain_keys.get(key))
-        .is_some_and(|current| *current == generation)
+        .is_some_and(|current| *current == token)
 }
 
 /// The authoritative result of a per-key origin HEAD.
@@ -403,7 +408,7 @@ pub(crate) fn resolve_uncertain_key(
     state: &KeyIndex,
     bucket: &str,
     key: &str,
-    generation: u64,
+    token: u64,
     authoritative: AuthoritativeKeyState,
 ) -> bool {
     let mut index = state.inner.write().unwrap();
@@ -411,7 +416,7 @@ pub(crate) fn resolve_uncertain_key(
     let Some(b) = buckets.get_mut(bucket) else {
         return false;
     };
-    if b.uncertain_keys.get(key) != Some(&generation) {
+    if b.uncertain_keys.get(key) != Some(&token) {
         return false;
     }
     match authoritative {
@@ -446,8 +451,8 @@ pub(crate) fn resolve_uncertain_key(
 }
 
 /// Reset a bucket to origin-serving state and advance the generation that may rebuild
-/// it. Retained fence tokens all predate this clean snapshot; exact-current completion
-/// may therefore clear them. Returns the new generation.
+/// it. Per-key fences and their allocation epoch survive: only their exact HEAD or a
+/// newer definitive mutation can resolve them. Returns the new rebuild generation.
 pub(crate) fn begin_bucket_resync(state: &KeyIndex, bucket: &str) -> u64 {
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
@@ -457,6 +462,7 @@ pub(crate) fn begin_bucket_resync(state: &KeyIndex, bucket: &str) -> u64 {
     let replacement = BucketState {
         sync_generation: generation,
         rebuild_generation: Some(generation),
+        uncertainty_epoch: previous.uncertainty_epoch,
         uncertain_keys: previous.uncertain_keys,
         ..BucketState::default()
     };
@@ -465,7 +471,7 @@ pub(crate) fn begin_bucket_resync(state: &KeyIndex, bucket: &str) -> u64 {
 }
 
 /// Discard a failed rebuild's partial rows and advance to a clean retry, but only while
-/// `generation` still owns the bucket. `None` means a newer fence already superseded it.
+/// `generation` still owns the bucket. `None` means a newer full rebuild superseded it.
 #[cfg(test)]
 pub(crate) fn restart_bucket_resync_if_current(
     state: &KeyIndex,
@@ -483,6 +489,7 @@ pub(crate) fn restart_bucket_resync_if_current(
     let replacement = BucketState {
         sync_generation: next,
         rebuild_generation: Some(next),
+        uncertainty_epoch: previous.uncertainty_epoch,
         uncertain_keys: previous.uncertain_keys,
         ..BucketState::default()
     };
@@ -771,6 +778,7 @@ fn sync_listing_into_generation(
 }
 
 /// Publish completion for `generation`; false means a newer rebuild owns the bucket.
+/// A full snapshot never resolves per-key mutation uncertainty, so its fences remain.
 fn finish_bucket_sync_generation(state: &KeyIndex, bucket: &str, generation: u64) -> bool {
     let mut index = state.inner.write().unwrap();
     let b = index.buckets.entry(bucket.to_owned()).or_default();
@@ -779,7 +787,6 @@ fn finish_bucket_sync_generation(state: &KeyIndex, bucket: &str, generation: u64
     }
     b.synced = true;
     b.rebuild_generation = None;
-    b.uncertain_keys.clear();
     true
 }
 
@@ -799,8 +806,8 @@ pub(crate) async fn sync_bucket_into(
     state: &KeyIndex,
     bucket: &str,
 ) -> anyhow::Result<usize> {
-    // Absence is authoritative only after a clean snapshot. In particular, a retry
-    // after a per-key fence must not merge into rows retained from a partial attempt.
+    // Absence is authoritative only after a clean snapshot. A retry after a failed page
+    // must not merge into rows retained from that partial attempt.
     let generation = begin_bucket_resync(state, bucket);
     sync_bucket_generation(client, state, bucket, generation).await
 }
@@ -1006,6 +1013,10 @@ mod tests {
         assert!(put(&state, "uncertain", 20, 10));
         state.mark_bucket_synced("b");
         let baseline = state.stats();
+        let (sync_generation, rebuild_generation) = {
+            let g = state.read().unwrap();
+            (g["b"].sync_generation, g["b"].rebuild_generation)
+        };
 
         let token = fence_uncertain_key(&state, "b", "uncertain");
         let g = state.read().unwrap();
@@ -1013,15 +1024,11 @@ mod tests {
         assert!(bucket.synced);
         assert_eq!(bucket.keys.len(), 2);
         assert_eq!(bucket.uncertain_keys.get("uncertain"), Some(&token));
+        assert_eq!(bucket.sync_generation, sync_generation);
+        assert_eq!(bucket.rebuild_generation, rebuild_generation);
         drop(g);
         assert_eq!(state.stats(), baseline);
 
-        assert_eq!(
-            sync_listing_into_generation(&state, "b", token, std::iter::empty()),
-            None,
-            "a fence generation is not a clean full-LIST generation"
-        );
-        assert!(!finish_bucket_sync_generation(&state, "b", token));
         assert!(resolve_uncertain_key(
             &state,
             "b",
@@ -1093,80 +1100,104 @@ mod tests {
         assert_eq!(size_of(&state, "k"), None);
     }
 
-    /// Once a newer uncertainty fences a bucket, an older rebuild may neither publish a
-    /// late page nor clear any key's origin-only marker. A later rebuild can clear the
-    /// fences only because it starts by discarding every retained partial row.
+    /// A per-key fence is independent of a clean full-LIST generation: the rebuild keeps
+    /// accepting pages and can complete, while the fenced key remains origin-only for
+    /// its exact HEAD reconciliation.
     #[test]
-    fn a_superseded_rebuild_cannot_clear_a_newer_uncertainty() {
+    fn a_key_fence_does_not_supersede_an_in_flight_rebuild() {
         let state = Index::default();
-        let older = begin_bucket_resync(&state, "b");
+        let rebuild = begin_bucket_resync(&state, "b");
         assert_eq!(
             sync_listing_into_generation(
                 &state,
                 "b",
-                older,
+                rebuild,
                 [("partial".to_owned(), entry(1, 10))]
             ),
             Some(1)
         );
         let first = fence_uncertain_key(&state, "b", "first");
         let second = fence_uncertain_key(&state, "b", "second");
-
-        assert_eq!(
-            sync_listing_into_generation(&state, "b", older, [("stale".to_owned(), entry(1, 10))]),
-            None,
-            "a stale page is rejected atomically with its generation check"
-        );
-        assert!(!finish_bucket_sync_generation(&state, "b", older));
         {
             let g = state.read().unwrap();
             let bucket = &g["b"];
+            assert_eq!(bucket.sync_generation, rebuild);
+            assert_eq!(bucket.rebuild_generation, Some(rebuild));
             assert!(!bucket.synced);
-            assert_eq!(
-                bucket
-                    .uncertain_keys
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-                ["first", "second"]
-            );
-            assert_eq!(bucket.uncertain_keys.get("first"), Some(&first));
-            assert_eq!(bucket.uncertain_keys.get("second"), Some(&second));
-            assert!(bucket.keys.contains_key("partial"));
-            assert!(!bucket.keys.contains_key("stale"));
         }
 
-        assert_eq!(
-            sync_listing_into_generation(
-                &state,
-                "b",
-                second,
-                [("unsafe-merge".to_owned(), entry(2, 20))]
-            ),
-            None,
-            "a fence token cannot bless retained partial rows as a full snapshot"
-        );
-        let current = begin_bucket_resync(&state, "b");
-        assert!(!state.read().unwrap()["b"].keys.contains_key("partial"));
         assert!(put(&state, "racing-write", 9, 30));
         assert_eq!(
             sync_listing_into_generation(
                 &state,
                 "b",
-                current,
+                rebuild,
                 [
-                    ("fresh".to_owned(), entry(2, 20)),
+                    ("later-page".to_owned(), entry(2, 20)),
                     ("racing-write".to_owned(), entry(1, 20))
                 ]
             ),
-            Some(2)
+            Some(2),
+            "a key fence cannot supersede the full-LIST generation"
         );
-        assert!(finish_bucket_sync_generation(&state, "b", current));
+        assert!(finish_bucket_sync_generation(&state, "b", rebuild));
         let g = state.read().unwrap();
         assert!(g["b"].synced);
-        assert!(g["b"].uncertain_keys.is_empty());
-        assert!(g["b"].keys.contains_key("fresh"));
+        assert_eq!(g["b"].uncertain_keys.get("first"), Some(&first));
+        assert_eq!(g["b"].uncertain_keys.get("second"), Some(&second));
+        assert!(g["b"].keys.contains_key("partial"));
+        assert!(g["b"].keys.contains_key("later-page"));
         assert_eq!(g["b"].keys["racing-write"].size, Some(9));
+    }
+
+    /// A full snapshot establishes key existence but does not own an ambiguous write's
+    /// resolution; completion must retain that key's exact HEAD fence.
+    #[test]
+    fn full_sync_completion_preserves_an_unresolved_fence() {
+        let state = Index::default();
+        let token = fence_uncertain_key(&state, "b", "writer");
+        let rebuild = begin_bucket_resync(&state, "b");
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                rebuild,
+                [("writer".to_owned(), entry(7, 10))]
+            ),
+            Some(1)
+        );
+        assert!(finish_bucket_sync_generation(&state, "b", rebuild));
+        assert!(uncertain_key_is_current(&state, "b", "writer", token));
+    }
+
+    /// Rebuilding removes and recreates the bucket state, but cannot reset its per-key
+    /// token epoch: an old async HEAD must not match a later fence for the same key.
+    #[test]
+    fn an_old_token_cannot_resolve_a_refence_across_resync() {
+        let state = Index::default();
+        let old = fence_uncertain_key(&state, "b", "writer");
+        let rebuild = begin_bucket_resync(&state, "b");
+        let retry = restart_bucket_resync_if_current(&state, "b", rebuild)
+            .expect("the rebuild still owns its generation");
+        assert!(finish_bucket_sync_generation(&state, "b", retry));
+
+        let current = fence_uncertain_key(&state, "b", "writer");
+        assert_eq!(current, old.checked_add(1).expect("the fixture token fits"));
+        assert!(!resolve_uncertain_key(
+            &state,
+            "b",
+            "writer",
+            old,
+            AuthoritativeKeyState::Present(entry(99, 20))
+        ));
+        assert!(resolve_uncertain_key(
+            &state,
+            "b",
+            "writer",
+            current,
+            AuthoritativeKeyState::Present(entry(7, 30))
+        ));
+        assert_eq!(size_of(&state, "writer"), Some(7));
     }
 
     /// A failed paginated attempt may have published rows before the failing page. The
