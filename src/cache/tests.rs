@@ -11,7 +11,7 @@ use http::HeaderMap;
 use s3s::dto::{ETag, GetObjectOutput, ListObjectsV2Input, Timestamp};
 use s3s::{S3, S3ErrorCode, S3Request};
 
-use crate::cache::proxy::{CacheConfig, CachingProxy, ReadRoute, affirm_after};
+use crate::cache::proxy::{CacheConfig, CachingProxy, FullSyncOwner, ReadRoute, affirm_after};
 use crate::index::{ObjEntry, apply_put, standard_class};
 use crate::list_token;
 use crate::metrics::Metrics;
@@ -61,7 +61,13 @@ async fn the_boot_affirmation_is_immediate_with_no_buckets() {
     let (_node, sync) = solo("boot-none");
     assert!(!sync.may_serve_local(), "a booting node holds no licence");
 
-    affirm_after(Vec::new(), Some(Arc::clone(&sync)), Some(sync.resync_gen())).await;
+    affirm_after(
+        Vec::new(),
+        Some(Arc::clone(&sync)),
+        Some(sync.resync_gen()),
+        None,
+    )
+    .await;
 
     assert!(
         sync.may_serve_local(),
@@ -84,6 +90,7 @@ async fn the_boot_affirmation_waits_for_every_bucket_warmup() {
         vec![warmup],
         Some(Arc::clone(&sync)),
         Some(sync.resync_gen()),
+        None,
     ));
     // Comfortably past the warm-up guard (one detection window plus two
     // anti-entropy rounds, ~100ms here): the lease would take the affirmation by
@@ -99,6 +106,44 @@ async fn the_boot_affirmation_waits_for_every_bucket_warmup() {
     assert!(
         sync.may_serve_local(),
         "and the warm-up landing is what puts the node in service"
+    );
+}
+
+/// Retry and affirmation ownership is independent of the coherence generation: boot
+/// warm-up can start after a gap has already claimed that same coherence generation.
+/// Only the newest full-index recovery may keep retrying or affirm it.
+#[tokio::test]
+async fn only_the_newest_full_sync_may_retry_or_affirm() {
+    let (_node, sync) = solo("full-sync-owner");
+    let owner = FullSyncOwner::default();
+    let stale = owner.claim();
+    let current = owner.claim();
+    assert!(!stale.is_current());
+    assert!(current.is_current());
+
+    affirm_after(
+        Vec::new(),
+        Some(Arc::clone(&sync)),
+        Some(sync.resync_gen()),
+        Some(stale),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !sync.may_serve_local(),
+        "a superseded full sync cannot affirm while its replacement is pending"
+    );
+
+    affirm_after(
+        Vec::new(),
+        Some(Arc::clone(&sync)),
+        Some(sync.resync_gen()),
+        Some(current),
+    )
+    .await;
+    assert!(
+        sync.may_serve_local(),
+        "the newest full sync retains retry and affirmation ownership"
     );
 }
 

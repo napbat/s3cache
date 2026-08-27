@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -11,10 +12,11 @@ use tracing::info;
 
 use crate::cache::copy;
 use crate::index::{
-    Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry, ObjMeta, apply_del, apply_put,
-    begin_bucket_resync, bucket_resync_is_current, complete_entry, entry_matches_body,
-    head_object_from_index, list_objects_v2_from_index, restart_bucket_resync_if_current,
-    standard_class, sync_bucket_generation, sync_bucket_into,
+    AuthoritativeKeyState, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry, ObjMeta,
+    apply_del, apply_observed_put, apply_put, begin_bucket_resync, complete_entry,
+    entry_matches_body, fence_uncertain_key, head_object_from_index, list_objects_v2_from_index,
+    resolve_uncertain_key, standard_class, sync_bucket_generation, sync_bucket_into,
+    uncertain_key_is_current,
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync};
@@ -61,6 +63,37 @@ const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// is the ordinary case, not a permanent verdict.
 const SYNC_RETRY_MIN: Duration = Duration::from_secs(1);
 const SYNC_RETRY_MAX: Duration = Duration::from_mins(1);
+
+/// Ownership for whole-bucket recovery retries. Boot warm-up and gap remediation can
+/// share one coherence generation while still being distinct recovery runs, so this
+/// local epoch ensures that only the newest run keeps issuing full LISTs. An older LIST
+/// already in flight can collide with one newer attempt, but it loses retry ownership;
+/// the newest run retains it and therefore converges instead of ping-ponging forever.
+#[derive(Clone, Default)]
+pub(super) struct FullSyncOwner(Arc<AtomicU64>);
+
+impl FullSyncOwner {
+    pub(super) fn claim(&self) -> FullSyncTicket {
+        let generation = self.0.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        FullSyncTicket {
+            owner: self.clone(),
+            generation,
+        }
+    }
+}
+
+/// One full-index recovery run's right to retry and affirm.
+#[derive(Clone)]
+pub(super) struct FullSyncTicket {
+    owner: FullSyncOwner,
+    generation: u64,
+}
+
+impl FullSyncTicket {
+    pub(super) fn is_current(&self) -> bool {
+        self.owner.0.load(Ordering::Acquire) == self.generation
+    }
+}
 
 /// The per-request `response-*` overrides on a read: headers the origin applies to that
 /// one response, and a property of the request rather than of the stored object. They
@@ -132,6 +165,38 @@ pub(super) fn observed_entry(observed: Option<&ObservedObject>) -> ObjEntry {
         storage_class: observed.storage_class.clone(),
         content_type: observed.content_type.clone(),
         meta: Some(Box::new(observed.meta.clone())),
+    }
+}
+
+/// A faithful index entry from the authoritative HEAD used to resolve an ambiguous
+/// mutation. The origin timestamp is the entry's LWW clock; falling back to the
+/// observation time is conservative for origins that omit it.
+fn authoritative_head_entry(
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> ObjEntry {
+    let last_modified = head
+        .last_modified()
+        .map_or_else(SystemTime::now, |modified| {
+            u64::try_from(modified.secs()).map_or_else(
+                |_| SystemTime::now(),
+                |secs| SystemTime::UNIX_EPOCH + Duration::new(secs, modified.subsec_nanos()),
+            )
+        });
+    ObjEntry {
+        size: head.content_length(),
+        last_modified,
+        etag: head.e_tag().and_then(|raw| raw.parse().ok()),
+        storage_class: head.storage_class().map_or_else(standard_class, |class| {
+            ObjectStorageClass::from(class.as_str().to_owned())
+        }),
+        content_type: head.content_type().map(str::to_owned),
+        meta: Some(Box::new(ObjMeta {
+            cache_control: head.cache_control().map(str::to_owned),
+            content_disposition: head.content_disposition().map(str::to_owned),
+            content_encoding: head.content_encoding().map(str::to_owned),
+            content_language: head.content_language().map(str::to_owned),
+            metadata: head.metadata().cloned(),
+        })),
     }
 }
 
@@ -260,7 +325,8 @@ impl IndexedWrite {
 /// Wait for every warm-up in `warmups`, then affirm to the coherence lease that this
 /// node has caught up and may serve locally again — on behalf of `generation`, so a gap
 /// that arrives while the warm-ups run supersedes the affirmation instead of being
-/// papered over by it.
+/// papered over by it. `full_sync` independently rejects an older boot/gap task when a
+/// newer full-index recovery shares the same coherence generation.
 ///
 /// With **no** buckets the join is vacuous and the affirmation is immediate, which is
 /// safe rather than a hole: a node told to warm nothing has empty tiers and a
@@ -274,12 +340,15 @@ pub(super) async fn affirm_after(
     warmups: Vec<tokio::task::JoinHandle<()>>,
     sync: Option<Arc<WriteSync>>,
     generation: Option<u64>,
+    full_sync: Option<FullSyncTicket>,
 ) {
     for warmup in warmups {
-        // A warm-up task only ends by succeeding (it retries forever otherwise), so a
-        // join error is this process shutting down — nothing to report and nothing left
-        // to affirm to.
+        // A warm-up ends after success or supersession. A join error is this process
+        // shutting down — nothing to report and nothing left to affirm to.
         let _ = warmup.await;
+    }
+    if full_sync.is_some_and(|ticket| !ticket.is_current()) {
+        return;
     }
     if let (Some(sync), Some(generation)) = (sync, generation) {
         sync.affirm_resynced(generation).await;
@@ -306,6 +375,8 @@ pub struct CachingProxy {
     /// Gossip write feed — the whole cross-node coherence layer, when
     /// configured (see [`crate::sync`]).
     pub(super) sync: Option<Arc<WriteSync>>,
+    /// The newest boot/gap full-index recovery allowed to retry and affirm.
+    full_sync_owner: FullSyncOwner,
     pub(super) metrics: Arc<Metrics>,
 }
 
@@ -333,6 +404,7 @@ impl CachingProxy {
             obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),
             max_obj_bytes: cfg.max_obj_bytes,
             sync,
+            full_sync_owner: FullSyncOwner::default(),
             metrics,
         }
     }
@@ -371,23 +443,61 @@ impl CachingProxy {
         let client = self.client.clone();
         let state = self.state.clone();
         let sync = self.sync.clone();
+        let full_sync_owner = self.full_sync_owner.clone();
         Arc::new(move || {
+            let full_sync = full_sync_owner.claim();
             let mut reset: std::collections::BTreeSet<String> =
                 state.read().unwrap().keys().cloned().collect();
             reset.extend(buckets.iter().cloned());
+            let mut first_generations = std::collections::BTreeMap::new();
             for bucket in reset {
-                begin_bucket_resync(&state, &bucket, None);
+                if !full_sync.is_current() {
+                    return;
+                }
+                let generation = begin_bucket_resync(&state, &bucket);
+                first_generations.insert(bucket, generation);
+            }
+            if !full_sync.is_current() {
+                return;
             }
             let (client, state, buckets) = (client.clone(), state.clone(), buckets.clone());
             let sync = sync.clone();
             let generation = sync.as_ref().map(|sync| sync.resync_gen());
             tokio::spawn(async move {
                 for bucket in buckets {
-                    if let Err(e) = sync_bucket_into(&client, &state, &bucket).await {
-                        tracing::warn!(
-                            "gap resync of `{bucket}` failed (staying passthrough): {e}"
-                        );
+                    if !full_sync.is_current() {
+                        return;
                     }
+                    let mut first_generation = first_generations.remove(&bucket);
+                    let mut backoff = SYNC_RETRY_MIN;
+                    loop {
+                        if !full_sync.is_current() {
+                            return;
+                        }
+                        let result = match first_generation.take() {
+                            Some(generation) => {
+                                sync_bucket_generation(&client, &state, &bucket, generation).await
+                            }
+                            None => sync_bucket_into(&client, &state, &bucket).await,
+                        };
+                        match result {
+                            Ok(_) => break,
+                            Err(error) => {
+                                if !full_sync.is_current() {
+                                    return;
+                                }
+                                tracing::warn!(
+                                    "gap resync of `{bucket}` failed (staying passthrough, \
+                                     retrying in {backoff:?}): {error}"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(SYNC_RETRY_MAX);
+                            }
+                        }
+                    }
+                }
+                if !full_sync.is_current() {
+                    return;
                 }
                 if let (Some(sync), Some(generation)) = (sync, generation) {
                     sync.affirm_resynced(generation).await;
@@ -450,7 +560,7 @@ impl CachingProxy {
         let Some(bucket) = g.get(input.bucket.as_str()).filter(|bucket| bucket.synced) else {
             return false;
         };
-        if bucket.uncertain_keys.contains(input.key.as_str()) {
+        if bucket.uncertain_keys.contains_key(input.key.as_str()) {
             return false;
         }
         let entry = bucket.keys.get(input.key.as_str());
@@ -477,49 +587,67 @@ impl CachingProxy {
         if_match_holds && if_none_match_holds
     }
 
-    /// Fence an ambiguously-mutated key and rebuild its bucket from the origin. The
-    /// generation is checked while each page is published and again at completion, so a
-    /// newer uncertainty cannot be cleared by this older task.
+    /// Fence an ambiguously-mutated key and reconcile only that key with an authoritative
+    /// origin HEAD. The exact key token is checked before the request and atomically with
+    /// its result, so neither a newer uncertainty nor a later definitive mutation can be
+    /// overwritten by this task.
     pub(super) fn reconcile_uncertain_put(&self, bucket: &str, key: &str, reason: &str) {
-        let generation = begin_bucket_resync(&self.state, bucket, Some(key));
+        let generation = fence_uncertain_key(&self.state, bucket, key);
         let client = self.client.clone();
         let state = self.state.clone();
         let bucket = bucket.to_owned();
         let key = key.to_owned();
         let reason = reason.to_owned();
         tracing::warn!(
-            "origin outcome for PUT `{bucket}/{key}` is uncertain ({reason}); fencing the key and rebuilding the bucket index"
+            "origin outcome for PUT `{bucket}/{key}` is uncertain ({reason}); fencing and reconciling the key with origin HEAD"
         );
         tokio::spawn(async move {
             let mut backoff = SYNC_RETRY_MIN;
-            let mut generation = generation;
             loop {
-                if !bucket_resync_is_current(&state, &bucket, generation) {
+                if !uncertain_key_is_current(&state, &bucket, &key, generation) {
                     return;
                 }
-                match sync_bucket_generation(&client, &state, &bucket, generation).await {
-                    Ok(found) => {
-                        info!(
-                            "reconciled uncertain PUT `{bucket}/{key}` from origin: {found} keys"
-                        );
+                match client.head_object().bucket(&bucket).key(&key).send().await {
+                    Ok(head) => {
+                        if resolve_uncertain_key(
+                            &state,
+                            &bucket,
+                            &key,
+                            generation,
+                            AuthoritativeKeyState::Present(authoritative_head_entry(&head)),
+                        ) {
+                            info!("reconciled uncertain PUT `{bucket}/{key}` as present");
+                        } else {
+                            tracing::debug!(
+                                "origin reconciliation of `{bucket}/{key}` was superseded"
+                            );
+                        }
                         return;
                     }
-                    Err(error) if !bucket_resync_is_current(&state, &bucket, generation) => {
-                        tracing::debug!(
-                            "origin reconciliation of `{bucket}/{key}` was superseded: {error}"
-                        );
+                    Err(error)
+                        if error.as_service_error().is_some_and(
+                            aws_sdk_s3::operation::head_object::HeadObjectError::is_not_found,
+                        ) =>
+                    {
+                        if resolve_uncertain_key(
+                            &state,
+                            &bucket,
+                            &key,
+                            generation,
+                            AuthoritativeKeyState::Absent,
+                        ) {
+                            info!("reconciled uncertain PUT `{bucket}/{key}` as absent");
+                        } else {
+                            tracing::debug!(
+                                "origin reconciliation of `{bucket}/{key}` was superseded"
+                            );
+                        }
                         return;
                     }
                     Err(error) => {
                         tracing::warn!(
                             "origin reconciliation of `{bucket}/{key}` failed (retrying in {backoff:?}): {error}"
                         );
-                        let Some(retry_generation) =
-                            restart_bucket_resync_if_current(&state, &bucket, generation)
-                        else {
-                            return;
-                        };
-                        generation = retry_generation;
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(SYNC_RETRY_MAX);
                     }
@@ -528,14 +656,14 @@ impl CachingProxy {
         });
     }
 
-    /// A key fenced by an ambiguous mutation may only be read from the origin until the
-    /// generation that fenced it has completed its rebuild.
+    /// A key fenced by an ambiguous mutation may only be read from the origin until its
+    /// exact reconciliation token is resolved or superseded.
     fn key_uncertain(&self, bucket: &str, key: &str) -> bool {
         self.state
             .read()
             .unwrap()
             .get(bucket)
-            .is_some_and(|bucket| bucket.uncertain_keys.contains(key))
+            .is_some_and(|bucket| bucket.uncertain_keys.contains_key(key))
     }
 
     /// Attach a write's session token to a response, when coherence is on.
@@ -620,19 +748,29 @@ impl CachingProxy {
     /// runs, so a gap arriving during warm-up supersedes this affirmation rather than
     /// being papered over by it.
     pub fn spawn_background_sync(&self, buckets: Vec<String>) {
+        let full_sync = self.full_sync_owner.claim();
+        let sync = self.sync.clone();
+        let generation = sync.as_ref().map(|sync| sync.resync_gen());
         let mut warmups = Vec::with_capacity(buckets.len());
         for bucket in buckets {
             let client = self.client.clone();
             let state = self.state.clone();
+            let full_sync = full_sync.clone();
             warmups.push(tokio::spawn(async move {
                 let mut backoff = SYNC_RETRY_MIN;
                 loop {
+                    if !full_sync.is_current() {
+                        return;
+                    }
                     match sync_bucket_into(&client, &state, &bucket).await {
                         Ok(n) => {
                             info!("warmed LIST index for `{bucket}`: {n} keys");
                             return;
                         }
                         Err(e) => {
+                            if !full_sync.is_current() {
+                                return;
+                            }
                             tracing::warn!(
                                 "background sync of `{bucket}` failed (staying passthrough, \
                                  retrying in {backoff:?}): {e}"
@@ -644,9 +782,7 @@ impl CachingProxy {
                 }
             }));
         }
-        let sync = self.sync.clone();
-        let generation = sync.as_ref().map(|sync| sync.resync_gen());
-        tokio::spawn(affirm_after(warmups, sync, generation));
+        tokio::spawn(affirm_after(warmups, sync, generation, Some(full_sync)));
     }
 
     /// Fold what an origin response proved into the index. An already-indexed key is
@@ -679,7 +815,7 @@ impl CachingProxy {
             content_type: observed.content_type.clone(),
             meta: Some(Box::new(observed.meta.clone())),
         };
-        if apply_put(&self.state, bucket, key, entry) {
+        if apply_observed_put(&self.state, bucket, key, entry) {
             self.metrics.write_indexed_observed();
         }
     }
@@ -696,7 +832,7 @@ impl CachingProxy {
             content_type: None,
             meta: None,
         };
-        if apply_put(&self.state, bucket, key, entry) {
+        if apply_observed_put(&self.state, bucket, key, entry) {
             self.metrics.write_indexed_observed();
         }
     }
@@ -899,6 +1035,11 @@ impl CachingProxy {
         resume_after: Option<&str>,
     ) -> Option<ListObjectsV2Output> {
         let g = self.state.read().unwrap();
+        if g.get(inp.bucket.as_str())
+            .is_some_and(|bucket| !bucket.uncertain_keys.is_empty())
+        {
+            return None;
+        }
         list_objects_v2_from_index(
             g.get(inp.bucket.as_str()).map(|b| &b.keys),
             inp,

@@ -658,7 +658,8 @@ async fn conditional_writes_keep_their_origin_semantics() {
 /// Cancellation after `MinIO` has applied a conditional PUT cannot cancel the proxy's
 /// coherence tail. The forwarder withholds that successful response, the caller is
 /// cancelled, and the response is then replaced with a 500: the detached tail must fence
-/// the stale local view and rebuild it before local HEAD/GET/LIST service resumes.
+/// the stale key and reconcile it with one authoritative HEAD before local service for
+/// that key resumes. The healthy bucket index must never be rebuilt for one key.
 #[tokio::test]
 async fn an_applied_put_survives_caller_cancellation_and_reconciles() {
     let origin = Origin::start("e2e-put-cancel").await;
@@ -711,26 +712,44 @@ async fn an_applied_put_survives_caller_cancellation_and_reconciles() {
             .is_cancelled(),
         "the inbound request future was actually dropped"
     );
-    let lists_before_reconciliation = origin.ops.list();
+    let (lists_before, heads_before) = (origin.ops.list(), origin.ops.head());
     origin.release_faulted_put();
 
     eventually!(
-        "the detached PUT tail to start an origin rebuild",
-        origin.ops.list() > lists_before_reconciliation
+        "the detached PUT tail to issue its reconciliation request",
+        origin.ops.head() > heads_before || origin.ops.list() > lists_before
     );
-    wait_for_index(&proxy, &origin, bucket).await;
+    assert!(
+        origin.ops.head() > heads_before,
+        "an uncertain key must reconcile with HEAD"
+    );
+    assert_eq!(
+        origin.ops.list(),
+        lists_before,
+        "one uncertain key must not rebuild the bucket"
+    );
+    let expected_etag = origin.etag("writer").await;
+    eventually!("the reconciled HEAD to become locally serveable", {
+        let heads = origin.ops.head();
+        let current = head(&proxy, bucket, "writer")
+            .await
+            .ok()
+            .and_then(|head| head.e_tag)
+            .map(ETag::into_value);
+        current == expected_etag && origin.ops.head() == heads
+    });
     let rebuilt = list_entry(&proxy, bucket, "writer").await;
     assert_eq!(
         rebuilt,
-        Some((7, origin.etag("writer").await)),
-        "the origin rebuild replaced the stale index ETag"
+        Some((7, expected_etag.clone())),
+        "the key HEAD replaced only the stale index row"
     );
-    let reconciled = head(&proxy, bucket, "writer")
-        .await
-        .expect("HEAD converges to the applied mutation")
-        .e_tag
-        .expect("the reconciled writer has an ETag")
-        .into_value();
+    assert_eq!(
+        origin.ops.list(),
+        lists_before,
+        "LIST resumed locally without rebuilding the retained index"
+    );
+    let reconciled = expected_etag.expect("the reconciled origin object has an ETag");
     assert_eq!(get(&proxy, bucket, "writer").await, "epoch-2");
 
     put_conditional(

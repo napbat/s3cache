@@ -269,12 +269,17 @@ pub(crate) struct BucketState {
     /// Deleted keys and when: consulted by [`apply_put`], pruned amortized.
     pub(crate) gone: BTreeMap<String, SystemTime>,
     /// Generation of the origin rebuild currently allowed to publish into this bucket.
-    /// A mutation whose outcome is ambiguous increments it before starting a rebuild, so
-    /// an older in-flight LIST cannot make the bucket authoritative again.
+    /// Fencing an ambiguous key advances it without discarding the retained snapshot,
+    /// so an older in-flight LIST cannot publish across that uncertainty.
     pub(crate) sync_generation: u64,
-    /// Keys whose last mutation outcome is not yet reconciled with the origin. Reads of
-    /// these keys stay origin-only until the matching bucket rebuild completes.
-    pub(crate) uncertain_keys: BTreeSet<String>,
+    /// `Some(generation)` only while that generation began by clearing the bucket. This
+    /// prevents a merge-only retry from treating retained partial rows as proof that an
+    /// absent key is gone and clearing its fence.
+    rebuild_generation: Option<u64>,
+    /// Keys whose last mutation outcome is not yet reconciled with the origin, paired
+    /// with the generation that fenced each key. Reads of these keys stay origin-only;
+    /// only an exact-token HEAD result or a newer definitive mutation may clear one.
+    pub(crate) uncertain_keys: BTreeMap<String, u64>,
     stats: IndexStats,
 }
 
@@ -296,13 +301,43 @@ const TOMBSTONE_TTL: Duration = Duration::from_hours(1);
 /// Tombstones per bucket before an amortized TTL prune runs.
 const TOMBSTONE_PRUNE_LEN: usize = 65_536;
 
-/// Applies an observed put (a local write, a peer's feed event, or a read
-/// observation) by per-key last-writer-wins: a strictly newer entry or an
+/// Whether an accepted put is a definitive mutation that supersedes an uncertainty, or
+/// a read/list observation that must leave a fence for its authoritative HEAD owner.
+#[derive(Clone, Copy)]
+enum PutAuthority {
+    DefinitiveMutation,
+    Observation,
+}
+
+/// Applies a definitive put (a local write or a peer's feed event) by per-key
+/// last-writer-wins: a strictly newer entry or an
 /// equal-or-newer tombstone rejects it; ties between puts fall to
 /// last-applied (cross-writer same-microsecond puts are healed by the next
 /// origin sync). `entry.last_modified` is the write's timestamp — the LWW
-/// clock. Returns whether the index changed.
+/// clock. An accepted definitive mutation supersedes any uncertainty for this key.
+/// Returns whether the index changed.
 pub(crate) fn apply_put(state: &KeyIndex, bucket: &str, key: &str, entry: ObjEntry) -> bool {
+    apply_put_with_authority(state, bucket, key, entry, PutAuthority::DefinitiveMutation)
+}
+
+/// Applies a read or LIST observation without letting it supersede a per-key
+/// uncertainty. An observation may have started before the ambiguous mutation.
+pub(crate) fn apply_observed_put(
+    state: &KeyIndex,
+    bucket: &str,
+    key: &str,
+    entry: ObjEntry,
+) -> bool {
+    apply_put_with_authority(state, bucket, key, entry, PutAuthority::Observation)
+}
+
+fn apply_put_with_authority(
+    state: &KeyIndex,
+    bucket: &str,
+    key: &str,
+    entry: ObjEntry,
+    authority: PutAuthority,
+) -> bool {
     let ts = entry.last_modified;
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
@@ -320,29 +355,109 @@ pub(crate) fn apply_put(state: &KeyIndex, bucket: &str, key: &str, entry: ObjEnt
         .as_ref()
         .map_or_else(IndexStats::default, IndexStats::for_entry);
     account_replacement(b, stats, previous, current);
+    if matches!(authority, PutAuthority::DefinitiveMutation) {
+        b.uncertain_keys.remove(key);
+    }
     true
 }
 
-/// Reset a bucket to origin-serving state and advance the generation that may rebuild it.
-/// `uncertain_key` is retained across overlapping resets because the newest full rebuild
-/// covers every earlier uncertainty too. Returns the new generation.
-pub(crate) fn begin_bucket_resync(
+/// Fence one ambiguous key without disturbing the bucket's authoritative snapshot,
+/// synced state, or aggregate accounting. Advancing the bucket generation invalidates
+/// any full LIST that began before this uncertainty. Returns the key's reconciliation
+/// token.
+pub(crate) fn fence_uncertain_key(state: &KeyIndex, bucket: &str, key: &str) -> u64 {
+    let mut index = state.inner.write().unwrap();
+    let bucket = index.buckets.entry(bucket.to_owned()).or_default();
+    let generation = bucket.sync_generation.wrapping_add(1);
+    bucket.sync_generation = generation;
+    bucket.rebuild_generation = None;
+    bucket.uncertain_keys.insert(key.to_owned(), generation);
+    generation
+}
+
+/// Whether `generation` still owns reconciliation of this exact key.
+pub(crate) fn uncertain_key_is_current(
     state: &KeyIndex,
     bucket: &str,
-    uncertain_key: Option<&str>,
-) -> u64 {
+    key: &str,
+    generation: u64,
+) -> bool {
+    state
+        .read()
+        .unwrap()
+        .get(bucket)
+        .and_then(|bucket| bucket.uncertain_keys.get(key))
+        .is_some_and(|current| *current == generation)
+}
+
+/// The authoritative result of a per-key origin HEAD.
+pub(crate) enum AuthoritativeKeyState {
+    Present(ObjEntry),
+    Absent,
+}
+
+/// Apply an authoritative HEAD result only while its exact fence token is current.
+/// `Present` faithfully replaces that key; `Absent` removes and tombstones it. The
+/// target fence and accounting change atomically, while every other key is untouched.
+pub(crate) fn resolve_uncertain_key(
+    state: &KeyIndex,
+    bucket: &str,
+    key: &str,
+    generation: u64,
+    authoritative: AuthoritativeKeyState,
+) -> bool {
+    let mut index = state.inner.write().unwrap();
+    let KeyIndexState { buckets, stats } = &mut *index;
+    let Some(b) = buckets.get_mut(bucket) else {
+        return false;
+    };
+    if b.uncertain_keys.get(key) != Some(&generation) {
+        return false;
+    }
+    match authoritative {
+        AuthoritativeKeyState::Present(entry) => {
+            b.gone.remove(key);
+            let current = IndexStats::for_entry(&entry);
+            let previous = b
+                .keys
+                .insert(key.to_owned(), entry)
+                .as_ref()
+                .map_or_else(IndexStats::default, IndexStats::for_entry);
+            account_replacement(b, stats, previous, current);
+        }
+        AuthoritativeKeyState::Absent => {
+            let ts = SystemTime::now();
+            let dead = b.gone.entry(key.to_owned()).or_insert(ts);
+            if *dead < ts {
+                *dead = ts;
+            }
+            if let Some(previous) = b.keys.remove(key) {
+                account_replacement(
+                    b,
+                    stats,
+                    IndexStats::for_entry(&previous),
+                    IndexStats::default(),
+                );
+            }
+        }
+    }
+    b.uncertain_keys.remove(key);
+    true
+}
+
+/// Reset a bucket to origin-serving state and advance the generation that may rebuild
+/// it. Retained fence tokens all predate this clean snapshot; exact-current completion
+/// may therefore clear them. Returns the new generation.
+pub(crate) fn begin_bucket_resync(state: &KeyIndex, bucket: &str) -> u64 {
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
     let previous = buckets.remove(bucket).unwrap_or_default();
     let generation = previous.sync_generation.wrapping_add(1);
-    let mut uncertain_keys = previous.uncertain_keys;
     stats.replace(previous.stats, IndexStats::default());
-    if let Some(key) = uncertain_key {
-        uncertain_keys.insert(key.to_owned());
-    }
     let replacement = BucketState {
         sync_generation: generation,
-        uncertain_keys,
+        rebuild_generation: Some(generation),
+        uncertain_keys: previous.uncertain_keys,
         ..BucketState::default()
     };
     buckets.insert(bucket.to_owned(), replacement);
@@ -351,6 +466,7 @@ pub(crate) fn begin_bucket_resync(
 
 /// Discard a failed rebuild's partial rows and advance to a clean retry, but only while
 /// `generation` still owns the bucket. `None` means a newer fence already superseded it.
+#[cfg(test)]
 pub(crate) fn restart_bucket_resync_if_current(
     state: &KeyIndex,
     bucket: &str,
@@ -359,13 +475,14 @@ pub(crate) fn restart_bucket_resync_if_current(
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
     let current = buckets.get(bucket)?;
-    if current.sync_generation != generation {
+    if current.sync_generation != generation || current.rebuild_generation != Some(generation) {
         return None;
     }
     let previous = buckets.remove(bucket).unwrap_or_default();
     let next = generation.wrapping_add(1);
     let replacement = BucketState {
         sync_generation: next,
+        rebuild_generation: Some(next),
         uncertain_keys: previous.uncertain_keys,
         ..BucketState::default()
     };
@@ -374,17 +491,10 @@ pub(crate) fn restart_bucket_resync_if_current(
     Some(next)
 }
 
-/// Whether `generation` is still the rebuild authorised for `bucket`.
-pub(crate) fn bucket_resync_is_current(state: &KeyIndex, bucket: &str, generation: u64) -> bool {
-    state
-        .read()
-        .unwrap()
-        .get(bucket)
-        .is_some_and(|state| state.sync_generation == generation)
-}
-
 /// Applies an observed delete: removes any not-newer entry and records a
-/// tombstone (see [`apply_put`]). Returns whether a live entry was removed.
+/// tombstone (see [`apply_put`]). A delete only supersedes an uncertainty when it is
+/// not older than either the retained live entry or tombstone. Returns whether a live
+/// entry was removed.
 pub(crate) fn apply_del(state: &KeyIndex, bucket: &str, key: &str, ts: SystemTime) -> bool {
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
@@ -394,6 +504,7 @@ pub(crate) fn apply_del(state: &KeyIndex, bucket: &str, key: &str, ts: SystemTim
     {
         b.gone.retain(|_, dead| *dead >= cutoff);
     }
+    let newer_tombstone = b.gone.get(key).is_some_and(|dead| *dead > ts);
     let dead = b.gone.entry(key.to_owned()).or_insert(ts);
     if *dead < ts {
         *dead = ts;
@@ -401,16 +512,21 @@ pub(crate) fn apply_del(state: &KeyIndex, bucket: &str, key: &str, ts: SystemTim
     if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
         return false; // the key was rewritten after this delete
     }
-    let Some(previous) = b.keys.remove(key) else {
+    if newer_tombstone {
         return false;
-    };
-    account_replacement(
-        b,
-        stats,
-        IndexStats::for_entry(&previous),
-        IndexStats::default(),
-    );
-    true
+    }
+    b.uncertain_keys.remove(key);
+    if let Some(previous) = b.keys.remove(key) {
+        account_replacement(
+            b,
+            stats,
+            IndexStats::for_entry(&previous),
+            IndexStats::default(),
+        );
+        true
+    } else {
+        false
+    }
 }
 
 /// Completes an indexed entry from an origin response: fills the fields it does not
@@ -600,11 +716,10 @@ pub(crate) fn head_object_from_index(
     }))
 }
 
-/// Folds listed rows into `state` through [`apply_put`], so a bootstrap or a gap resync
-/// obeys exactly the tombstones and per-key last-writer-wins a write does: the origin's
-/// view of a key is old news the moment a newer local write or a delete has been applied,
-/// and folding it in raw would resurrect deleted keys and clobber fresh ones. Returns how
-/// many rows the origin listed (not how many changed).
+/// Folds listed rows into `state` through [`apply_observed_put`], so a bootstrap or a gap
+/// resync obeys exactly the tombstones and per-key last-writer-wins a write does without
+/// letting one row clear a per-key fence. Returns how many rows the origin listed (not
+/// how many changed).
 #[cfg(test)]
 pub(crate) fn sync_listing_into(
     state: &KeyIndex,
@@ -613,7 +728,7 @@ pub(crate) fn sync_listing_into(
 ) -> usize {
     let mut found = 0usize;
     for (key, entry) in rows {
-        apply_put(state, bucket, &key, entry);
+        apply_observed_put(state, bucket, &key, entry);
         found += 1;
     }
     found
@@ -631,7 +746,7 @@ fn sync_listing_into_generation(
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
     let b = buckets.entry(bucket.to_owned()).or_default();
-    if b.sync_generation != generation {
+    if b.sync_generation != generation || b.rebuild_generation != Some(generation) {
         return None;
     }
     let mut found = 0usize;
@@ -659,39 +774,35 @@ fn sync_listing_into_generation(
 fn finish_bucket_sync_generation(state: &KeyIndex, bucket: &str, generation: u64) -> bool {
     let mut index = state.inner.write().unwrap();
     let b = index.buckets.entry(bucket.to_owned()).or_default();
-    if b.sync_generation != generation {
+    if b.sync_generation != generation || b.rebuild_generation != Some(generation) {
         return false;
     }
     b.synced = true;
+    b.rebuild_generation = None;
     b.uncertain_keys.clear();
     true
 }
 
-/// Full paginated LIST of a bucket into `state`, then mark it synced. Merges (never
-/// clears) so a write that raced the sync isn't lost. Free-standing (takes the client +
-/// shared index) so the background warm-up task can run it without borrowing the proxy,
-/// which the S3 service owns by value.
+/// Full paginated LIST of a bucket into `state`, then mark it synced. Every invocation
+/// starts from a clean generation, so keys absent from the snapshot cannot survive a
+/// prior partial attempt; writes racing that generation still merge through per-key LWW.
+/// Free-standing (takes the client + shared index) so the background warm-up task can
+/// run it without borrowing the proxy, which the S3 service owns by value.
 ///
 /// # Errors
 ///
 /// The upstream LIST error, leaving the bucket unsynced (and therefore passthrough).
+/// The caller retries through this function, whose next clean generation discards any
+/// rows retained by the failed attempt.
 pub(crate) async fn sync_bucket_into(
     client: &aws_sdk_s3::Client,
     state: &KeyIndex,
     bucket: &str,
 ) -> anyhow::Result<usize> {
-    let generation = {
-        let mut index = state.inner.write().unwrap();
-        let bucket = index.buckets.entry(bucket.to_owned()).or_default();
-        bucket.sync_generation
-    };
-    let result = sync_bucket_generation(client, state, bucket, generation).await;
-    if result.is_err() {
-        // A failed page must not remain to be mistaken for part of a later successful
-        // snapshot. If another fence already moved the generation, it owns the reset.
-        restart_bucket_resync_if_current(state, bucket, generation);
-    }
-    result
+    // Absence is authoritative only after a clean snapshot. In particular, a retry
+    // after a per-key fence must not merge into rows retained from a partial attempt.
+    let generation = begin_bucket_resync(state, bucket);
+    sync_bucket_generation(client, state, bucket, generation).await
 }
 
 /// Full paginated LIST for one already-established rebuild generation. A newer reset
@@ -768,11 +879,12 @@ pub(crate) async fn sync_bucket_generation(
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_MTIME_SLACK, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry, ObjMeta,
-        apply_del, apply_put, begin_bucket_resync, complete_entry, entry_matches_body,
-        finish_bucket_sync_generation, head_object_from_index, list_objects_v2_from_index,
+        AuthoritativeKeyState, BODY_MTIME_SLACK, Completion, EntryFill, IndexedHead, KeyIndex,
+        ObjEntry, ObjMeta, apply_del, apply_put, begin_bucket_resync, complete_entry,
+        entry_matches_body, fence_uncertain_key, finish_bucket_sync_generation,
+        head_object_from_index, list_objects_v2_from_index, resolve_uncertain_key,
         restart_bucket_resync_if_current, standard_class, sync_listing_into,
-        sync_listing_into_generation,
+        sync_listing_into_generation, uncertain_key_is_current,
     };
     use crate::list_token::{Continuation, classify};
     use crate::tier::CachedObject;
@@ -885,13 +997,120 @@ mod tests {
         assert_eq!(size_of(&state, "fresh"), Some(3));
     }
 
+    /// Fencing changes only the target key's routing state: a healthy snapshot and its
+    /// aggregate accounting remain immediately useful for every other key.
+    #[test]
+    fn fencing_one_key_preserves_the_synced_snapshot_and_stats() {
+        let state = Index::default();
+        assert!(put(&state, "stable", 10, 10));
+        assert!(put(&state, "uncertain", 20, 10));
+        state.mark_bucket_synced("b");
+        let baseline = state.stats();
+
+        let token = fence_uncertain_key(&state, "b", "uncertain");
+        let g = state.read().unwrap();
+        let bucket = &g["b"];
+        assert!(bucket.synced);
+        assert_eq!(bucket.keys.len(), 2);
+        assert_eq!(bucket.uncertain_keys.get("uncertain"), Some(&token));
+        drop(g);
+        assert_eq!(state.stats(), baseline);
+
+        assert_eq!(
+            sync_listing_into_generation(&state, "b", token, std::iter::empty()),
+            None,
+            "a fence generation is not a clean full-LIST generation"
+        );
+        assert!(!finish_bucket_sync_generation(&state, "b", token));
+        assert!(resolve_uncertain_key(
+            &state,
+            "b",
+            "uncertain",
+            token,
+            AuthoritativeKeyState::Present(entry(25, 20))
+        ));
+        assert_eq!(size_of(&state, "stable"), Some(10));
+        assert_eq!(size_of(&state, "uncertain"), Some(25));
+        assert_eq!(state.stats().logical_bytes, 35);
+        assert!(state.read().unwrap()["b"].synced);
+
+        let absent_token = fence_uncertain_key(&state, "b", "uncertain");
+        assert!(resolve_uncertain_key(
+            &state,
+            "b",
+            "uncertain",
+            absent_token,
+            AuthoritativeKeyState::Absent
+        ));
+        assert_eq!(size_of(&state, "uncertain"), None);
+        assert_eq!(state.stats().logical_bytes, 10);
+        assert!(state.read().unwrap()["b"].uncertain_keys.is_empty());
+        assert!(
+            !put(&state, "uncertain", 99, 20),
+            "the authoritative absence leaves a tombstone against an older event"
+        );
+    }
+
+    /// An old reconciliation result cannot overwrite a newer definitive write or
+    /// resurrect a key after a newer definitive delete. An older delete is not enough
+    /// to supersede the fence protecting a newer retained live entry.
+    #[test]
+    fn an_old_head_token_cannot_overwrite_a_newer_mutation() {
+        let state = Index::default();
+        assert!(put(&state, "k", 1, 10));
+        let put_token = fence_uncertain_key(&state, "b", "k");
+        let newer_fence = fence_uncertain_key(&state, "b", "k");
+        assert!(!resolve_uncertain_key(
+            &state,
+            "b",
+            "k",
+            put_token,
+            AuthoritativeKeyState::Present(entry(99, 20))
+        ));
+        assert!(uncertain_key_is_current(&state, "b", "k", newer_fence));
+        assert!(put(&state, "k", 2, 30));
+        assert!(!uncertain_key_is_current(&state, "b", "k", newer_fence));
+        assert!(!resolve_uncertain_key(
+            &state,
+            "b",
+            "k",
+            newer_fence,
+            AuthoritativeKeyState::Present(entry(99, 20))
+        ));
+        assert_eq!(size_of(&state, "k"), Some(2));
+
+        let delete_token = fence_uncertain_key(&state, "b", "k");
+        assert!(!apply_del(&state, "b", "k", ts(25)));
+        assert!(uncertain_key_is_current(&state, "b", "k", delete_token));
+        assert!(apply_del(&state, "b", "k", ts(40)));
+        assert!(!resolve_uncertain_key(
+            &state,
+            "b",
+            "k",
+            delete_token,
+            AuthoritativeKeyState::Present(entry(99, 50))
+        ));
+        assert_eq!(size_of(&state, "k"), None);
+    }
+
     /// Once a newer uncertainty fences a bucket, an older rebuild may neither publish a
-    /// late page nor clear the newer key's origin-only marker at completion.
+    /// late page nor clear any key's origin-only marker. A later rebuild can clear the
+    /// fences only because it starts by discarding every retained partial row.
     #[test]
     fn a_superseded_rebuild_cannot_clear_a_newer_uncertainty() {
         let state = Index::default();
-        let older = begin_bucket_resync(&state, "b", Some("first"));
-        let current = begin_bucket_resync(&state, "b", Some("second"));
+        let older = begin_bucket_resync(&state, "b");
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                older,
+                [("partial".to_owned(), entry(1, 10))]
+            ),
+            Some(1)
+        );
+        let first = fence_uncertain_key(&state, "b", "first");
+        let second = fence_uncertain_key(&state, "b", "second");
 
         assert_eq!(
             sync_listing_into_generation(&state, "b", older, [("stale".to_owned(), entry(1, 10))]),
@@ -906,11 +1125,14 @@ mod tests {
             assert_eq!(
                 bucket
                     .uncertain_keys
-                    .iter()
+                    .keys()
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
                 ["first", "second"]
             );
+            assert_eq!(bucket.uncertain_keys.get("first"), Some(&first));
+            assert_eq!(bucket.uncertain_keys.get("second"), Some(&second));
+            assert!(bucket.keys.contains_key("partial"));
             assert!(!bucket.keys.contains_key("stale"));
         }
 
@@ -918,16 +1140,33 @@ mod tests {
             sync_listing_into_generation(
                 &state,
                 "b",
-                current,
-                [("fresh".to_owned(), entry(2, 20))]
+                second,
+                [("unsafe-merge".to_owned(), entry(2, 20))]
             ),
-            Some(1)
+            None,
+            "a fence token cannot bless retained partial rows as a full snapshot"
+        );
+        let current = begin_bucket_resync(&state, "b");
+        assert!(!state.read().unwrap()["b"].keys.contains_key("partial"));
+        assert!(put(&state, "racing-write", 9, 30));
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                current,
+                [
+                    ("fresh".to_owned(), entry(2, 20)),
+                    ("racing-write".to_owned(), entry(1, 20))
+                ]
+            ),
+            Some(2)
         );
         assert!(finish_bucket_sync_generation(&state, "b", current));
         let g = state.read().unwrap();
         assert!(g["b"].synced);
         assert!(g["b"].uncertain_keys.is_empty());
         assert!(g["b"].keys.contains_key("fresh"));
+        assert_eq!(g["b"].keys["racing-write"].size, Some(9));
     }
 
     /// A failed paginated attempt may have published rows before the failing page. The
@@ -936,7 +1175,8 @@ mod tests {
     #[test]
     fn a_retry_discards_rows_from_its_failed_partial_attempt() {
         let state = Index::default();
-        let failed = begin_bucket_resync(&state, "b", Some("writer"));
+        fence_uncertain_key(&state, "b", "writer");
+        let failed = begin_bucket_resync(&state, "b");
         assert_eq!(
             sync_listing_into_generation(
                 &state,
@@ -1021,7 +1261,7 @@ mod tests {
             }
         );
 
-        let generation = begin_bucket_resync(&state, "b", None);
+        let generation = begin_bucket_resync(&state, "b");
         assert_eq!(
             state.stats(),
             super::IndexStats::default(),
