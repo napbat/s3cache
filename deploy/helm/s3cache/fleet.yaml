@@ -13,7 +13,7 @@ helm:
     # routine image rollouts.
     replicaCount: 2
     image:
-      tag: 1e8affd22d5ee3b39143257778266703b8af95be
+      tag: 610c630a794cfa829a1a9b68f35a2b9c97a173c1
     upstream:
       endpoint: https://e340c486028724e7b58d09928fdf10e2.r2.cloudflarestorage.com
       buckets: docres
