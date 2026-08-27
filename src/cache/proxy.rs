@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -12,7 +11,7 @@ use tracing::info;
 
 use crate::cache::copy;
 use crate::index::{
-    BucketState, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del, apply_put,
+    Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry, ObjMeta, apply_del, apply_put,
     begin_bucket_resync, bucket_resync_is_current, complete_entry, entry_matches_body,
     head_object_from_index, list_objects_v2_from_index, restart_bucket_resync_if_current,
     standard_class, sync_bucket_generation, sync_bucket_into,
@@ -299,7 +298,7 @@ pub struct CachingProxy {
     pub(super) client: aws_sdk_s3::Client,
     /// The LIST index, `Arc` so the background warm-up task shares it with the serving
     /// proxy (the service takes the proxy by value, so the sync can't borrow `self`).
-    pub(super) state: Arc<RwLock<HashMap<String, BucketState>>>,
+    pub(super) state: Arc<KeyIndex>,
     /// Object-body cache: hot heap in front of an optional node-local disk tier.
     pub(super) obj_cache: TieredCache,
     /// Objects larger than this are never cached (segments stream straight through).
@@ -324,11 +323,13 @@ impl CachingProxy {
         metrics: Arc<Metrics>,
     ) -> Self {
         let copy_client = copy::conditioned_client(&client);
+        let state = Arc::new(KeyIndex::default());
+        metrics.register_index(Arc::clone(&state));
         Self {
             inner: Arc::new(inner),
             copy_inner: Arc::new(s3s_aws::Proxy::from(copy_client)),
             client,
-            state: Arc::new(RwLock::new(HashMap::new())),
+            state,
             obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),
             max_obj_bytes: cfg.max_obj_bytes,
             sync,

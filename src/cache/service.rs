@@ -468,7 +468,7 @@ impl s3s::S3 for CachingProxy {
         // The bucket is gone; its index is not, and would go on answering LIST from a
         // key set the origin no longer has — and HEADs of those keys as authoritative
         // 404s of the wrong kind. Dropping the state returns the name to passthrough.
-        self.state.write().unwrap().remove(&bucket);
+        self.state.remove_bucket(&bucket);
         Ok(resp)
     }
 

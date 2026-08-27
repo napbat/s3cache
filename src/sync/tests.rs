@@ -1,6 +1,5 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use groupnet::consistency::{CAP_ACKS, CAP_LEASE, LeaseConfig, WriteFeed};
@@ -10,7 +9,7 @@ use groupnet::transport::mem::{MemTransport, Network};
 use groupnet::transport::{Inbound, Transport};
 use s3s::dto::GetObjectOutput;
 
-use crate::index::{BucketState, ObjEntry, standard_class};
+use crate::index::{KeyIndex, ObjEntry, standard_class};
 use crate::metrics::Metrics;
 use crate::sync::coherence::{
     AFFIRM_POLL, CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, FEED_CAPACITY, WriteSync, WriteWait,
@@ -23,7 +22,7 @@ use crate::sync::wire::{
 };
 use crate::tier::{CachedObject, LocalCache, TieredCache};
 
-type Index = Arc<RwLock<HashMap<String, BucketState>>>;
+type Index = Arc<KeyIndex>;
 
 /// A lease short enough to watch lapse inside a test, and still comfortably inside
 /// its own envelope: `D = 300ms`, renewed every 100ms, 5ms of rate margin.
@@ -185,7 +184,7 @@ fn start_watching(
     resyncs: &Arc<AtomicU64>,
     metrics: &Arc<Metrics>,
 ) -> Index {
-    let state: Index = Arc::new(RwLock::new(HashMap::new()));
+    let state = Arc::new(KeyIndex::default());
     let local: LocalCache = cache.local();
     sync.start_apply(
         local,
@@ -321,7 +320,7 @@ fn wired_pair_named(
     let (b_id, _b_node, b_group) = spawn_node(net, ids.1, ids.0);
     let metrics = Arc::new(Metrics::default());
     let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
-    let state: Index = Arc::new(RwLock::new(HashMap::new()));
+    let state = Arc::new(KeyIndex::default());
     let sync_b = Arc::new(attach(b_group, b_id, consistency));
     sync_b.start_apply(cache.local(), state.clone(), Arc::new(|| {}), metrics);
     let sync_a = attach(a_group, a_id, consistency);
@@ -577,6 +576,8 @@ async fn peer_events_fold_into_index_and_invalidate() {
         "put reaches the peer index",
     )
     .await;
+    assert_eq!(state.stats().objects, 1);
+    assert_eq!(state.stats().logical_bytes, 42);
     let entry = indexed(&state, "bkt", "obj").expect("the peer indexed the write");
     assert_eq!(
         entry.etag.as_ref().map(s3s::dto::ETag::value),
@@ -606,6 +607,8 @@ async fn peer_events_fold_into_index_and_invalidate() {
         "delete reaches the peer index",
     )
     .await;
+    assert_eq!(state.stats().objects, 0);
+    assert_eq!(state.stats().logical_bytes, 0);
 }
 
 /// The strict-LIST barrier: after a publish, `await_fresh` on the peer

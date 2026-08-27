@@ -3,8 +3,8 @@
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,6 +16,8 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tierstore_mmap::MmapDiskStats;
 use tokio::net::TcpListener;
 use tracing::info;
+
+use crate::index::{IndexStats, KeyIndex};
 
 /// Declares the event-counter set once: the fields, a bump method per counter, the stats
 /// line, and the Prometheus exposition — all generated in declaration order. Warm
@@ -34,6 +36,7 @@ macro_rules! counters {
             warm_disk_budget_bytes: AtomicU64,
             warm_evictions: AtomicU64,
             warm_evicted_bytes: AtomicU64,
+            index: RwLock<Option<Arc<KeyIndex>>>,
         }
 
         impl Metrics {
@@ -64,9 +67,23 @@ macro_rules! counters {
                 self.warm_evicted_bytes.store(stats.evicted_bytes, Ordering::Relaxed);
             }
 
+            /// Attach the index whose current footprint this metric set exports.
+            pub(crate) fn register_index(&self, index: Arc<KeyIndex>) {
+                *self.index.write().unwrap() = Some(index);
+            }
+
+            fn index_stats(&self) -> IndexStats {
+                self.index
+                    .read()
+                    .unwrap()
+                    .as_deref()
+                    .map_or_else(IndexStats::default, KeyIndex::stats)
+            }
+
             /// The counters as one `name=value …` line.
             fn stats_line(&self) -> String {
                 let mut line = String::new();
+                let index = self.index_stats();
                 $(
                     let _ = write!(
                         line,
@@ -76,8 +93,11 @@ macro_rules! counters {
                 )+
                 let _ = write!(
                     line,
-                    " warm_entries={} warm_mapped_entries={} warm_disk_bytes={} \
+                    " index_objects={} index_logical_bytes={} warm_entries={} \
+                     warm_mapped_entries={} warm_disk_bytes={} \
                      warm_disk_budget_bytes={} warm_evictions={} warm_evicted_bytes={}",
+                    index.objects,
+                    index.logical_bytes,
                     self.warm_entries.load(Ordering::Relaxed),
                     self.warm_mapped_entries.load(Ordering::Relaxed),
                     self.warm_disk_bytes.load(Ordering::Relaxed),
@@ -93,6 +113,7 @@ macro_rules! counters {
             #[must_use]
             pub fn prometheus_text(&self) -> String {
                 let mut out = String::new();
+                let index = self.index_stats();
                 $(
                     let _ = writeln!(
                         out,
@@ -105,12 +126,16 @@ macro_rules! counters {
                 )+
                 let _ = writeln!(
                     out,
-                    "# TYPE s3cache_warm_entries gauge\ns3cache_warm_entries {}\
+                    "# TYPE s3cache_index_objects gauge\ns3cache_index_objects {}\
+                     \n# TYPE s3cache_index_logical_bytes gauge\ns3cache_index_logical_bytes {}\
+                     \n# TYPE s3cache_warm_entries gauge\ns3cache_warm_entries {}\
                      \n# TYPE s3cache_warm_mapped_entries gauge\ns3cache_warm_mapped_entries {}\
                      \n# TYPE s3cache_warm_disk_bytes gauge\ns3cache_warm_disk_bytes {}\
                      \n# TYPE s3cache_warm_disk_budget_bytes gauge\ns3cache_warm_disk_budget_bytes {}\
                      \n# TYPE s3cache_warm_evictions counter\ns3cache_warm_evictions {}\
                      \n# TYPE s3cache_warm_evicted_bytes counter\ns3cache_warm_evicted_bytes {}",
+                    index.objects,
+                    index.logical_bytes,
                     self.warm_entries.load(Ordering::Relaxed),
                     self.warm_mapped_entries.load(Ordering::Relaxed),
                     self.warm_disk_bytes.load(Ordering::Relaxed),
@@ -330,7 +355,10 @@ fn scrape(metrics: &Metrics, method: &Method, path: &str) -> Response<Full<Bytes
 #[cfg(test)]
 mod tests {
     use super::{Metrics, scrape};
+    use crate::index::{KeyIndex, ObjEntry, apply_put, standard_class};
     use http::{Method, StatusCode};
+    use std::sync::Arc;
+    use std::time::SystemTime;
     use tierstore_mmap::MmapDiskStats;
 
     #[test]
@@ -365,7 +393,9 @@ mod tests {
             let (name, value) = entry.split_once('=').expect("name=value");
             let kind = if matches!(
                 name,
-                "warm_entries"
+                "index_objects"
+                    | "index_logical_bytes"
+                    | "warm_entries"
                     | "warm_mapped_entries"
                     | "warm_disk_bytes"
                     | "warm_disk_budget_bytes"
@@ -414,6 +444,38 @@ mod tests {
         ] {
             assert!(text.contains(sample), "missing {sample}: {text}");
         }
+    }
+
+    #[test]
+    fn index_footprint_is_rendered_as_prometheus_gauges() {
+        let metrics = Metrics::default();
+        let index = Arc::new(KeyIndex::default());
+        metrics.register_index(Arc::clone(&index));
+        apply_put(
+            &index,
+            "bucket",
+            "key",
+            ObjEntry {
+                size: Some(4096),
+                last_modified: SystemTime::now(),
+                etag: None,
+                storage_class: standard_class(),
+                content_type: None,
+                meta: None,
+            },
+        );
+
+        let text = metrics.prometheus_text();
+        assert!(
+            text.contains("# TYPE s3cache_index_objects gauge\ns3cache_index_objects 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "# TYPE s3cache_index_logical_bytes gauge\ns3cache_index_logical_bytes 4096\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

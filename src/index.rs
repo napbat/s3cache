@@ -16,8 +16,8 @@
 //! origin, which is the authority the index caches.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::Bound;
-use std::sync::RwLock;
+use std::ops::{Bound, Deref};
+use std::sync::{LockResult, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use s3s::dto::{
@@ -168,6 +168,97 @@ pub(crate) enum IndexedHead {
     Absent,
 }
 
+/// One O(1) snapshot of the in-memory index's current logical footprint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndexStats {
+    pub(crate) objects: u64,
+    pub(crate) logical_bytes: u64,
+}
+
+impl IndexStats {
+    fn for_entry(entry: &ObjEntry) -> Self {
+        Self {
+            objects: 1,
+            logical_bytes: entry
+                .size
+                .and_then(|size| u64::try_from(size).ok())
+                .unwrap_or(0),
+        }
+    }
+
+    fn replace(&mut self, previous: Self, current: Self) {
+        self.objects = self
+            .objects
+            .saturating_sub(previous.objects)
+            .saturating_add(current.objects);
+        self.logical_bytes = self
+            .logical_bytes
+            .saturating_sub(previous.logical_bytes)
+            .saturating_add(current.logical_bytes);
+    }
+}
+
+#[derive(Default)]
+struct KeyIndexState {
+    buckets: HashMap<String, BucketState>,
+    stats: IndexStats,
+}
+
+/// Read guard over the key map. The aggregate statistics share its lock but remain an
+/// implementation detail, so lookup call sites retain direct `HashMap` ergonomics.
+pub(crate) struct KeyIndexReadGuard<'a>(RwLockReadGuard<'a, KeyIndexState>);
+
+impl Deref for KeyIndexReadGuard<'_> {
+    type Target = HashMap<String, BucketState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.buckets
+    }
+}
+
+/// The whole LIST index. The key map and its cached totals share one lock, so mutation
+/// has no nested lock and a scrape remains an O(1), internally consistent snapshot.
+#[derive(Default)]
+pub(crate) struct KeyIndex {
+    inner: RwLock<KeyIndexState>,
+}
+
+impl KeyIndex {
+    /// Read access retained for the latency-sensitive lookup paths.
+    pub(crate) fn read(&self) -> LockResult<KeyIndexReadGuard<'_>> {
+        self.inner
+            .read()
+            .map(KeyIndexReadGuard)
+            .map_err(|poisoned| PoisonError::new(KeyIndexReadGuard(poisoned.into_inner())))
+    }
+
+    /// Remove a bucket and its complete contribution to the aggregate gauges.
+    pub(crate) fn remove_bucket(&self, bucket: &str) {
+        let mut index = self.inner.write().unwrap();
+        let KeyIndexState { buckets, stats } = &mut *index;
+        if let Some(previous) = buckets.remove(bucket) {
+            stats.replace(previous.stats, IndexStats::default());
+        }
+    }
+
+    /// Mark a fixture bucket authoritative without exposing accounting-bypassing map writes.
+    #[cfg(test)]
+    pub(crate) fn mark_bucket_synced(&self, bucket: &str) {
+        self.inner
+            .write()
+            .unwrap()
+            .buckets
+            .entry(bucket.to_owned())
+            .or_default()
+            .synced = true;
+    }
+
+    /// Current object count and known logical bytes without walking the key map.
+    pub(crate) fn stats(&self) -> IndexStats {
+        self.inner.read().unwrap().stats
+    }
+}
+
 /// Per-bucket LIST index: the sorted key set, whether its warm-up sync has
 /// finished, and delete tombstones so a late-arriving cross-writer put
 /// cannot resurrect a deleted key.
@@ -184,6 +275,17 @@ pub(crate) struct BucketState {
     /// Keys whose last mutation outcome is not yet reconciled with the origin. Reads of
     /// these keys stay origin-only until the matching bucket rebuild completes.
     pub(crate) uncertain_keys: BTreeSet<String>,
+    stats: IndexStats,
+}
+
+fn account_replacement(
+    bucket: &mut BucketState,
+    total: &mut IndexStats,
+    previous: IndexStats,
+    current: IndexStats,
+) {
+    bucket.stats.replace(previous, current);
+    total.replace(previous, current);
 }
 
 /// How long a delete tombstone shields its key from older, late-arriving
@@ -200,22 +302,24 @@ const TOMBSTONE_PRUNE_LEN: usize = 65_536;
 /// last-applied (cross-writer same-microsecond puts are healed by the next
 /// origin sync). `entry.last_modified` is the write's timestamp — the LWW
 /// clock. Returns whether the index changed.
-pub(crate) fn apply_put(
-    state: &RwLock<HashMap<String, BucketState>>,
-    bucket: &str,
-    key: &str,
-    entry: ObjEntry,
-) -> bool {
+pub(crate) fn apply_put(state: &KeyIndex, bucket: &str, key: &str, entry: ObjEntry) -> bool {
     let ts = entry.last_modified;
-    let mut g = state.write().unwrap();
-    let b = g.entry(bucket.to_owned()).or_default();
+    let mut index = state.inner.write().unwrap();
+    let KeyIndexState { buckets, stats } = &mut *index;
+    let b = buckets.entry(bucket.to_owned()).or_default();
     if b.gone.get(key).is_some_and(|dead| *dead >= ts) {
         return false; // deletes win ties: never resurrect
     }
     if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
         return false; // a newer put is already indexed
     }
-    b.keys.insert(key.to_owned(), entry);
+    let current = IndexStats::for_entry(&entry);
+    let previous = b
+        .keys
+        .insert(key.to_owned(), entry)
+        .as_ref()
+        .map_or_else(IndexStats::default, IndexStats::for_entry);
+    account_replacement(b, stats, previous, current);
     true
 }
 
@@ -223,59 +327,55 @@ pub(crate) fn apply_put(
 /// `uncertain_key` is retained across overlapping resets because the newest full rebuild
 /// covers every earlier uncertainty too. Returns the new generation.
 pub(crate) fn begin_bucket_resync(
-    state: &RwLock<HashMap<String, BucketState>>,
+    state: &KeyIndex,
     bucket: &str,
     uncertain_key: Option<&str>,
 ) -> u64 {
-    let mut g = state.write().unwrap();
-    let previous = g.remove(bucket).unwrap_or_default();
+    let mut index = state.inner.write().unwrap();
+    let KeyIndexState { buckets, stats } = &mut *index;
+    let previous = buckets.remove(bucket).unwrap_or_default();
     let generation = previous.sync_generation.wrapping_add(1);
     let mut uncertain_keys = previous.uncertain_keys;
+    stats.replace(previous.stats, IndexStats::default());
     if let Some(key) = uncertain_key {
         uncertain_keys.insert(key.to_owned());
     }
-    g.insert(
-        bucket.to_owned(),
-        BucketState {
-            sync_generation: generation,
-            uncertain_keys,
-            ..BucketState::default()
-        },
-    );
+    let replacement = BucketState {
+        sync_generation: generation,
+        uncertain_keys,
+        ..BucketState::default()
+    };
+    buckets.insert(bucket.to_owned(), replacement);
     generation
 }
 
 /// Discard a failed rebuild's partial rows and advance to a clean retry, but only while
 /// `generation` still owns the bucket. `None` means a newer fence already superseded it.
 pub(crate) fn restart_bucket_resync_if_current(
-    state: &RwLock<HashMap<String, BucketState>>,
+    state: &KeyIndex,
     bucket: &str,
     generation: u64,
 ) -> Option<u64> {
-    let mut g = state.write().unwrap();
-    let current = g.get(bucket)?;
+    let mut index = state.inner.write().unwrap();
+    let KeyIndexState { buckets, stats } = &mut *index;
+    let current = buckets.get(bucket)?;
     if current.sync_generation != generation {
         return None;
     }
-    let previous = g.remove(bucket).unwrap_or_default();
+    let previous = buckets.remove(bucket).unwrap_or_default();
     let next = generation.wrapping_add(1);
-    g.insert(
-        bucket.to_owned(),
-        BucketState {
-            sync_generation: next,
-            uncertain_keys: previous.uncertain_keys,
-            ..BucketState::default()
-        },
-    );
+    let replacement = BucketState {
+        sync_generation: next,
+        uncertain_keys: previous.uncertain_keys,
+        ..BucketState::default()
+    };
+    stats.replace(previous.stats, IndexStats::default());
+    buckets.insert(bucket.to_owned(), replacement);
     Some(next)
 }
 
 /// Whether `generation` is still the rebuild authorised for `bucket`.
-pub(crate) fn bucket_resync_is_current(
-    state: &RwLock<HashMap<String, BucketState>>,
-    bucket: &str,
-    generation: u64,
-) -> bool {
+pub(crate) fn bucket_resync_is_current(state: &KeyIndex, bucket: &str, generation: u64) -> bool {
     state
         .read()
         .unwrap()
@@ -285,14 +385,10 @@ pub(crate) fn bucket_resync_is_current(
 
 /// Applies an observed delete: removes any not-newer entry and records a
 /// tombstone (see [`apply_put`]). Returns whether a live entry was removed.
-pub(crate) fn apply_del(
-    state: &RwLock<HashMap<String, BucketState>>,
-    bucket: &str,
-    key: &str,
-    ts: SystemTime,
-) -> bool {
-    let mut g = state.write().unwrap();
-    let b = g.entry(bucket.to_owned()).or_default();
+pub(crate) fn apply_del(state: &KeyIndex, bucket: &str, key: &str, ts: SystemTime) -> bool {
+    let mut index = state.inner.write().unwrap();
+    let KeyIndexState { buckets, stats } = &mut *index;
+    let b = buckets.entry(bucket.to_owned()).or_default();
     if b.gone.len() > TOMBSTONE_PRUNE_LEN
         && let Some(cutoff) = ts.checked_sub(TOMBSTONE_TTL)
     {
@@ -305,7 +401,16 @@ pub(crate) fn apply_del(
     if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
         return false; // the key was rewritten after this delete
     }
-    b.keys.remove(key).is_some()
+    let Some(previous) = b.keys.remove(key) else {
+        return false;
+    };
+    account_replacement(
+        b,
+        stats,
+        IndexStats::for_entry(&previous),
+        IndexStats::default(),
+    );
+    true
 }
 
 /// Completes an indexed entry from an origin response: fills the fields it does not
@@ -313,15 +418,20 @@ pub(crate) fn apply_del(
 /// *observes* what is already indexed, it does not write, so it can neither reorder
 /// against a concurrent write nor resurrect a deleted key.
 pub(crate) fn complete_entry(
-    state: &RwLock<HashMap<String, BucketState>>,
+    state: &KeyIndex,
     bucket: &str,
     key: &str,
     fill: EntryFill,
 ) -> Completion {
-    let mut g = state.write().unwrap();
-    let Some(entry) = g.get_mut(bucket).and_then(|b| b.keys.get_mut(key)) else {
+    let mut index = state.inner.write().unwrap();
+    let KeyIndexState { buckets, stats } = &mut *index;
+    let Some(bucket) = buckets.get_mut(bucket) else {
         return Completion::NotIndexed;
     };
+    let Some(entry) = bucket.keys.get_mut(key) else {
+        return Completion::NotIndexed;
+    };
+    let previous = IndexStats::for_entry(entry);
     let mut filled = false;
     if entry.size.is_none() {
         entry.size = fill.size;
@@ -340,6 +450,8 @@ pub(crate) fn complete_entry(
         filled = true;
     }
     if filled {
+        let current = IndexStats::for_entry(entry);
+        account_replacement(bucket, stats, previous, current);
         Completion::Completed
     } else {
         Completion::AlreadyComplete
@@ -495,7 +607,7 @@ pub(crate) fn head_object_from_index(
 /// many rows the origin listed (not how many changed).
 #[cfg(test)]
 pub(crate) fn sync_listing_into(
-    state: &RwLock<HashMap<String, BucketState>>,
+    state: &KeyIndex,
     bucket: &str,
     rows: impl IntoIterator<Item = (String, ObjEntry)>,
 ) -> usize {
@@ -511,13 +623,14 @@ pub(crate) fn sync_listing_into(
 /// The generation check and every row application happen under the same lock, which is
 /// what prevents a superseded rebuild from slipping a stale page in after a newer reset.
 fn sync_listing_into_generation(
-    state: &RwLock<HashMap<String, BucketState>>,
+    state: &KeyIndex,
     bucket: &str,
     generation: u64,
     rows: impl IntoIterator<Item = (String, ObjEntry)>,
 ) -> Option<usize> {
-    let mut g = state.write().unwrap();
-    let b = g.entry(bucket.to_owned()).or_default();
+    let mut index = state.inner.write().unwrap();
+    let KeyIndexState { buckets, stats } = &mut *index;
+    let b = buckets.entry(bucket.to_owned()).or_default();
     if b.sync_generation != generation {
         return None;
     }
@@ -529,7 +642,13 @@ fn sync_listing_into_generation(
                 .get(&key)
                 .is_none_or(|current| current.last_modified <= ts)
         {
-            b.keys.insert(key, entry);
+            let current = IndexStats::for_entry(&entry);
+            let previous = b
+                .keys
+                .insert(key, entry)
+                .as_ref()
+                .map_or_else(IndexStats::default, IndexStats::for_entry);
+            account_replacement(b, stats, previous, current);
         }
         found += 1;
     }
@@ -537,13 +656,9 @@ fn sync_listing_into_generation(
 }
 
 /// Publish completion for `generation`; false means a newer rebuild owns the bucket.
-fn finish_bucket_sync_generation(
-    state: &RwLock<HashMap<String, BucketState>>,
-    bucket: &str,
-    generation: u64,
-) -> bool {
-    let mut g = state.write().unwrap();
-    let b = g.entry(bucket.to_owned()).or_default();
+fn finish_bucket_sync_generation(state: &KeyIndex, bucket: &str, generation: u64) -> bool {
+    let mut index = state.inner.write().unwrap();
+    let b = index.buckets.entry(bucket.to_owned()).or_default();
     if b.sync_generation != generation {
         return false;
     }
@@ -562,12 +677,13 @@ fn finish_bucket_sync_generation(
 /// The upstream LIST error, leaving the bucket unsynced (and therefore passthrough).
 pub(crate) async fn sync_bucket_into(
     client: &aws_sdk_s3::Client,
-    state: &RwLock<HashMap<String, BucketState>>,
+    state: &KeyIndex,
     bucket: &str,
 ) -> anyhow::Result<usize> {
     let generation = {
-        let mut g = state.write().unwrap();
-        g.entry(bucket.to_owned()).or_default().sync_generation
+        let mut index = state.inner.write().unwrap();
+        let bucket = index.buckets.entry(bucket.to_owned()).or_default();
+        bucket.sync_generation
     };
     let result = sync_bucket_generation(client, state, bucket, generation).await;
     if result.is_err() {
@@ -587,7 +703,7 @@ pub(crate) async fn sync_bucket_into(
 /// one. In both cases the bucket remains origin-serving.
 pub(crate) async fn sync_bucket_generation(
     client: &aws_sdk_s3::Client,
-    state: &RwLock<HashMap<String, BucketState>>,
+    state: &KeyIndex,
     bucket: &str,
     generation: u64,
 ) -> anyhow::Result<usize> {
@@ -652,8 +768,8 @@ pub(crate) async fn sync_bucket_generation(
 #[cfg(test)]
 mod tests {
     use super::{
-        BODY_MTIME_SLACK, Completion, EntryFill, IndexedHead, ObjEntry, ObjMeta, apply_del,
-        apply_put, begin_bucket_resync, complete_entry, entry_matches_body,
+        BODY_MTIME_SLACK, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry, ObjMeta,
+        apply_del, apply_put, begin_bucket_resync, complete_entry, entry_matches_body,
         finish_bucket_sync_generation, head_object_from_index, list_objects_v2_from_index,
         restart_bucket_resync_if_current, standard_class, sync_listing_into,
         sync_listing_into_generation,
@@ -661,10 +777,9 @@ mod tests {
     use crate::list_token::{Continuation, classify};
     use crate::tier::CachedObject;
     use std::collections::HashMap;
-    use std::sync::RwLock;
     use std::time::Duration;
 
-    type Index = RwLock<HashMap<String, super::BucketState>>;
+    type Index = KeyIndex;
 
     fn ts(secs: u64) -> std::time::SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
@@ -702,7 +817,7 @@ mod tests {
     /// late older put from resurrecting the key.
     #[test]
     fn lww_applies_out_of_order_events_convergently() {
-        let state: Index = RwLock::new(HashMap::new());
+        let state = Index::default();
         assert!(put(&state, "k", 1, 10));
         assert!(!put(&state, "k", 9, 5), "older put loses");
         assert_eq!(size_of(&state, "k"), Some(1));
@@ -728,7 +843,7 @@ mod tests {
     /// suppresses the older put.
     #[test]
     fn delete_first_reorder_suppresses_the_put() {
-        let state: Index = RwLock::new(HashMap::new());
+        let state = Index::default();
         assert!(!apply_del(&state, "b", "k", ts(50)), "nothing live yet");
         assert!(!put(&state, "k", 1, 45), "arrives late, loses");
         assert_eq!(size_of(&state, "k"), None);
@@ -740,7 +855,7 @@ mod tests {
     /// resurrects deleted keys and overwrites fresh ones with the origin's stale view.
     #[test]
     fn a_listing_cannot_resurrect_a_delete_or_clobber_a_newer_write() {
-        let state: Index = RwLock::new(HashMap::new());
+        let state = Index::default();
 
         // A delete races a bootstrap that still lists the key: the key stays gone.
         assert!(put(&state, "deleted", 7, 10));
@@ -774,7 +889,7 @@ mod tests {
     /// late page nor clear the newer key's origin-only marker at completion.
     #[test]
     fn a_superseded_rebuild_cannot_clear_a_newer_uncertainty() {
-        let state: Index = RwLock::new(HashMap::new());
+        let state = Index::default();
         let older = begin_bucket_resync(&state, "b", Some("first"));
         let current = begin_bucket_resync(&state, "b", Some("second"));
 
@@ -820,7 +935,7 @@ mod tests {
     /// retry would make that absent key authoritative again.
     #[test]
     fn a_retry_discards_rows_from_its_failed_partial_attempt() {
-        let state: Index = RwLock::new(HashMap::new());
+        let state = Index::default();
         let failed = begin_bucket_resync(&state, "b", Some("writer"));
         assert_eq!(
             sync_listing_into_generation(
@@ -855,6 +970,100 @@ mod tests {
         assert!(g["b"].synced);
         assert!(!g["b"].keys.contains_key("deleted-before-retry"));
         assert!(g["b"].keys.contains_key("still-present"));
+    }
+
+    /// Every mutation path maintains the aggregate gauges in lockstep with the key map;
+    /// rejected LWW operations and metadata-only completions do not perturb them.
+    #[test]
+    fn index_stats_track_upserts_deletes_and_bucket_replacements() {
+        let state = Index::default();
+        assert_eq!(state.stats(), super::IndexStats::default());
+
+        assert!(put(&state, "k", 10, 10));
+        assert_eq!(
+            state.stats(),
+            super::IndexStats {
+                objects: 1,
+                logical_bytes: 10,
+            }
+        );
+        assert!(!put(&state, "k", 99, 5), "an older put is a no-op");
+        assert_eq!(state.stats().logical_bytes, 10);
+
+        assert!(put(&state, "k", 4, 20), "an upsert replaces its size");
+        let mut unknown = entry(0, 20);
+        unknown.size = None;
+        assert!(apply_put(&state, "b", "unknown", unknown));
+        assert_eq!(
+            state.stats(),
+            super::IndexStats {
+                objects: 2,
+                logical_bytes: 4,
+            }
+        );
+        assert_eq!(
+            complete_entry(&state, "b", "unknown", fill()),
+            Completion::Completed
+        );
+        assert_eq!(state.stats().logical_bytes, 16);
+
+        assert!(
+            !apply_del(&state, "b", "k", ts(15)),
+            "an older delete is a no-op"
+        );
+        assert_eq!(state.stats().objects, 2);
+        assert!(apply_del(&state, "b", "k", ts(30)));
+        assert_eq!(
+            state.stats(),
+            super::IndexStats {
+                objects: 1,
+                logical_bytes: 12,
+            }
+        );
+
+        let generation = begin_bucket_resync(&state, "b", None);
+        assert_eq!(
+            state.stats(),
+            super::IndexStats::default(),
+            "a full rebuild replaces the previous snapshot immediately"
+        );
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                generation,
+                [
+                    ("a".to_owned(), entry(3, 40)),
+                    ("b".to_owned(), entry(7, 40))
+                ]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            state.stats(),
+            super::IndexStats {
+                objects: 2,
+                logical_bytes: 10,
+            }
+        );
+        assert_eq!(
+            sync_listing_into_generation(
+                &state,
+                "b",
+                generation,
+                [("b".to_owned(), entry(99, 30))]
+            ),
+            Some(1),
+            "the origin listed a row even though LWW rejected it"
+        );
+        assert_eq!(state.stats().logical_bytes, 10);
+
+        state.remove_bucket("b");
+        assert_eq!(
+            state.stats(),
+            super::IndexStats::default(),
+            "dropping a bucket removes its cached contribution"
+        );
     }
 
     use s3s::dto::{ETag, ListObjectsV2Input, ListObjectsV2Output};
@@ -1060,7 +1269,7 @@ mod tests {
     /// every HEAD after that is local *and* identical.
     #[test]
     fn a_skeletal_entry_answers_a_head_only_once_completed() {
-        let state: Index = RwLock::new(HashMap::new());
+        let state = Index::default();
         assert!(put(&state, "k", 12, 10));
         {
             let g = state.read().unwrap();
@@ -1218,7 +1427,7 @@ mod tests {
     /// may describe an older version.
     #[test]
     fn completion_only_fills_what_is_missing() {
-        let state: Index = RwLock::new(HashMap::new());
+        let state = Index::default();
         assert_eq!(
             complete_entry(&state, "b", "ghost", fill()),
             Completion::NotIndexed,

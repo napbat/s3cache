@@ -173,13 +173,7 @@ fn index(proxy: &CachingProxy, key: &str, etag: Option<&str>, modified: SystemTi
 
 /// Flip the bucket to synced — the state in which the index may arbitrate.
 fn synced(proxy: &CachingProxy) {
-    proxy
-        .state
-        .write()
-        .unwrap()
-        .entry("b".to_owned())
-        .or_default()
-        .synced = true;
+    proxy.state.mark_bucket_synced("b");
 }
 
 fn request<T>(input: T) -> S3Request<T> {

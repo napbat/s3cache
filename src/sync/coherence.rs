@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use groupnet::consistency::{
@@ -13,7 +12,7 @@ use groupnet::transport::udp::UdpTransport;
 use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
-use crate::index::{BucketState, ObjEntry, apply_del, apply_put, standard_class};
+use crate::index::{KeyIndex, ObjEntry, apply_del, apply_put, standard_class};
 use crate::metrics::Metrics;
 use crate::sync::recovery::{Affirmation, LapseWatch, ResyncGate, remediate, watch_lapses};
 use crate::sync::wire::{
@@ -814,7 +813,7 @@ impl WriteSync {
     pub(crate) fn start_apply(
         self: &Arc<Self>,
         local: LocalCache,
-        state: Arc<RwLock<HashMap<String, BucketState>>>,
+        state: Arc<KeyIndex>,
         resync: Arc<dyn Fn() + Send + Sync>,
         metrics: Arc<Metrics>,
     ) {
