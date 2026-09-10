@@ -37,9 +37,3 @@ helm:
         resources:
           requests:
             storage: 25Gi
-    # Reserve measured steady-state capacity during co-located CI builds. Leave
-    # CPU uncapped so each replica can use idle node capacity.
-    resources:
-      requests:
-        cpu: "1"
-        memory: 6Gi
