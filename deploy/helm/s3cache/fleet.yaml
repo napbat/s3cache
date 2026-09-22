@@ -12,6 +12,13 @@ helm:
     # warm-cache PVC, while Fleet and the PDB retain one serving replica during
     # routine image rollouts.
     replicaCount: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 2Gi
+      limits:
+        cpu: "1"
+        memory: 10Gi
     image:
       tag: 8f4512a85a683371c90364291c68fe1bab829772
     upstream:
