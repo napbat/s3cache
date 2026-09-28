@@ -3,7 +3,13 @@
 The S3 origin is authoritative for object contents but supplies no committed
 event stream for proxy writes. A proxy can die after an origin mutation commits
 and before its Groupnet feed event exists. This document defines a separate,
-durable control source for closing that window. The initial implementation in
+durable **opt-in** control source for closing that window. The default remains
+zero coordination or metadata writes to S3, and the origin bucket is never
+used for control records. Without explicitly configured durable coordination
+or an equivalent authoritative reconciliation source, existing origin fallback
+remains and no complete peer index or event-complete subscription is claimed.
+Event-complete delivery would additionally require retained committed history;
+a snapshot cannot substitute for each event. The initial implementation in
 `sync::control` provides its storage and codec only; it does not change write
 paths, serving gates, startup, or current consistency claims.
 
