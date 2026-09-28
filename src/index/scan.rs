@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::try_join_all;
+use groupnet::consistency::volatile_recovery::PublicationPermit;
 use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
@@ -165,6 +166,7 @@ async fn scan_range(
     bucket: &str,
     generation: u64,
     range: KeyRange,
+    permit: Option<PublicationPermit>,
 ) -> anyhow::Result<usize> {
     let mut token: Option<String> = None;
     let mut previous: Option<String> = None;
@@ -215,7 +217,13 @@ async fn scan_range(
                 },
             ));
         }
-        let Some(page_len) = sync_listing_into_generation(state, bucket, generation, rows) else {
+        let updated = match &permit {
+            Some(permit) => permit
+                .publish(|| sync_listing_into_generation(state, bucket, generation, rows))
+                .flatten(),
+            None => sync_listing_into_generation(state, bucket, generation, rows),
+        };
+        let Some(page_len) = updated else {
             anyhow::bail!("bucket sync superseded by a newer origin rebuild");
         };
         found += page_len;
@@ -252,16 +260,23 @@ pub(super) async fn sync_bucket_generation(
     bucket: &str,
     generation: u64,
     config: ScanConfig,
+    permit: Option<PublicationPermit>,
 ) -> anyhow::Result<usize> {
     let config = config.bounded();
     let boundaries = discover_boundaries(client, bucket, config).await;
     let range_count = boundaries.len() + 1;
     let scans = ranges(&boundaries)
         .into_iter()
-        .map(|range| scan_range(client, state, bucket, generation, range));
+        .map(|range| scan_range(client, state, bucket, generation, range, permit.clone()));
     let counts = try_join_all(scans).await?;
     let found = counts.into_iter().sum();
-    if !finish_bucket_sync_generation(state, bucket, generation) {
+    let finished = match &permit {
+        Some(permit) => permit
+            .publish(|| finish_bucket_sync_generation(state, bucket, generation))
+            .unwrap_or(false),
+        None => finish_bucket_sync_generation(state, bucket, generation),
+    };
+    if !finished {
         anyhow::bail!("bucket sync superseded by a newer origin rebuild");
     }
     info!(bucket, found, range_count, "synced bucket into index");

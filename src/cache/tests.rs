@@ -8,13 +8,10 @@ use groupnet::core::{Config, NodeId};
 use groupnet::runtime::Node;
 use groupnet::transport::mem::{MemTransport, Network};
 use http::HeaderMap;
-use s3s::dto::{ETag, GetObjectOutput, ListObjectsV2Input, Timestamp};
+use s3s::dto::{ETag, GetObjectInput, GetObjectOutput, ListObjectsV2Input, Timestamp};
 use s3s::{S3, S3ErrorCode, S3Request};
 
-use crate::cache::proxy::{
-    CacheConfig, CachingProxy, FullSyncOwner, ObservedObject, ReadRoute, affirm_after,
-    affirm_bootstrap,
-};
+use crate::cache::proxy::{CacheConfig, CachingProxy, FullSyncOwner, ObservedObject, ReadRoute};
 use crate::index::{
     IndexedHead, ObjEntry, ObjMeta, apply_put, head_object_from_index, standard_class,
 };
@@ -58,181 +55,14 @@ fn solo(id: &str) -> (Node<MemTransport>, Arc<WriteSync>) {
     (node, Arc::new(sync))
 }
 
-/// A node told to warm nothing affirms as soon as its lease allows — and that is
-/// safe rather than a shortcut: with empty tiers and a passthrough index there is no
-/// local state for the licence to license.
-#[tokio::test]
-async fn the_boot_affirmation_is_immediate_with_no_buckets() {
-    let (_node, sync) = solo("boot-none");
-    assert!(!sync.may_serve_local(), "a booting node holds no licence");
-
-    affirm_after(
-        Vec::new(),
-        Some(Arc::clone(&sync)),
-        Some(sync.resync_gen()),
-        None,
-    )
-    .await;
-
-    assert!(
-        sync.may_serve_local(),
-        "and takes one as soon as the lease shell's warm-up guard releases"
-    );
-}
-
-/// With a bucket, the licence waits for that bucket's warm-up to land. A node whose
-/// index is still filling from the origin must not answer a LIST or positive local read
-/// out of it.
-#[tokio::test]
-async fn the_boot_affirmation_waits_for_every_bucket_warmup() {
-    let (_node, sync) = solo("boot-one");
-    let (done, warmed) = tokio::sync::oneshot::channel::<()>();
-    let warmup = tokio::spawn(async move {
-        let _ = warmed.await;
-    });
-
-    let affirming = tokio::spawn(affirm_after(
-        vec![warmup],
-        Some(Arc::clone(&sync)),
-        Some(sync.resync_gen()),
-        None,
-    ));
-    // Comfortably past the warm-up guard (one detection window plus two
-    // anti-entropy rounds, ~100ms here): the lease would take the affirmation by
-    // now, and the only thing holding it back is the bucket.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !sync.may_serve_local(),
-        "an index still filling from the origin licenses nothing"
-    );
-
-    drop(done);
-    affirming.await.expect("the affirmation task");
-    assert!(
-        sync.may_serve_local(),
-        "and the warm-up landing is what puts the node in service"
-    );
-}
-
-#[tokio::test]
-async fn a_boot_feed_gap_supersedes_early_point_read_affirmation() {
-    let (_node, sync) = solo("boot-gap");
-    let owner = FullSyncOwner::default();
-    let boot = owner.claim();
-    let boot_generation = sync.resync_gen();
-
-    // A feed gap arrived while the full LIST was still blocked. The old boot
-    // proof cannot license cached reads, even after the lease warm-up window.
-    sync.require_resync();
-    affirm_bootstrap(Arc::clone(&sync), boot_generation, boot.clone()).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!sync.may_serve_local());
-
-    // Only the gap's current generation may affirm after its full scan lands.
-    affirm_after(
-        Vec::new(),
-        Some(Arc::clone(&sync)),
-        Some(sync.resync_gen()),
-        Some(owner.claim()),
-    )
-    .await;
-    assert!(sync.may_serve_local());
-}
-
-#[tokio::test]
-async fn a_gap_before_boot_sync_starts_keeps_its_recovery_owner() {
-    let (_node, sync) = solo("boot-gap-before-scan");
-    let proxy = proxy(Some(Arc::clone(&sync)));
-    // start_coherence claims boot ownership before the apply task can report
-    // a Gap. Model the Gap at the boundary before spawn_background_sync.
-    proxy.start_coherence(&[]);
-    sync.require_resync();
-    let gap_owner = proxy.full_sync_owner.claim();
-    proxy.spawn_background_sync(Vec::new());
-
-    assert!(
-        gap_owner.is_current(),
-        "late boot must not replace gap recovery"
-    );
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !sync.may_serve_local(),
-        "late boot must not affirm the gap generation"
-    );
-}
-
-#[tokio::test]
-async fn gossip_boot_without_an_apply_loop_cannot_affirm() {
-    let (_node, sync) = solo("boot-without-apply");
-    let proxy = proxy(Some(Arc::clone(&sync)));
-    proxy.spawn_background_sync(Vec::new());
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!sync.may_serve_local());
-}
-
-#[tokio::test]
-async fn startup_readiness_requires_every_index_and_the_boot_licence() {
-    let (_node, sync) = solo("startup-ready");
-    let proxy = proxy(Some(Arc::clone(&sync)));
-    let buckets = vec!["first".to_owned(), "second".to_owned()];
-
-    assert!(!proxy.initially_ready(&buckets));
-    proxy.state.mark_bucket_synced("first");
-    assert!(!proxy.initially_ready(&buckets));
-    proxy.state.mark_bucket_synced("second");
-    assert!(
-        !proxy.initially_ready(&buckets),
-        "boot licence is still closed"
-    );
-
-    affirm_after(
-        Vec::new(),
-        Some(Arc::clone(&sync)),
-        Some(sync.resync_gen()),
-        None,
-    )
-    .await;
-    assert!(proxy.initially_ready(&buckets));
-}
-
-/// Retry and affirmation ownership is independent of the coherence generation: boot
-/// warm-up can start after a gap has already claimed that same coherence generation.
-/// Only the newest full-index recovery may keep retrying or affirm it.
-#[tokio::test]
-async fn only_the_newest_full_sync_may_retry_or_affirm() {
-    let (_node, sync) = solo("full-sync-owner");
+#[test]
+fn only_the_newest_single_node_warmup_may_retry() {
     let owner = FullSyncOwner::default();
     let stale = owner.claim();
     let current = owner.claim();
     assert!(!stale.is_current());
     assert!(current.is_current());
-
-    affirm_after(
-        Vec::new(),
-        Some(Arc::clone(&sync)),
-        Some(sync.resync_gen()),
-        Some(stale),
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !sync.may_serve_local(),
-        "a superseded full sync cannot affirm while its replacement is pending"
-    );
-
-    affirm_after(
-        Vec::new(),
-        Some(Arc::clone(&sync)),
-        Some(sync.resync_gen()),
-        Some(current),
-    )
-    .await;
-    assert!(
-        sync.may_serve_local(),
-        "the newest full sync retains retry and affirmation ownership"
-    );
 }
-
 // ---- the retention read path (`validated_get`) -------------------------------
 
 /// A proxy over an origin it never dials. Every case below is decided from local
@@ -250,6 +80,7 @@ fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
         ))
         .endpoint_url("http://127.0.0.1:1")
         .force_path_style(true)
+        .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
         .build();
     let client = aws_sdk_s3::Client::from_conf(conf);
     CachingProxy::new(
@@ -263,6 +94,98 @@ fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
         sync,
         Arc::new(Metrics::default()),
     )
+}
+
+/// Pause exactly after a local body or index answer was computed, before the
+/// final serving-permission check. The two barriers make revocation ordered
+/// without relying on scheduler timing.
+async fn revoke_before_local_return(
+    proxy: &CachingProxy,
+    sync: &WriteSync,
+    read: impl std::future::Future<Output = bool> + Send + 'static,
+) {
+    let pause = Arc::new(tokio::sync::Barrier::new(2));
+    *proxy.read_return_pause.lock().unwrap() = Some(pause.clone());
+    let response = tokio::spawn(read);
+    tokio::time::timeout(Duration::from_secs(3), pause.wait())
+        .await
+        .expect("read reached its local-return decision");
+    sync.require_lease_resync();
+    assert!(!sync.may_serve_local());
+    pause.wait().await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("origin fallback finishes")
+            .expect("read task finishes"),
+        "a revoked local answer must route to the origin"
+    );
+}
+
+#[tokio::test]
+async fn a_lease_revoked_after_local_body_lookup_forces_origin_get() {
+    let (_node, sync) = solo("return-fence-get");
+    let proxy = proxy(Some(sync.clone()));
+    let body = cached("v1", at(1_700_000_000));
+    body.mark_trusted(proxy.obj_cache.suspect_gen());
+    proxy.obj_cache.insert(ck("k"), body).await;
+    sync.start_apply(
+        proxy.obj_cache.local(),
+        proxy.state.clone(),
+        proxy.metrics.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !sync.may_serve_local() {
+            let _ = sync.affirm_lease_now();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("solo lease becomes valid");
+    let pending = proxy.clone();
+    revoke_before_local_return(&proxy, &sync, async move {
+        pending
+            .get_object(request(GetObjectInput {
+                bucket: "b".to_owned(),
+                key: "k".to_owned(),
+                ..Default::default()
+            }))
+            .await
+            .is_err()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_lease_revoked_after_index_answer_forces_origin_list() {
+    let (_node, sync) = solo("return-fence-list");
+    let proxy = proxy(Some(sync.clone()));
+    index(&proxy, "k", Some("v1"), at(1_700_000_000));
+    synced(&proxy);
+    sync.start_apply(
+        proxy.obj_cache.local(),
+        proxy.state.clone(),
+        proxy.metrics.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !sync.may_serve_local() {
+            let _ = sync.affirm_lease_now();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("solo lease becomes valid");
+    let pending = proxy.clone();
+    revoke_before_local_return(&proxy, &sync, async move {
+        pending
+            .list_objects_v2(request(ListObjectsV2Input {
+                bucket: "b".to_owned(),
+                ..Default::default()
+            }))
+            .await
+            .is_err()
+    })
+    .await;
 }
 
 fn at(secs: u64) -> SystemTime {

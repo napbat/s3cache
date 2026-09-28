@@ -2,6 +2,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use groupnet::consistency::volatile_recovery::{RecoveryError, RecoveryHandle, RecoveryStatus};
 use groupnet::consistency::{
     AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, LeaseConfig, LeaseView, Leases,
     PeerWrite, PeerWrites, RenewalId, WriteFeed, WriteToken, advertised_head, applied_by_selected,
@@ -14,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::index::{KeyIndex, ObjEntry, apply_del, apply_put, standard_class};
 use crate::metrics::Metrics;
-use crate::sync::recovery::{Affirmation, LapseWatch, ResyncGate, remediate, watch_lapses};
+use crate::sync::volatile::CacheRecoveryAdapter;
 use crate::sync::wire::{
     IndexEvent, IndexOp, decode_event, encode_event, etag_to_wire, from_micros, parse_token,
     to_micros,
@@ -22,7 +23,7 @@ use crate::sync::wire::{
 use crate::tier::LocalCache;
 
 /// Ring capacity: a peer that falls further behind than this many writes
-/// gets a gap (distrust every body + origin resync, see [`remediate`]) instead
+/// gets a gap (Groupnet closes serving, distrusts bodies, and rescans origin) instead
 /// of per-event application.
 pub(super) const FEED_CAPACITY: usize = 4096;
 
@@ -157,27 +158,9 @@ pub(super) const DEAD_TIMEOUT_FLOOR_MS: u64 = 2_000;
 /// guarantee at all; the second is slack for scheduling, not for hope.
 pub(super) const WRITE_WAIT_SLACK: Duration = Duration::from_secs(1);
 
-/// How often a pending affirmation retries while the lease declines it.
-pub(super) const AFFIRM_POLL: Duration = Duration::from_millis(50);
-
-/// How long an affirmation keeps trying before giving up **loudly**, and the same
-/// budget the staged recovery's stage 1 gives its granters. Generous on purpose:
-/// the two things that decline it — this node's own warm-up window and a frozen
-/// confirmation behind an unreaped granter — both clear on their own, the second
-/// only at the reap horizon. Giving up leaves the node serving via the origin,
-/// which is correct and slow, never stale.
-///
-/// It is a **fixed** minute against a reap horizon that scales with the lease: `2 ×
-/// dead_timeout` past the `Dead` verdict, itself up to one detection window past the
-/// silence, and `dead_timeout` is `max(D, 2s)` (see [`WriteSync::new`]). Past roughly
-/// `D = 25s` the horizon outruns this, and then a dead granter's reap always arrives
-/// after the deadline: the recovery's cheap arm stops existing — every lapse takes
-/// the fallback, and every affirmation gives up before the confirmation it is waiting
-/// on can come back. That direction is fail-closed (a slow, correct, origin-served
-/// node, and a cache thrown away for nothing), but it is silent, so it is stated here
-/// rather than discovered. A fleet running a lease that long wants this scaled with
-/// it; nothing in the shipped envelope — `D = 2s` by default — comes near.
-pub(super) const AFFIRM_DEADLINE: Duration = Duration::from_mins(1);
+fn lapse_poll(duration: Duration) -> Duration {
+    (duration / 4).max(Duration::from_millis(25))
+}
 
 /// A published write: the raw token (for the cluster-wide ack wait) and its
 /// header form (for the response).
@@ -331,8 +314,8 @@ impl WriteWait {
 pub struct WriteSync {
     feed: WriteFeed<IndexEvent>,
     pub(super) group: Group,
-    me: NodeId,
-    consistency: Consistency,
+    pub(super) me: NodeId,
+    pub(super) consistency: Consistency,
     /// Set by [`start_apply`](Self::start_apply); the freshness barrier reads it.
     view: OnceLock<groupnet::consistency::FrontierView>,
     /// This node's participation in the coherence-lease tier — `Some` only in
@@ -340,13 +323,11 @@ pub struct WriteSync {
     /// protocol**: no renewals (this node's own window closes within `D`), no
     /// grants (every peer's confirmation freezes until membership reaps this
     /// node), no ingest.
-    leases: Option<Leases>,
+    pub(super) leases: Option<Leases>,
     /// The read handle of the lease above: the whole read-side licence in
     /// `strong` mode, and a lock-free borrow plus one compare per request.
     lease_view: Option<LeaseView>,
-    /// Shared with the apply loop, which stands the lease down on a feed gap,
-    /// and with the resync that affirms catch-up afterwards.
-    resync: Arc<ResyncGate>,
+    recovery: OnceLock<RecoveryHandle<CacheRecoveryAdapter>>,
     /// The deadline the coherence wait gets: one lease duration (the longest a
     /// silent holder's lapse can take) plus [`WRITE_WAIT_SLACK`].
     write_wait: Duration,
@@ -399,7 +380,7 @@ impl WriteSync {
             view: OnceLock::new(),
             leases,
             lease_view: lease_view.clone(),
-            resync: Arc::new(ResyncGate::new(lease_view)),
+            recovery: OnceLock::new(),
             write_wait: lease.duration + WRITE_WAIT_SLACK,
             _node: node,
         }
@@ -417,6 +398,27 @@ impl WriteSync {
     ///   fully alive may itself be the partitioned one, so it benches itself.
     /// * `bounded`: always. Freshness is the bound, and the barrier is what enforces it.
     pub(crate) fn may_serve_local(&self) -> bool {
+        if self
+            .recovery
+            .get()
+            .is_some_and(|recovery| !recovery.status().may_serve)
+        {
+            return false;
+        }
+        self.mode_allows_local()
+    }
+
+    /// Final read check bound to the recovery generation observed before its
+    /// asynchronous barrier/tier work. A later successful rebuild must not
+    /// license an answer computed under the preceding generation.
+    pub(crate) fn may_serve_local_in_generation(&self, expected: Option<u64>) -> bool {
+        if !recovery_generation_permits(self.recovery_status(), expected) {
+            return false;
+        }
+        self.mode_allows_local()
+    }
+
+    fn mode_allows_local(&self) -> bool {
         match self.consistency {
             Consistency::Strong => self.lease_view.as_ref().is_some_and(LeaseView::valid),
             Consistency::StrongAcks => self.cluster_healthy(),
@@ -424,49 +426,48 @@ impl WriteSync {
         }
     }
 
-    /// The resync generation a catch-up starting **now** would answer for. Read it
-    /// before the re-synchronization runs and hand it back to
-    /// [`affirm_resynced`](Self::affirm_resynced): a gap that lands in between
-    /// supersedes this catch-up, and the affirmation must not re-open a window for work
-    /// that no longer covers it.
-    pub(crate) fn resync_gen(&self) -> u64 {
-        self.resync.generation()
+    pub(super) fn install_recovery(&self, recovery: RecoveryHandle<CacheRecoveryAdapter>) {
+        assert!(
+            self.recovery.set(recovery).is_ok(),
+            "recovery already installed"
+        );
     }
 
-    /// Affirm that this node has re-synchronized and may serve locally again, on behalf
-    /// of the resync that started at `generation`.
-    ///
-    /// Polls rather than concluding, because the two things that decline an affirmation
-    /// both clear on their own: this node's own lease warm-up window, and a confirmation
-    /// frozen behind a granter that has stopped publishing. One `false` is "not yet",
-    /// never a verdict. Returns as soon as it takes, as soon as a later gap supersedes
-    /// it, or — loudly — at [`AFFIRM_DEADLINE`], which leaves this node serving via the
-    /// origin until the next resync: correct and slow, never stale.
-    ///
-    /// A no-op in every mode but `strong`: there is no window to open.
-    pub(crate) async fn affirm_resynced(&self, generation: u64) {
-        let deadline = Instant::now() + AFFIRM_DEADLINE;
-        loop {
-            match self.resync.affirm(generation) {
-                Affirmation::Took | Affirmation::Superseded => return,
-                Affirmation::NotYet => {}
-            }
-            if Instant::now() >= deadline {
-                warn!(
-                    "coherence lease never accepted this node's catch-up; serving via the \
-                     origin until the next resync (a granter may have stopped publishing)"
-                );
-                return;
-            }
-            tokio::time::sleep(AFFIRM_POLL).await;
+    pub(crate) fn has_recovery(&self) -> bool {
+        self.recovery.get().is_some()
+    }
+
+    pub(crate) fn restart_recovery(&self) -> Result<(), RecoveryError> {
+        self.recovery.get().ok_or(RecoveryError::Stage)?.restart()
+    }
+
+    pub(crate) fn recovery_status(&self) -> Option<RecoveryStatus> {
+        self.recovery.get().map(RecoveryHandle::status)
+    }
+
+    pub(crate) fn recovery_settle_floor_ms(&self) -> u64 {
+        self.group
+            .config()
+            .anti_entropy_interval_ms
+            .saturating_mul(2)
+    }
+
+    pub(super) fn frontier_view(&self) -> Option<groupnet::consistency::FrontierView> {
+        self.view.get().cloned()
+    }
+
+    pub(crate) fn require_lease_resync(&self) {
+        if let Some(view) = &self.lease_view {
+            view.require_resync();
         }
     }
 
-    /// Stand this node's serve-lease down: the gap arm of the apply loop, reachable from
-    /// a test that must not fabricate a ring overflow to get at it.
-    #[cfg(test)]
-    pub(crate) fn require_resync(&self) {
-        self.resync.require_resync();
+    pub(crate) fn affirm_lease_now(&self) -> bool {
+        self.view.get().is_some()
+            && self
+                .lease_view
+                .as_ref()
+                .is_none_or(groupnet::consistency::LeaseView::mark_caught_up)
     }
 
     /// The newest renewal of this node's serve-lease that **every** granter in its
@@ -503,15 +504,6 @@ impl WriteSync {
         self.leases
             .as_ref()
             .and_then(|leases| leases.granted_by(granter))
-    }
-
-    /// How many times this node's own serve-lease has lapsed — groupnet's monotone
-    /// counter, which misses no edge (unlike the state, whose `Lapsed` edge the lease
-    /// shell's view task usually consumes first). `0` in a mode that holds no lease.
-    /// A test's way of waiting for the lapse [`watch_lapses`] exists to remediate.
-    #[cfg(test)]
-    pub(crate) fn lease_lapses(&self) -> u64 {
-        self.lease_view.as_ref().map_or(0, LeaseView::lapses)
     }
 
     /// Every peer holding a live `~lease` entry in this node's view — the wait set a
@@ -796,40 +788,36 @@ impl WriteSync {
             .unwrap_or(false)
     }
 
-    /// Spawn the apply loop: peers' events fold into the LIST index and drop
-    /// the local hot body copy; a gap distrusts every local body and triggers
-    /// `resync` (an origin re-LIST) since the stale subset is unknowable.
+    /// Spawn the apply loop: peer events update the LIST index and invalidate
+    /// hot bodies. A gap synchronously closes Groupnet's local serving gate
+    /// and schedules an origin rebuild. In `strong`, a small watcher reports
+    /// the lease's monotone lapse count to that same recovery driver.
     ///
-    /// In `strong` this also spawns [`watch_lapses`], because a gap is not the only
-    /// way this node loses its right to serve and the others arrive as no event at
-    /// all. Both live here for the same reason: this is where everything a recovery
-    /// needs — the local tiers, the applied-write frontier, and the origin re-LIST —
-    /// first exists at once.
-    ///
-    /// Takes `self` as an [`Arc`] because the lapse watch holds a
-    /// [`Weak`](std::sync::Weak) back to
-    /// it: the recovery has to read this node's own lease confirmation, and a strong
-    /// handle in a task this object spawned would be a cycle.
+    /// Takes `self` as an [`Arc`] because the lapse watcher holds a weak
+    /// reference back to this object, avoiding a task/handle cycle.
     pub(crate) fn start_apply(
         self: &Arc<Self>,
         local: LocalCache,
         state: Arc<KeyIndex>,
-        resync: Arc<dyn Fn() + Send + Sync>,
         metrics: Arc<Metrics>,
     ) {
         let (frontier, view) = Frontier::new();
-        let _ = self.view.set(view.clone());
+        let _ = self.view.set(view);
         if let Some(leases) = &self.leases {
-            watch_lapses(LapseWatch {
-                gate: Arc::clone(&self.resync),
-                sync: Arc::downgrade(self),
-                local: local.clone(),
-                frontier: view,
-                group: self.group.clone(),
-                me: self.me.clone(),
-                resync: Arc::clone(&resync),
-                metrics: Arc::clone(&metrics),
-                lease: leases.config().duration,
+            let weak = Arc::downgrade(self);
+            let poll = lapse_poll(leases.config().duration);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(poll).await;
+                    let Some(sync) = weak.upgrade() else { return };
+                    let Some(recovery) = sync.recovery.get() else {
+                        return;
+                    };
+                    let count = sync.lease_view.as_ref().map_or(0, LeaseView::lapses);
+                    if count > recovery.status().state.covered_lapses {
+                        let _ = recovery.lease_lapse(count);
+                    }
+                }
             });
         }
         // Bounded mode publishes no acks (that is its point at scale); both strong
@@ -839,9 +827,11 @@ impl WriteSync {
             .acks()
             .then(|| AckLedger::new(self.group.clone()));
         let mut peers = PeerWrites::new(self.group.clone(), self.me.clone(), decode_event);
-        let gate = Arc::clone(&self.resync);
+        let weak = Arc::downgrade(self);
+        let lapse_view = self.lease_view.clone();
         tokio::spawn(async move {
             while let Some(event) = peers.next().await {
+                let Some(sync) = weak.upgrade() else { return };
                 match event {
                     PeerWrite::Wrote {
                         peer,
@@ -897,17 +887,15 @@ impl WriteSync {
                         missed_through,
                     } => {
                         warn!("write-feed gap from `{peer}`: distrusting bodies, resyncing index");
-                        // Stand the licence down, distrust, re-LIST — see
-                        // `remediate`, which is also the fallback of a lapse with no
-                        // gap behind it. The node stays out of service until the
-                        // resync affirms catch-up for *this* generation: a reader
-                        // that missed invalidations missed exactly the ones whose
-                        // writers proceeded because it had. Acking the gap is
-                        // truthful the moment this returns even though the bodies are
-                        // still here: `strong` serves none of them while the licence
-                        // is down, and the other modes refuse a suspect body in a
-                        // bucket the re-LIST has put back to passthrough.
-                        remediate(&gate, &local, &resync);
+                        // The public signal fences serving before returning; the
+                        // recovery worker distrusts bodies and guards every origin
+                        // scan page with that exact operation's permit. Frontier
+                        // progress below means the old local state is unservable,
+                        // not that the replacement index has materialized already.
+                        if let Some(recovery) = sync.recovery.get() {
+                            let lapses = lapse_view.as_ref().map_or(0, LeaseView::lapses);
+                            let _ = recovery.feed_gap(lapses);
+                        }
                         frontier.advance(&peer, missed_through);
                         if let Some(ledger) = &ledger {
                             ledger.record(&peer, missed_through).await;
@@ -941,5 +929,15 @@ impl WriteSync {
             }
         }
         true
+    }
+}
+
+pub(super) fn recovery_generation_permits(
+    status: Option<RecoveryStatus>,
+    expected: Option<u64>,
+) -> bool {
+    match status {
+        Some(status) => status.may_serve && Some(status.state.generation) == expected,
+        None => expected.is_none(),
     }
 }

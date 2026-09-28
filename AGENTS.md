@@ -53,7 +53,7 @@ src/
     mod.rs       # sync link point: module docs and declarations only
     coherence.rs # gossip write-feed and coherence core
     config.rs    # gossip env/config parsing and node construction
-    recovery.rs  # staged lease-lapse recovery and its correctness argument
+    volatile.rs  # S3 origin facts/effects for Groupnet's bounded recovery driver
     wire.rs      # write-event and session-token codec
     tests.rs     # coherence unit tests
   metrics.rs    # counters, warm-residency gauges, and periodic stats logging
@@ -86,10 +86,10 @@ origin/counter harness in `common/mod.rs` and the differential comparator in
 - Declare every direct package dependency once in `[workspace.dependencies]`; package
   dependency tables use `workspace = true`, and package metadata and lints are
   workspace-inherited. Commit `Cargo.lock`, and use `--locked` in every build gate.
-- `groupnet` comes from its GitHub `main` branch and is pinned to the resolved revision
-  by `Cargo.lock`. Local `[patch]` or path overrides are forbidden in shippable changes.
-  A deliberate `cargo update -p groupnet` must be followed by the full locked gate and
-  a review that every groupnet lock entry has the intended Git source and revision.
+- `groupnet` comes from GitHub at an exact reviewed revision, uniformly pinned
+  across its workspace crates in `Cargo.toml` and `Cargo.lock`. Local `[patch]`
+  or path overrides are forbidden in shippable changes. A deliberate update
+  must be followed by the full locked gate and a review of every Groupnet lock entry.
 - `.dockerignore` is an allowlist. Any new Docker build input must be added there
   deliberately.
 
@@ -201,21 +201,15 @@ after a death) are in the README's Consistency section and in groupnet's own hon
 do not restate them loosely, and do not add a mode without answering
 `Consistency::{acks, leases, capabilities}` explicitly — they are exhaustive on purpose.
 
-Losing the read-side licence is a **latch**, so every way of losing it needs a way back,
-and the two ways are deliberately priced differently. A write-feed gap is proof that
-specific events were missed: the apply loop's `sync::recovery::remediate` stands the
-licence down,
-**distrusts** every cached body (the trust generation moves; nothing is dropped) and
-re-LISTs the index, so each copy proves itself against that index on its next read or is
-evicted then. A lapse with no gap behind it is *not* that proof, so
-`sync::recovery::watch_lapses`
-(strong only) runs a staged recovery on the same `ResyncGate` generation — every granter
-re-grants (per granter, *not* off the roster-wide min), settle, no-peer-vanished, barrier
-on every advertised feed head, no-peer-vanished again — and keeps the cache whole when
-the barrier proves it (`lapse_barrier_retains`), falling back to `remediate` whenever a
-stage cannot get its proof (`lapse_barrier_fallbacks` / `lease_lapse_resyncs`).
-`LocalCache::flush` survives only as an escape hatch; no remediation path calls it. The
-correctness argument for the barrier is in `src/sync/recovery.rs`'s module docs — it has
-two checked hinges and one named residual; read it before touching the stages. A planned
-stop calls `WriteSync::leave` from the binary's signal path so peers do not wait out a
-lease of a pod that is leaving on purpose.
+Losing the read-side licence is a **latch**, so every way of losing it needs a way back.
+The apply loop sends feed gaps and lease lapses to Groupnet's bounded volatile-recovery
+driver; `sync::volatile` supplies bounded gossip observations and guarded origin-index
+effects. A gap synchronously revokes local publication, **distrusts** every cached body
+(the trust generation moves; nothing is dropped), and re-LISTs the index. A lapse
+without a gap attempts the cheaper per-granter renewal, settle, vanished-peer, and
+feed-frontier proof before falling back to a guarded origin scan. Groupnet's
+`docs/replication-volatile-coherence.md` and sans-IO core define its generation,
+retry, and affirmation rules. The S3 adapter never treats a volatile feed as a
+durable source cursor. `LocalCache::flush` remains an escape hatch; no recovery path
+calls it. A planned stop calls `WriteSync::leave` from the binary's signal path so
+peers do not wait out a lease of a pod that is leaving on purpose.

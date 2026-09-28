@@ -86,6 +86,7 @@ impl s3s::S3 for CachingProxy {
         &self,
         mut req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let read_fence = self.local_read_fence();
         // Three things the index cannot answer without guessing at the origin's own
         // wire format or authorisation, so they are forwarded verbatim:
         //   * `encoding-type` — percent-encoding is per-origin (MinIO escapes a space
@@ -114,6 +115,7 @@ impl s3s::S3 for CachingProxy {
             && self.is_synced(req.input.bucket.as_str())
             && self.read_barrier(&req.headers).await == ReadRoute::Local
             && let Some(out) = self.list_from_index(&req.input, resume_after)
+            && self.local_read_gate_open(read_fence).await
         {
             self.metrics.list_from_index();
             return Ok(S3Response::new(out));

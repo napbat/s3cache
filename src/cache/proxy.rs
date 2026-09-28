@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -13,10 +13,9 @@ use tracing::info;
 use crate::cache::copy;
 use crate::index::{
     AuthoritativeKeyState, BodyMatch, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry,
-    ObjMeta, ScanConfig, apply_del, apply_observed_put, apply_put, begin_bucket_resync,
-    compare_entry_body, complete_entry, fence_uncertain_key, head_object_from_index,
-    list_objects_v2_from_index, resolve_uncertain_key, standard_class,
-    sync_bucket_generation_with_config, sync_bucket_into_with_config, uncertain_key_is_current,
+    ObjMeta, ScanConfig, apply_del, apply_observed_put, apply_put, compare_entry_body,
+    complete_entry, fence_uncertain_key, head_object_from_index, list_objects_v2_from_index,
+    resolve_uncertain_key, standard_class, sync_bucket_into_with_config, uncertain_key_is_current,
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync};
@@ -41,6 +40,14 @@ pub struct CacheConfig {
 pub(super) enum ReadRoute {
     Local,
     Origin,
+}
+
+/// The recovery and body-trust generations sampled before a local read may
+/// await gossip, a tier lookup, or an index computation.
+#[derive(Clone, Copy)]
+pub(super) struct LocalReadFence {
+    recovery_generation: Option<u64>,
+    body_generation: u64,
 }
 
 /// A byte range that a complete cached body can answer.
@@ -90,11 +97,9 @@ const READ_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const SYNC_RETRY_MIN: Duration = Duration::from_secs(1);
 const SYNC_RETRY_MAX: Duration = Duration::from_mins(1);
 
-/// Ownership for whole-bucket recovery retries. Boot warm-up and gap remediation can
-/// share one coherence generation while still being distinct recovery runs, so this
-/// local epoch ensures that only the newest run keeps issuing full LISTs. An older LIST
-/// already in flight can collide with one newer attempt, but it loses retry ownership;
-/// the newest run retains it and therefore converges instead of ping-ponging forever.
+/// Single-node (no gossip) background scan ownership. A second warm-up
+/// supersedes the first task's future retries. Gossip recovery has its own
+/// Groupnet operation and publication permit instead.
 #[derive(Clone, Default)]
 pub(super) struct FullSyncOwner(Arc<AtomicU64>);
 
@@ -108,7 +113,7 @@ impl FullSyncOwner {
     }
 }
 
-/// One full-index recovery run's right to retry and affirm.
+/// One single-node warm-up run's right to retry.
 #[derive(Clone)]
 pub(super) struct FullSyncTicket {
     owner: FullSyncOwner,
@@ -354,57 +359,6 @@ impl IndexedWrite {
     }
 }
 
-/// Wait for every warm-up in `warmups`, then affirm the coherence lease on behalf
-/// of `generation`. At boot this is a second affirmation after the full index is
-/// ready. An earlier boot affirmation can license fresh point reads while the
-/// index remains incomplete. A gap supersedes that early proof and requires this
-/// full-index recovery. `full_sync` rejects older boot/gap tasks independently.
-///
-/// With **no** buckets the join is vacuous and the affirmation is immediate, which is
-/// safe rather than a hole: a node told to warm nothing has empty tiers and a
-/// passthrough index, so there is no local state for a lease to license serving — every
-/// LIST forwards, every GET misses, and every index miss is a miss rather than a 404. The
-/// lease shell's own warm-up guard still holds the window shut for this node's first
-/// `detection_window_ms + 2 × anti_entropy_interval` regardless, which is the window that
-/// matters: it is what keeps a booting node from serving under a roster it has not
-/// finished learning.
-pub(super) async fn affirm_after(
-    warmups: Vec<tokio::task::JoinHandle<()>>,
-    sync: Option<Arc<WriteSync>>,
-    generation: Option<u64>,
-    full_sync: Option<FullSyncTicket>,
-) {
-    for warmup in warmups {
-        // A warm-up ends after success or supersession. A join error is this process
-        // shutting down — nothing to report and nothing left to affirm to.
-        let _ = warmup.await;
-    }
-    if full_sync.is_some_and(|ticket| !ticket.is_current()) {
-        return;
-    }
-    if let (Some(sync), Some(generation)) = (sync, generation) {
-        sync.affirm_resynced(generation).await;
-    }
-}
-
-/// License fresh point reads during boot while the full LIST remains incomplete.
-/// A feed gap changes `generation` and leaves its full-index recovery in charge.
-pub(super) async fn affirm_bootstrap(
-    sync: Arc<WriteSync>,
-    generation: u64,
-    full_sync: FullSyncTicket,
-) {
-    while full_sync.is_current()
-        && sync.resync_gen() == generation
-        && !sync.await_fresh(READ_BARRIER_TIMEOUT).await
-    {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    if full_sync.is_current() && sync.resync_gen() == generation {
-        sync.affirm_resynced(generation).await;
-    }
-}
-
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
 /// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
 /// every write.
@@ -427,10 +381,10 @@ pub struct CachingProxy {
     pub(super) sync: Option<Arc<WriteSync>>,
     /// The newest boot/gap full-index recovery allowed to retry and affirm.
     pub(super) full_sync_owner: FullSyncOwner,
-    /// Claimed before the feed apply loop can report a boot-time gap. The gap
-    /// then supersedes this ticket instead of a late boot task replacing it.
-    boot_full_sync: Arc<Mutex<Option<(FullSyncTicket, u64)>>>,
     index_scan: ScanConfig,
+    recovery_config: Option<groupnet::consistency::volatile_recovery::RecoveryConfig>,
+    #[cfg(test)]
+    pub(super) read_return_pause: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     pub(super) metrics: Arc<Metrics>,
 }
 
@@ -468,8 +422,10 @@ impl CachingProxy {
             max_obj_bytes: cfg.max_obj_bytes,
             sync,
             full_sync_owner: FullSyncOwner::default(),
-            boot_full_sync: Arc::new(Mutex::new(None)),
             index_scan: ScanConfig::default(),
+            recovery_config: None,
+            #[cfg(test)]
+            read_return_pause: Arc::new(std::sync::Mutex::new(None)),
             metrics,
         }
     }
@@ -481,114 +437,75 @@ impl CachingProxy {
         self
     }
 
-    /// Start the gossip apply loop: peers' events fold into this node's LIST index and
-    /// invalidate its hot body copies; a gap — or, in `strong`, a serve-lease lapse with no
-    /// gap behind it whose staged recovery could not prove the cache — *distrusts* every
-    /// local body copy (nothing is dropped; each has to prove itself again) and resyncs
-    /// `buckets` from the origin. A no-op without gossip — single-node is already strict.
+    /// Set finite recovery budgets and roster caps for gossip mode.
+    /// The settle window must still cover two local anti-entropy periods.
+    ///
+    /// # Errors
+    /// Returns an invalid-configuration error for zero/overflowing bounds or
+    /// an undersized gossip settle window.
+    pub fn with_recovery_config(
+        mut self,
+        config: groupnet::consistency::volatile_recovery::RecoveryConfig,
+    ) -> Result<Self, groupnet::consistency::volatile_recovery::RecoveryError> {
+        config.validate()?;
+        if self
+            .sync
+            .as_ref()
+            .is_some_and(|sync| config.settle_ms < sync.recovery_settle_floor_ms())
+        {
+            return Err(groupnet::consistency::volatile_recovery::RecoveryError::InvalidConfig);
+        }
+        self.recovery_config = Some(config);
+        Ok(self)
+    }
+
+    /// Start one Groupnet-owned cold origin scan and the gossip apply loop.
+    /// Peer events update the LIST index and invalidate hot bodies. A gap, or
+    /// an unprovable strong serve-lease lapse, closes local serving and starts
+    /// a guarded origin rebuild. A no-op without gossip; the single-node
+    /// background warm-up remains separate.
     pub fn start_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
-        let boot_ticket = self.full_sync_owner.claim();
-        *self
-            .boot_full_sync
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((boot_ticket, sync.resync_gen()));
+        sync.open_recovery(crate::sync::volatile::RecoveryInputs {
+            client: self.client.clone(),
+            state: self.state.clone(),
+            local: self.obj_cache.local(),
+            buckets: buckets.to_vec(),
+            scan: self.index_scan,
+            metrics: self.metrics.clone(),
+            config: self.recovery_config,
+        });
         sync.start_apply(
             self.obj_cache.local(),
             self.state.clone(),
-            self.gap_resync_handle(buckets.to_vec()),
             self.metrics.clone(),
         );
     }
 
-    /// The index half of the remediation: reset every bucket to passthrough
-    /// (unsynced LISTs are always correct) and re-warm the configured ones from
-    /// the origin — the authority the index caches.
+    /// Start a new bounded origin recovery after the previous attempt reached
+    /// `OriginOnly` (for example, an outage longer than its total budget).
+    /// Requests continue forwarding to origin while the new scan runs.
     ///
-    /// Both triggers in `sync` call this — a write-feed gap and a serve-lease lapse with
-    /// no gap behind it — and each has already stood the lease down and *distrusted*
-    /// every cached body before it does: the copies are still there, and the index this
-    /// re-LISTs is what they now have to prove themselves against.
-    ///
-    /// It also **owns the affirmation** that puts this node back in service: only work
-    /// that actually re-synchronized may lift a stand-down, so the generation is read
-    /// here, after that stand-down and before the first LIST, and handed to the
-    /// affirmation at the end. A second gap arriving mid-resync moves the generation on,
-    /// and this affirmation then declines rather than re-opening a window its own resync
-    /// no longer covers.
-    fn gap_resync_handle(&self, buckets: Vec<String>) -> Arc<dyn Fn() + Send + Sync> {
-        let client = self.client.clone();
-        let state = self.state.clone();
-        let sync = self.sync.clone();
-        let full_sync_owner = self.full_sync_owner.clone();
-        let index_scan = self.index_scan;
-        Arc::new(move || {
-            let full_sync = full_sync_owner.claim();
-            let mut reset: std::collections::BTreeSet<String> =
-                state.read().unwrap().keys().cloned().collect();
-            reset.extend(buckets.iter().cloned());
-            let mut first_generations = std::collections::BTreeMap::new();
-            for bucket in reset {
-                if !full_sync.is_current() {
-                    return;
-                }
-                let generation = begin_bucket_resync(&state, &bucket);
-                first_generations.insert(bucket, generation);
-            }
-            if !full_sync.is_current() {
-                return;
-            }
-            let (client, state, buckets) = (client.clone(), state.clone(), buckets.clone());
-            let sync = sync.clone();
-            let generation = sync.as_ref().map(|sync| sync.resync_gen());
-            tokio::spawn(async move {
-                for bucket in buckets {
-                    if !full_sync.is_current() {
-                        return;
-                    }
-                    let mut first_generation = first_generations.remove(&bucket);
-                    let mut backoff = SYNC_RETRY_MIN;
-                    loop {
-                        if !full_sync.is_current() {
-                            return;
-                        }
-                        let result = match first_generation.take() {
-                            Some(generation) => {
-                                sync_bucket_generation_with_config(
-                                    &client, &state, &bucket, generation, index_scan,
-                                )
-                                .await
-                            }
-                            None => {
-                                sync_bucket_into_with_config(&client, &state, &bucket, index_scan)
-                                    .await
-                            }
-                        };
-                        match result {
-                            Ok(_) => break,
-                            Err(error) => {
-                                if !full_sync.is_current() {
-                                    return;
-                                }
-                                tracing::warn!(
-                                    "gap resync of `{bucket}` failed (staying passthrough, \
-                                     retrying in {backoff:?}): {error}"
-                                );
-                                tokio::time::sleep(backoff).await;
-                                backoff = (backoff * 2).min(SYNC_RETRY_MAX);
-                            }
-                        }
-                    }
-                }
-                if !full_sync.is_current() {
-                    return;
-                }
-                if let (Some(sync), Some(generation)) = (sync, generation) {
-                    sync.affirm_resynced(generation).await;
-                }
-            });
-        })
+    /// # Errors
+    /// Fails if gossip recovery was not started or its local fence cannot
+    /// advance. A failed restart never licenses local serving.
+    pub fn restart_coherence(
+        &self,
+    ) -> Result<(), groupnet::consistency::volatile_recovery::RecoveryError> {
+        self.sync
+            .as_ref()
+            .ok_or(groupnet::consistency::volatile_recovery::RecoveryError::Stage)?
+            .restart_recovery()
+    }
+
+    /// Current local recovery stage and its publication gate in gossip mode.
+    /// A completed stage still needs the ordinary lease, freshness, and index
+    /// checks before a read can use local state.
+    #[must_use]
+    pub fn recovery_status(
+        &self,
+    ) -> Option<groupnet::consistency::volatile_recovery::RecoveryStatus> {
+        self.sync.as_ref()?.recovery_status()
     }
 
     /// Freshness barrier: before serving a read from node-local state (the LIST index,
@@ -627,6 +544,47 @@ impl CachingProxy {
             return ReadRoute::Origin;
         }
         ReadRoute::Local
+    }
+
+    /// Capture the recovery and body-trust generations before a local read can
+    /// await. Its final gate check rejects an answer from a superseded scan.
+    pub(super) fn local_read_fence(&self) -> LocalReadFence {
+        LocalReadFence {
+            recovery_generation: self
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.recovery_status())
+                .map(|status| status.state.generation),
+            body_generation: self.obj_cache.suspect_gen(),
+        }
+    }
+
+    /// Check the captured generations and synchronous serving gate after an
+    /// asynchronous tier or index read. No index guard is held here.
+    #[cfg(not(test))]
+    pub(super) fn local_read_gate_open(&self, fence: LocalReadFence) -> std::future::Ready<bool> {
+        std::future::ready(self.local_read_gate_now(fence))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn local_read_gate_open(&self, fence: LocalReadFence) -> bool {
+        let pause = {
+            let mut guard = self.read_return_pause.lock().unwrap();
+            guard.take()
+        };
+        if let Some(pause) = pause {
+            pause.wait().await;
+            pause.wait().await;
+        }
+        self.local_read_gate_now(fence)
+    }
+
+    fn local_read_gate_now(&self, fence: LocalReadFence) -> bool {
+        self.obj_cache.suspect_gen() == fence.body_generation
+            && self
+                .sync
+                .as_ref()
+                .is_none_or(|sync| sync.may_serve_local_in_generation(fence.recovery_generation))
     }
 
     /// Whether this node's currently serveable index says every conditional on `input`
@@ -829,43 +787,24 @@ impl CachingProxy {
     /// passthrough for the process lifetime — a transient origin outage at startup
     /// should not cost every LIST for the next fortnight.
     ///
-    /// A fresh process has no trusted hot bodies. Its persisted disk bodies are
-    /// suspect. The boot lease can affirm before the LIST scan completes, which
-    /// permits fresh GET fills while LIST and index-backed HEAD stay origin-routed.
-    /// A feed gap supersedes that boot proof and restores the full-scan requirement.
-    /// The full-scan affirmation remains as the recovery path.
+    /// Gossip nodes use Groupnet's guarded cold scan started by
+    /// [`start_coherence`](Self::start_coherence); this method then does no
+    /// duplicate work. Without gossip, it retains the independent single-node
+    /// background warm-up and bounded per-bucket origin retries.
     pub fn spawn_background_sync(&self, buckets: Vec<String>) {
-        let boot = self
-            .boot_full_sync
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let (full_sync, generation, can_affirm_early) = match boot {
-            Some((ticket, generation)) => (ticket, Some(generation), true),
-            None if self.sync.is_some() => {
+        if self.sync.is_some() {
+            if !self.sync.as_ref().is_some_and(|sync| sync.has_recovery()) {
                 tracing::error!("start_coherence must run before background sync with gossip");
-                return;
             }
-            None => (self.full_sync_owner.claim(), None, false),
-        };
-        let index_scan = self.index_scan;
-        let sync = self.sync.clone();
-        if let (Some(boot_sync), Some(boot_generation)) = (sync.clone(), generation)
-            && can_affirm_early
-            && boot_generation == 0
-        {
-            tokio::spawn(affirm_bootstrap(
-                boot_sync,
-                boot_generation,
-                full_sync.clone(),
-            ));
+            return;
         }
-        let mut warmups = Vec::with_capacity(buckets.len());
+        let full_sync = self.full_sync_owner.claim();
+        let index_scan = self.index_scan;
         for bucket in buckets {
             let client = self.client.clone();
             let state = self.state.clone();
             let full_sync = full_sync.clone();
-            warmups.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 let mut backoff = SYNC_RETRY_MIN;
                 loop {
                     if !full_sync.is_current() {
@@ -889,9 +828,8 @@ impl CachingProxy {
                         }
                     }
                 }
-            }));
+            });
         }
-        tokio::spawn(affirm_after(warmups, sync, generation, Some(full_sync)));
     }
 
     /// Fold what an origin response proved into the index. An already-indexed key is
@@ -1285,6 +1223,7 @@ impl CachingProxy {
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
+        let read_fence = self.local_read_fence();
         // Requests whose response the cache can't faithfully reproduce must go to the
         // origin: a specific version, origin-computed checksums, SSE-C (whose bytes must
         // never be served without the caller's key), or a bucket-owner guard, which is
@@ -1316,6 +1255,7 @@ impl CachingProxy {
             if local_ok
                 && let Some(obj) = self.validated_get(&ckey).await
                 && let Some(out) = range.slice(&obj)
+                && self.local_read_gate_open(read_fence).await
             {
                 self.metrics.range_hit();
                 return Ok(S3Response::new(out));
@@ -1331,6 +1271,7 @@ impl CachingProxy {
                 && small
                 && let CachedRange::Int { first, last } = range
                 && let Some(resp) = self.promote_range(&ckey, &req, first, last).await
+                && self.local_read_gate_open(read_fence).await
             {
                 return resp;
             }
@@ -1342,6 +1283,7 @@ impl CachingProxy {
         if local_ok
             && cacheable
             && let Some(obj) = self.validated_get(&ckey).await
+            && self.local_read_gate_open(read_fence).await
         {
             self.metrics.get_hit();
             return Ok(S3Response::new(obj.to_get()));
@@ -1363,13 +1305,14 @@ impl CachingProxy {
             return self.inner.get_object(req).await;
         }
 
-        self.fill_whole_get(req, &ckey).await
+        self.fill_whole_get(req, &ckey, read_fence).await
     }
 
     async fn fill_whole_get(
         &self,
         req: S3Request<GetObjectInput>,
         ckey: &(String, String),
+        read_fence: LocalReadFence,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         // Read before the fetch, not after it: a remediation that distrusts the cache
         // while this round-trip is in flight must leave the copy it lands suspect.
@@ -1381,6 +1324,7 @@ impl CachingProxy {
         let generation = self.obj_cache.suspect_gen();
         let cap = self.max_obj_bytes;
         let inner = &self.inner;
+        let fallback_req = req.clone();
         let origin = async {
             let mut resp = inner
                 .get_object(req)
@@ -1426,7 +1370,13 @@ impl CachingProxy {
             )
             .await
         {
-            Ok(filled) => Ok(S3Response::new(filled.to_get())),
+            Ok(filled) if self.local_read_gate_open(read_fence).await => {
+                Ok(S3Response::new(filled.to_get()))
+            }
+            Ok(_) => {
+                self.metrics.get_bypass();
+                self.inner.get_object(fallback_req).await
+            }
             Err(WholeGetFillError::Origin(error)) => Err(error),
             Err(WholeGetFillError::Uncacheable(resp)) => {
                 self.metrics.get_bypass();
@@ -1441,6 +1391,7 @@ impl CachingProxy {
         &self,
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let read_fence = self.local_read_fence();
         let cache_eligible = req.input.range.is_none()
             && req.input.part_number.is_none()
             && req.input.version_id.is_none()
@@ -1456,23 +1407,28 @@ impl CachingProxy {
             && !self.key_uncertain(&ckey.0, &ckey.1)
             && self.read_barrier(&req.headers).await == ReadRoute::Local
         {
-            if let Some(obj) = self.validated_get(&ckey).await {
+            if let Some(obj) = self.validated_get(&ckey).await
+                && self.local_read_gate_open(read_fence).await
+            {
                 self.metrics.head_hit();
                 return Ok(S3Response::new(obj.to_head()));
             }
             if self.is_synced(&ckey.0) {
-                match self.head_from_index(&ckey.0, &ckey.1) {
-                    IndexedHead::Faithful(out) => {
-                        self.metrics.head_index();
-                        return Ok(S3Response::new(*out));
+                let indexed = self.head_from_index(&ckey.0, &ckey.1);
+                if self.local_read_gate_open(read_fence).await {
+                    match indexed {
+                        IndexedHead::Faithful(out) => {
+                            self.metrics.head_index();
+                            return Ok(S3Response::new(*out));
+                        }
+                        // A key the index does not hold does not exist — but only once no
+                        // peer can still be holding a write this node has not seen.
+                        IndexedHead::Absent if self.index_404_trustworthy() => {
+                            self.metrics.head_404();
+                            return Err(s3s::s3_error!(NoSuchKey, "the key does not exist"));
+                        }
+                        IndexedHead::Absent | IndexedHead::Incomplete => {}
                     }
-                    // A key the index does not hold does not exist — but only once no
-                    // peer can still be holding a write this node has not seen.
-                    IndexedHead::Absent if self.index_404_trustworthy() => {
-                        self.metrics.head_404();
-                        return Err(s3s::s3_error!(NoSuchKey, "the key does not exist"));
-                    }
-                    IndexedHead::Absent | IndexedHead::Incomplete => {}
                 }
             }
         }

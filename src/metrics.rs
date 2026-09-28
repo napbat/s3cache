@@ -278,33 +278,10 @@ counters! {
     /// movement means a peer is unresponsive, and each such write cost up to one lease
     /// duration.
     write_lease_lapses => write_lease_lapse,
-    /// Record a resync this node ran because **its own** serve-lease lapsed with no
-    /// write-feed gap to explain it — a peer stopped granting (scale-in, a crash, a
-    /// partition that healed without overflowing the ring) — and the staged barrier could
-    /// not prove its cache instead, so the lapse watcher fell back to the gap
-    /// remediation: every body distrusted, index re-LISTed from the origin, licence
-    /// re-affirmed. Each one is a stretch of origin-serving that ends at the reap
-    /// horizon, plus a cache that has to buy itself back one key at a time; sustained
-    /// movement means a peer is flapping.
-    ///
-    /// The **expensive** arm of a lapse, and the same set `lapse_barrier_fallbacks`
-    /// counts — the two move together, and the pair with `lapse_barrier_retains` is what
-    /// says how often the cheap arm is winning.
-    lease_lapse_resyncs => lease_lapse_resync,
-    /// Record a serve-lease lapse the staged barrier answered by **retaining** the body
-    /// cache: the peers that were alive when the lapse landed were still there after the
-    /// lease re-confirmed, and their advertised feed heads had all been applied locally,
-    /// so every write of the lapse era had already evicted exactly the keys it touched.
-    /// Nothing was distrusted, nothing was re-LISTed, and every untouched body kept its
-    /// proof — the cheap arm, and the one a healthy fleet should live on.
-    lapse_barrier_retains => lapse_barrier_retain,
-    /// Record a lapse the staged barrier could **not** answer, so the node fell back to
-    /// the full remediation (which is what `lease_lapse_resyncs` counts): a peer that was
-    /// alive when the lapse landed vanished from membership before the barrier ran (its
-    /// feed frame went with it), a peer's head never arrived, or the lease never
-    /// re-confirmed inside the deadline. Fail-closed by construction — every one of these
-    /// is "the proof was unavailable", never "the proof failed".
-    lapse_barrier_fallbacks => lapse_barrier_fallback,
+    /// A Groupnet recovery generation began an origin index scan on this node.
+    /// Includes initial bootstrap, explicit gap recovery, and a full lapse
+    /// fallback; retries are counted separately as additional attempts.
+    recovery_origin_scans => recovery_origin_scan,
     /// Record a cache-served read routed to the origin because this node held no licence
     /// to serve it locally: no valid coherence lease (`strong` — booting, warming up,
     /// lapsed, awaiting a resync affirmation, or a granter gone silent), or a membership

@@ -198,6 +198,7 @@ pub struct Origin {
     pub ops: Arc<Ops>,
     put_fault: Arc<AppliedPutFault>,
     list_pause: Arc<ResponsePause>,
+    list_fault: Arc<AtomicBool>,
     get_pause: Arc<ResponsePause>,
 }
 
@@ -289,12 +290,14 @@ impl Origin {
         let ops = Arc::new(Ops::default());
         let put_fault = Arc::new(AppliedPutFault::default());
         let list_pause = Arc::new(ResponsePause::default());
+        let list_fault = Arc::new(AtomicBool::new(false));
         let get_pause = Arc::new(ResponsePause::default());
         let counted = counting_proxy(
             minio,
             Arc::clone(&ops),
             Arc::clone(&put_fault),
             Arc::clone(&list_pause),
+            Arc::clone(&list_fault),
             Arc::clone(&get_pause),
         )
         .await;
@@ -306,6 +309,7 @@ impl Origin {
             ops,
             put_fault,
             list_pause,
+            list_fault,
             get_pause,
         })
     }
@@ -323,6 +327,11 @@ impl Origin {
     /// Let the held LIST response reach the index scanner.
     pub fn release_paused_list(&self) {
         self.list_pause.release();
+    }
+
+    /// Make every counted LIST fail until cleared, including recovery retries.
+    pub fn fail_lists(&self, enabled: bool) {
+        self.list_fault.store(enabled, Ordering::SeqCst);
     }
 
     /// Hold the next origin object GET response after `MinIO` returns it.
@@ -478,6 +487,7 @@ async fn counting_proxy(
     ops: Arc<Ops>,
     put_fault: Arc<AppliedPutFault>,
     list_pause: Arc<ResponsePause>,
+    list_fault: Arc<AtomicBool>,
     get_pause: Arc<ResponsePause>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -493,6 +503,7 @@ async fn counting_proxy(
             let ops = Arc::clone(&ops);
             let put_fault = Arc::clone(&put_fault);
             let list_pause = Arc::clone(&list_pause);
+            let list_fault = Arc::clone(&list_fault);
             let get_pause = Arc::clone(&get_pause);
             let conn = http
                 .serve_connection(
@@ -501,11 +512,20 @@ async fn counting_proxy(
                         let ops = Arc::clone(&ops);
                         let put_fault = Arc::clone(&put_fault);
                         let list_pause = Arc::clone(&list_pause);
+                        let list_fault = Arc::clone(&list_fault);
                         let get_pause = Arc::clone(&get_pause);
                         async move {
                             ops.record(req.method(), req.uri(), req.headers());
                             Ok::<_, std::convert::Infallible>(
-                                forward(upstream, req, &put_fault, &list_pause, &get_pause).await,
+                                forward(
+                                    upstream,
+                                    req,
+                                    &put_fault,
+                                    &list_pause,
+                                    &list_fault,
+                                    &get_pause,
+                                )
+                                .await,
                             )
                         }
                     }),
@@ -537,6 +557,7 @@ async fn forward(
     req: Request<Incoming>,
     put_fault: &AppliedPutFault,
     list_pause: &ResponsePause,
+    list_fault: &AtomicBool,
     get_pause: &ResponsePause,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
     let faulted = put_fault.claim(&req);
@@ -544,6 +565,19 @@ async fn forward(
     let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
     let held_list = req.method() == Method::GET && !on_key && list_pause.claim();
     let held_get = req.method() == Method::GET && on_key && get_pause.claim();
+    if req.method() == Method::GET && !on_key && list_fault.load(Ordering::SeqCst) {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("content-type", "application/xml")
+            .body(
+                Full::new(Bytes::from_static(
+                    b"<Error><Code>ServiceUnavailable</Code><Message>injected LIST outage</Message></Error>",
+                ))
+                .map_err(|never| match never {})
+                .boxed(),
+            )
+            .expect("an injected LIST failure is well-formed");
+    }
     match relay(upstream, req).await {
         Ok(resp) if faulted && resp.status().is_success() => {
             put_fault.origin_applied();

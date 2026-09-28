@@ -40,10 +40,8 @@ struct Sample {
     licence_b: u64,
     freshness_a: u64,
     freshness_b: u64,
-    lapse_retain_a: u64,
-    lapse_retain_b: u64,
-    lapse_fallback_a: u64,
-    lapse_fallback_b: u64,
+    recovery_scans_a: u64,
+    recovery_scans_b: u64,
     gaps_a: u64,
     gaps_b: u64,
 }
@@ -66,10 +64,8 @@ impl Sample {
             licence_b: counter(b, "read_licence_bypasses"),
             freshness_a: counter(a, "read_freshness_bypasses"),
             freshness_b: counter(b, "read_freshness_bypasses"),
-            lapse_retain_a: counter(a, "lapse_barrier_retains"),
-            lapse_retain_b: counter(b, "lapse_barrier_retains"),
-            lapse_fallback_a: counter(a, "lapse_barrier_fallbacks"),
-            lapse_fallback_b: counter(b, "lapse_barrier_fallbacks"),
+            recovery_scans_a: counter(a, "recovery_origin_scans"),
+            recovery_scans_b: counter(b, "recovery_origin_scans"),
             gaps_a: counter(a, "feed_gaps"),
             gaps_b: counter(b, "feed_gaps"),
         }
@@ -78,7 +74,7 @@ impl Sample {
     fn report(self, before: Self, label: &str, elapsed: Duration) {
         let d = |after: u64, before: u64| after.saturating_sub(before);
         println!(
-            "idle_origin {label} elapsed_s={:.3} origin_list={} origin_get={} origin_head={} origin_put={} origin_delete={} origin_copy={} origin_other={} list_index_a={} list_index_b={} list_passthrough_a={} list_passthrough_b={} licence_a={} licence_b={} freshness_a={} freshness_b={} lapse_retain_a={} lapse_retain_b={} lapse_fallback_a={} lapse_fallback_b={} feed_gaps_a={} feed_gaps_b={}",
+            "idle_origin {label} elapsed_s={:.3} origin_list={} origin_get={} origin_head={} origin_put={} origin_delete={} origin_copy={} origin_other={} list_index_a={} list_index_b={} list_passthrough_a={} list_passthrough_b={} licence_a={} licence_b={} freshness_a={} freshness_b={} recovery_scans_a={} recovery_scans_b={} feed_gaps_a={} feed_gaps_b={}",
             elapsed.as_secs_f64(),
             d(self.list, before.list),
             d(self.get, before.get),
@@ -95,10 +91,8 @@ impl Sample {
             d(self.licence_b, before.licence_b),
             d(self.freshness_a, before.freshness_a),
             d(self.freshness_b, before.freshness_b),
-            d(self.lapse_retain_a, before.lapse_retain_a),
-            d(self.lapse_retain_b, before.lapse_retain_b),
-            d(self.lapse_fallback_a, before.lapse_fallback_a),
-            d(self.lapse_fallback_b, before.lapse_fallback_b),
+            d(self.recovery_scans_a, before.recovery_scans_a),
+            d(self.recovery_scans_b, before.recovery_scans_b),
             d(self.gaps_a, before.gaps_a),
             d(self.gaps_b, before.gaps_b),
         );

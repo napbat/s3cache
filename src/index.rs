@@ -877,7 +877,23 @@ pub(crate) async fn sync_bucket_generation_with_config(
     generation: u64,
     config: ScanConfig,
 ) -> anyhow::Result<usize> {
-    scan::sync_bucket_generation(client, state, bucket, generation, config).await
+    scan::sync_bucket_generation(client, state, bucket, generation, config, None).await
+}
+
+/// Recovery LIST with every page and the final synced flag guarded by the
+/// exact volatile-recovery operation, including its absolute deadline.
+///
+/// # Errors
+/// Returns the origin error or a superseded/expired publication error.
+pub(crate) async fn sync_bucket_generation_guarded(
+    client: &aws_sdk_s3::Client,
+    state: &KeyIndex,
+    bucket: &str,
+    generation: u64,
+    config: ScanConfig,
+    permit: groupnet::consistency::volatile_recovery::PublicationPermit,
+) -> anyhow::Result<usize> {
+    scan::sync_bucket_generation(client, state, bucket, generation, config, Some(permit)).await
 }
 
 #[cfg(test)]

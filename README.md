@@ -175,11 +175,12 @@ heuristic earlier releases used:
 - **A gap stands the lease down first.** A write-feed gap (ring overflow, a peer
   restart) is proof this node missed invalidations, so it drops its right to serve
   *before* the remediation runs — and only the resync that actually ran may hand it
-  back. A booting node can obtain its first lease after feed catch-up and the
-  lease warm-up window, while its bucket scans continue. It can then cache fresh
-  GET responses and reuse them. Persisted bodies remain suspect until validated.
-  LIST and index-backed absence still require a complete bucket index.
-  A feed gap during boot cancels this early proof and requires the full recovery scan.
+  back. Groupnet now owns one cold origin scan per node in gossip mode. Until that scan
+  completes and the node affirms recovery, positive GETs forward to origin;
+  requests do not wait for LIST, and local cache hits become available after
+  recovery. Persisted bodies remain suspect
+  until validated. LIST and index-backed absence still require a complete bucket
+  index. A feed gap during boot supersedes the scan and requires a fresh one.
 - **A lapse with no gap behind it gets a recovery, and usually keeps the cache.** Not
   every way of losing the licence arrives as an event: a peer scaled in, lost for good,
   or restarted while the write feed was quiet freezes this node's confirmation with no
@@ -196,11 +197,10 @@ heuristic earlier releases used:
   barrier waits and a reap can land inside that wait. Past the barrier the apply loop has
   updated every changed key and removed its stale hot copy; retained warm bodies must
   validate against that index, while unrelated hot bodies keep their proof. The node then
-  re-affirms warm (`lapse_barrier_retains`). Any stage that cannot
+  re-affirms warm. Groupnet owns the bounded generation and retry schedule. Any stage that cannot
   get its proof — a live peer reaped before the recovery could affirm, so its feed frame
   went with it; a head that never arrives; a granter that never re-grants — falls back to
-  the gap's remediation instead (`lapse_barrier_fallbacks`, the same set
-  `lease_lapse_resyncs` counts). Without any of this a lapse would be permanent
+  the gap's guarded origin rebuild instead. Without any of this a lapse would be permanent
   origin-serving for a node whose surviving peers are perfectly healthy.
 
 **What it rests on, stated as failure modes** (groupnet's `consistency::lease` honesty
@@ -324,8 +324,11 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
   in-process — real groupnet nodes over an in-memory transport, no external services.
   They cover peer-write index folding + hot-only invalidation (including retained,
   suspect warm bodies), out-of-order LWW convergence
-  (tombstones, delete-wins-ties, no-resurrection), the freshness barrier, the gap path,
-  and the staged lapse recovery — what it retains, and every way it falls back.
+  (tombstones, delete-wins-ties, no-resurrection), and the freshness barrier.
+  Groupnet's sans-IO core and simulator cover recovery generations, lease-lapse
+  barriers, vanished peers, retry budgets, and stale callbacks. S3cache's MinIO
+  startup tests cover origin fallback, body distrust, guarded retry pages, and
+  explicit restart after a prolonged outage.
 - **Integration tests** (`cargo test --locked --workspace --all-features`, needs a
   Docker daemon): `tests/e2e.rs` and `tests/coherence.rs` run the real `CachingProxy`
   against a **real MinIO origin** (testcontainers) reached through a transparent
@@ -455,10 +458,10 @@ completed from a forwarded answer — see below), the warm tier (`warm_hit` / `w
 `warm_error` stays alertable), its live Tierstore view (`warm_entries`,
 `warm_mapped_entries`, `warm_disk_bytes`, `warm_disk_budget_bytes`, `warm_evictions`, and
 `warm_evicted_bytes`), and the
-gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`, `lease_lapse_resyncs`,
-`lapse_barrier_retains`, `lapse_barrier_fallbacks`, `unhealthy_bypasses`).
+gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`,
+`recovery_origin_scans`, `unhealthy_bypasses`).
 
-The last six are the coherence tier's, and the split between the first two is the one
+Those are the coherence tier's, and the split between lease lapses and timeouts is the one
 worth wiring an alert around: **`write_lease_lapses` is the guarantee working** — a peer
 stopped acknowledging, its serve-lease expired, and the write completed knowing that peer
 can serve nothing cached until it re-synchronizes. Sustained movement means a pod is
@@ -477,10 +480,6 @@ synced index. Its reason counters are `body_revalidation_index_absent`,
 `body_revalidation_timestamp_mismatch`. These reasons keep the same trust
 decision. A body in an unsynced bucket is invalidated without incrementing
 `body_revalidation_evictions`.
-The lapse pair is the read side of the same story: this node's *own* lease lapsed with no
-gap to explain it (a peer stopped granting). `lapse_barrier_retains` is the cheap arm —
-the staged recovery proved the cache and kept it, so the node came back **warm** — and
-`lapse_barrier_fallbacks` is the expensive one, where the proof was unavailable and the
-node distrusted, re-LISTed and affirmed its way back cold; `lease_lapse_resyncs` counts
-exactly that second set. One lapse per peer death is normal, and the ratio between the
-two arms is what says what a flapping peer is actually costing.
+`recovery_origin_scans` counts one attempt each time this node starts the full
+origin-index arm, including cold boot, gaps, and any lapse whose feed/lease proof
+could not retain its index. The origin LIST counter prices the actual request cost.

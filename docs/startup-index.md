@@ -7,15 +7,36 @@ Listener readiness and index completion are separate states.
 Requests can then reach the origin while the index is incomplete.
 `GET /index-ready` separately reports initial index and coherence readiness.
 
-A body fetched under a valid coherence lease can serve later reads before the
-full index scan finishes. A body from a prior process still requires validation.
-Each later read must pass the current coherence read barrier.
+In gossip mode, Groupnet owns one initial origin scan per node and keeps the local
+serving gate closed until that scan and its recovery affirmation complete.
+Positive GETs still forward to the origin while this happens; they do not wait
+for LIST and may fill a body for later index validation. This increases origin
+GETs and local-hit latency during a cold join compared with the prior early
+lease affirmation. A body from a prior process still requires validation, and
+each later local read must pass the current coherence read barrier.
+Connected nodes currently scan independently. Fleet-wide single-builder
+bootstrap and peer index transfer remain a separate follow-up; skipping another
+node's scan without a transferred, validated index would leave it origin-only.
+Recovery retries individual failed scans within a finite total budget. If that
+budget expires during a prolonged origin outage, the node remains origin-routed
+until `CachingProxy::restart_coherence` explicitly starts a new episode (or a
+new feed gap does). Automatic capped rearm belongs in the Groupnet recovery
+policy follow-up; this consumer does not run a second retry loop.
 An incomplete index cannot prove that a key is absent or that a LIST is complete.
 Those requests continue to use the origin.
 
-A feed gap during boot cancels the early lease affirmation.
-The node then waits for the full recovery scan before serving local data.
-An ordinary rolling join with retained feed history can use early cache hits.
+The former s3cache lapse/retry state-machine tests now live at the protocol
+boundary in Groupnet's deterministic volatile-recovery core and simulator:
+generation supersession, lapse and vanished-peer proofs, frontier barriers,
+bounded retries, and terminal failure. S3cache keeps black-box assertions at
+its own boundary: cold positive GETs and warm bodies use origin fallback, a
+timed-out scan cannot publish a delayed page, a prolonged outage needs a new
+episode, malformed advertised feed data fails observation, and the default
+path creates no origin control objects.
+
+A feed gap during boot supersedes that scan and requires a fresh guarded scan
+before local serving. Retained volatile feed history alone is not a certified
+index baseline for a new process.
 
 ## Parallel scan
 
@@ -41,7 +62,10 @@ The first such mutation also supersedes a previously scanned row, regardless of
 the relative origin and proxy timestamps. An unresolved mutation keeps its key
 unavailable to local reads.
 
-A newer rebuild generation rejects pages from the previous generation.
+A newer rebuild generation rejects pages from the previous generation. Each
+origin LIST page and the final complete-index flag also require the current
+Groupnet publication permit, so a delayed page cannot publish after a gap or
+recovery timeout.
 After completion, each local LIST still passes the coherence read barrier.
 The barrier and lease govern whether the node can serve its index.
 A feed gap requires recovery.

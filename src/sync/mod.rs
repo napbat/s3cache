@@ -30,8 +30,9 @@
 //! `consistency::lease` honesty box.
 //! Losing that licence is a latch, so every way of losing it needs a way back:
 //! a gap has the apply loop, and a lapse with no gap behind it — a peer scaled
-//! in, lost, or restarted quietly — has the staged recovery. Its full barrier
-//! correctness argument lives beside the implementation in `recovery`.
+//! in, lost, or restarted quietly — enters Groupnet's bounded volatile
+//! recovery protocol. `volatile` supplies S3 origin and local-lease facts;
+//! Groupnet owns the retry, generation, and affirmation decisions.
 
 /// Consistency modes and the gossip write-feed coherence engine.
 pub mod coherence;
@@ -39,7 +40,7 @@ pub mod coherence;
 pub mod config;
 /// Durable, scoped control-source slots; not yet connected to serving or writes.
 pub mod control;
-mod recovery;
+pub(crate) mod volatile;
 pub(crate) mod wire;
 
 #[cfg(test)]
