@@ -37,6 +37,8 @@
 pub mod coherence;
 /// Gossip environment/config parsing and node construction.
 pub mod config;
+/// Durable, scoped control-source slots; not yet connected to serving or writes.
+pub mod control;
 mod recovery;
 pub(crate) mod wire;
 
