@@ -46,8 +46,8 @@ use s3s::dto::{
 use s3s::{S3, S3Request, S3Result};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -101,6 +101,18 @@ pub struct Ops {
     copy: AtomicU64,
     conditional_copy: AtomicU64,
     other: AtomicU64,
+    writes: Mutex<Vec<OriginWrite>>,
+}
+
+/// One mutating request that actually reached the counted origin endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OriginWrite {
+    /// The HTTP mutation verb.
+    pub method: Method,
+    /// The path-style bucket and key target.
+    pub path: String,
+    /// The raw multipart or other S3 query, if present.
+    pub query: Option<String>,
 }
 
 macro_rules! op_readers {
@@ -119,10 +131,29 @@ macro_rules! op_readers {
 op_readers!(list, get, head, put, delete, copy, conditional_copy, other);
 
 impl Ops {
+    /// Every origin mutation, including bucket-level POSTs and multipart requests.
+    #[must_use]
+    pub fn writes(&self) -> Vec<OriginWrite> {
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Classify one forwarded request the way S3 bills it, and count it. Path-style
     /// addressing (what the proxy uses) makes `/bucket` a bucket operation and
     /// `/bucket/key` an object one; a copy is a PUT carrying a copy source.
     fn record(&self, method: &Method, uri: &Uri, headers: &HeaderMap) {
+        if matches!(*method, Method::PUT | Method::POST | Method::DELETE) {
+            self.writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(OriginWrite {
+                    method: method.clone(),
+                    path: uri.path().to_owned(),
+                    query: uri.query().map(str::to_owned),
+                });
+        }
         let path = uri.path().trim_start_matches('/');
         let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
         if method == Method::PUT
