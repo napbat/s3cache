@@ -9,7 +9,7 @@ use std::sync::Arc;
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioIo;
-use s3cache::metrics::{Metrics, spawn_exporter};
+use s3cache::metrics::{Metrics, StartupReady, spawn_exporter};
 use tokio::net::TcpStream;
 
 /// One scrape over the wire.
@@ -35,9 +35,15 @@ async fn scrape(addr: SocketAddr, path: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn the_exporter_serves_the_counters_as_prometheus_text() {
     let metrics = Arc::new(Metrics::default());
-    let addr = spawn_exporter(Arc::clone(&metrics), "127.0.0.1:0")
+    let readiness = Arc::new(StartupReady::default());
+    let addr = spawn_exporter(Arc::clone(&metrics), Arc::clone(&readiness), "127.0.0.1:0")
         .await
         .expect("the exporter binds");
+
+    assert_eq!(
+        scrape(addr, "/ready").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 
     let (status, body) = scrape(addr, "/metrics").await;
     assert_eq!(status, StatusCode::OK);
@@ -57,4 +63,6 @@ async fn the_exporter_serves_the_counters_as_prometheus_text() {
     }
 
     assert_eq!(scrape(addr, "/").await.0, StatusCode::NOT_FOUND);
+    readiness.mark_ready();
+    assert_eq!(scrape(addr, "/ready").await.0, StatusCode::OK);
 }

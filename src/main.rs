@@ -78,13 +78,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // upstream (always correct) until a bucket's index is complete, then flip to
     // index-served. Keeps startup instant + independent of bucket size. A bucket that
     // fails to sync just stays in passthrough (safe).
-    cp.spawn_background_sync(cfg.buckets);
+    cp.spawn_background_sync(cfg.buckets.clone());
     metrics::spawn_stats(cp.metrics(), cfg.stats_secs);
     // Optional Prometheus text endpoint on its own port, so the counters can be graphed
     // and alerted on instead of diffed out of the stats line by hand. Off by default;
     // a bad S3CACHE_METRICS_LISTEN fails startup rather than leaving a silent blind spot.
     if let Some(listen) = &cfg.metrics_listen {
-        metrics::spawn_exporter(cp.metrics(), listen).await?;
+        let readiness = Arc::new(metrics::StartupReady::default());
+        let probe = cp.clone();
+        let buckets = cfg.buckets.clone();
+        let latch = Arc::clone(&readiness);
+        tokio::spawn(async move {
+            loop {
+                if probe.initially_ready(&buckets) {
+                    latch.mark_ready();
+                    info!(
+                        "initial index ready for {} configured buckets",
+                        buckets.len()
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+        metrics::spawn_exporter(cp.metrics(), readiness, listen).await?;
     }
 
     let service = {

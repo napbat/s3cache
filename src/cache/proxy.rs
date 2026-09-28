@@ -407,6 +407,15 @@ pub struct CachingProxy {
 }
 
 impl CachingProxy {
+    /// Whether the initial configured index is complete and this node may serve
+    /// from local state. Callers latch the first true result for startup
+    /// readiness. Later lease loss must keep the origin fallback available.
+    #[must_use]
+    pub fn initially_ready(&self, buckets: &[String]) -> bool {
+        buckets.iter().all(|bucket| self.is_synced(bucket))
+            && self.sync.as_ref().is_none_or(|sync| sync.may_serve_local())
+    }
+
     /// Wire up the proxy. `cfg` sizes the hot tier; `warm` is the optional node-local
     /// disk tier and `sync` the gossip write feed (both built by the caller). `metrics`
     /// is shared so the tiers, the feed, and the stats task all report into it.

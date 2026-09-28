@@ -109,6 +109,31 @@ async fn the_boot_affirmation_waits_for_every_bucket_warmup() {
     );
 }
 
+#[tokio::test]
+async fn startup_readiness_requires_every_index_and_the_boot_licence() {
+    let (_node, sync) = solo("startup-ready");
+    let proxy = proxy(Some(Arc::clone(&sync)));
+    let buckets = vec!["first".to_owned(), "second".to_owned()];
+
+    assert!(!proxy.initially_ready(&buckets));
+    proxy.state.mark_bucket_synced("first");
+    assert!(!proxy.initially_ready(&buckets));
+    proxy.state.mark_bucket_synced("second");
+    assert!(
+        !proxy.initially_ready(&buckets),
+        "boot licence is still closed"
+    );
+
+    affirm_after(
+        Vec::new(),
+        Some(Arc::clone(&sync)),
+        Some(sync.resync_gen()),
+        None,
+    )
+    .await;
+    assert!(proxy.initially_ready(&buckets));
+}
+
 /// Retry and affirmation ownership is independent of the coherence generation: boot
 /// warm-up can start after a gap has already claimed that same coherence generation.
 /// Only the newest full-index recovery may keep retrying or affirm it.

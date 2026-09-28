@@ -114,9 +114,14 @@ With the feed on, **multiple replicas are safe** — this lifts the historical
 single-replica constraint with zero extra services.
 
 The Helm chart preserves that availability during routine operations: replicated
-releases wait for a new ordinal to remain ready before advancing a rollout and
-render a `PodDisruptionBudget` with `maxUnavailable: 1`. Each ordinal owns its own
-warm PVC, so rollout availability does not require sharing cache files.
+releases wait for a new ordinal to finish its initial bucket index sync and gain
+a read licence before advancing a rollout. The `GET /ready` check is on the
+metrics port. It stays ready after the first success, so a later lease lapse
+still uses the safe origin fallback. The headless gossip Service publishes
+not-ready addresses so peers can connect during warm-up. Disabling the metrics
+listener selects a TCP readiness check, which admits a pod before index warm-up.
+The chart renders a `PodDisruptionBudget` with `maxUnavailable: 1`. Each ordinal
+owns its own warm PVC, so rollout availability does not require sharing cache files.
 
 ## Consistency
 
@@ -410,6 +415,10 @@ Every counter is logged as one `s3cache stats:` line each `S3CACHE_STATS_SECS`, 
 when `S3CACHE_METRICS_LISTEN` is set — served as Prometheus text at `GET /metrics` on
 that address, `s3cache_`-prefixed (`metrics.enabled` in the chart). Both are generated
 from one declaration, so a counter cannot exist in one and not the other.
+The same listener returns 503 at `GET /ready` until the configured bucket
+indexes are complete and the boot read licence is available. It returns 200
+afterward, including during later lease lapses. The S3 read barrier still
+routes those later reads to the origin.
 
 What they attribute: LIST (`list_from_index` vs `list_passthrough`), GET
 (`get_hit` / `get_miss` / `get_bypass`, `range_*`), HEAD (`head_hit` from a cached body,

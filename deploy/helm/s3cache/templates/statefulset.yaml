@@ -111,12 +111,19 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.auth.existingSecret }}
-          # No startupProbe needed: the proxy binds + serves immediately and warms its LIST
-          # index in the background (LISTs pass through until warm), so readiness/liveness
-          # can engage right away regardless of bucket size.
+          # Keep client traffic on an old ready pod until this pod has completed
+          # its initial index sync and gained a read licence. Liveness checks only
+          # the S3 listener; a slow origin sync must not restart the process.
           readinessProbe:
+            {{- if .Values.metrics.enabled }}
+            httpGet:
+              path: /ready
+              port: metrics
+            {{- else }}
+            # Without the metrics listener, startup readiness is only a TCP check.
             tcpSocket:
               port: s3
+            {{- end }}
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:

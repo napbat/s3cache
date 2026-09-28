@@ -69,11 +69,11 @@ gossip:
   # lengthens the freeze a single unresponsive pod costs every reader. Empty = 2000.
   leaseMs: ""
 
-# Prometheus text endpoint (GET /metrics) on its own port, carrying the same counters as
-# the 60s stats line — graphable and alertable instead of diffed out of pod logs by hand.
-# Off by default: nothing else changes when it is on, it is just another listener.
+# Prometheus text endpoint (GET /metrics) and startup readiness (GET /ready) on
+# one port. With this listener enabled, the client Service waits for full index
+# warm-up and a boot read licence. Disabling it uses TCP startup readiness.
 metrics:
-  enabled: false
+  enabled: true
   port: 9090
 
 # AWS/R2 credentials (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION) come from

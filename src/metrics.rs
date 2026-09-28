@@ -3,7 +3,7 @@
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -18,6 +18,24 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::index::{IndexStats, KeyIndex};
+
+/// Startup readiness is latched after the configured indexes and boot lease
+/// become usable. A later lease lapse still routes reads to the origin.
+#[derive(Default)]
+pub struct StartupReady(AtomicBool);
+
+impl StartupReady {
+    /// Mark the initial warm-up complete. This state never returns to false.
+    pub fn mark_ready(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the proxy completed its initial warm-up.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 /// Declares the event-counter set once: the fields, a bump method per counter, the stats
 /// line, and the Prometheus exposition — all generated in declaration order. Warm
@@ -299,9 +317,10 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
     });
 }
 
-/// Bind `listen` and serve the counters at `GET /metrics` (anything else is a 404) until
-/// the process ends. The 60s stats line can't be graphed or alerted on; this is the same
-/// numbers in a form Prometheus can scrape. Off unless `S3CACHE_METRICS_LISTEN` is set.
+/// Bind `listen` and serve counters at `GET /metrics` and startup readiness at
+/// `GET /ready`. Other paths return 404. The 60s stats line cannot be graphed
+/// or alerted on; this is the same data in a form Prometheus can scrape.
+/// Off unless `S3CACHE_METRICS_LISTEN` is set.
 /// Returns the bound address, which is the requested one unless port 0 asked the OS to
 /// choose.
 ///
@@ -311,11 +330,12 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
 /// silently leaving the fleet unscraped.
 pub async fn spawn_exporter(
     metrics: Arc<Metrics>,
+    readiness: Arc<StartupReady>,
     listen: &str,
 ) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(listen).await?;
     let bound = listener.local_addr()?;
-    info!("metrics exporter on {bound} (GET /metrics)");
+    info!("metrics exporter on {bound} (GET /metrics, GET /ready)");
     tokio::spawn(async move {
         let http = ConnBuilder::new(TokioExecutor::new());
         loop {
@@ -327,6 +347,7 @@ pub async fn spawn_exporter(
                 }
             };
             let metrics = Arc::clone(&metrics);
+            let readiness = Arc::clone(&readiness);
             // Owned: the connection future outlives this iteration's borrow of the
             // builder, exactly as the S3 listener's does.
             let conn = http
@@ -334,8 +355,14 @@ pub async fn spawn_exporter(
                     TokioIo::new(socket),
                     service_fn(move |req| {
                         let metrics = Arc::clone(&metrics);
+                        let readiness = Arc::clone(&readiness);
                         async move {
-                            Ok::<_, Infallible>(scrape(&metrics, req.method(), req.uri().path()))
+                            Ok::<_, Infallible>(scrape(
+                                &metrics,
+                                &readiness,
+                                req.method(),
+                                req.uri().path(),
+                            ))
                         }
                     }),
                 )
@@ -348,13 +375,27 @@ pub async fn spawn_exporter(
     Ok(bound)
 }
 
-/// One scrape: the exposition for `GET /metrics`, a 404 for anything else.
-fn scrape(metrics: &Metrics, method: &Method, path: &str) -> Response<Full<Bytes>> {
+/// One metrics scrape or readiness probe. Other routes return 404.
+fn scrape(
+    metrics: &Metrics,
+    readiness: &StartupReady,
+    method: &Method,
+    path: &str,
+) -> Response<Full<Bytes>> {
     if method == Method::GET && path == "/metrics" {
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
             .body(Full::new(Bytes::from(metrics.prometheus_text())))
+            .unwrap_or_else(|_| Response::new(Full::default()))
+    } else if method == Method::GET && path == "/ready" {
+        Response::builder()
+            .status(if readiness.is_ready() {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            })
+            .body(Full::default())
             .unwrap_or_else(|_| Response::new(Full::default()))
     } else {
         Response::builder()
@@ -366,7 +407,7 @@ fn scrape(metrics: &Metrics, method: &Method, path: &str) -> Response<Full<Bytes
 
 #[cfg(test)]
 mod tests {
-    use super::{Metrics, scrape};
+    use super::{Metrics, StartupReady, scrape};
     use crate::index::{KeyIndex, ObjEntry, apply_put, standard_class};
     use http::{Method, StatusCode};
     use std::sync::Arc;
@@ -491,9 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn only_get_metrics_is_served() {
+    fn metrics_and_readiness_routes_are_distinct() {
         let metrics = Metrics::default();
-        let ok = scrape(&metrics, &Method::GET, "/metrics");
+        let readiness = StartupReady::default();
+        let ok = scrape(&metrics, &readiness, &Method::GET, "/metrics");
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(
             ok.headers()
@@ -501,13 +543,23 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("text/plain; version=0.0.4")
         );
+        assert_eq!(
+            scrape(&metrics, &readiness, &Method::GET, "/ready").status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        readiness.mark_ready();
+        assert_eq!(
+            scrape(&metrics, &readiness, &Method::GET, "/ready").status(),
+            StatusCode::OK
+        );
         for (method, path) in [
             (Method::GET, "/"),
             (Method::GET, "/metrics/"),
             (Method::POST, "/metrics"),
+            (Method::POST, "/ready"),
         ] {
             assert_eq!(
-                scrape(&metrics, &method, path).status(),
+                scrape(&metrics, &readiness, &method, path).status(),
                 StatusCode::NOT_FOUND,
                 "{method} {path}"
             );
