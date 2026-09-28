@@ -25,6 +25,12 @@ upstream:
   endpoint: ""            # e.g. https://<acct>.r2.cloudflarestorage.com  (required)
   buckets: ""             # comma-separated buckets to index eagerly
 
+# Concurrent, exhaustive key-range scans. Discovery samples directory prefixes
+# to choose boundaries. These requests are additional Class A operations.
+indexScan:
+  concurrency: ""         # auto: available CPU parallelism; override 1–64
+  discoveryRequests: 16  # per-rebuild discovery request budget, maximum 64
+
 # Hot (in-memory) tier — always on. `bytes` is the heap budget and the rollover point:
 # objects evicted from here are still served from the disk (warm) tier when enabled.
 # `maxObjectBytes` caps what gets cached at all; bigger objects stream straight through.
@@ -69,9 +75,9 @@ gossip:
   # lengthens the freeze a single unresponsive pod costs every reader. Empty = 2000.
   leaseMs: ""
 
-# Prometheus text endpoint (GET /metrics) and startup readiness (GET /ready) on
-# one port. With this listener enabled, the client Service waits for full index
-# warm-up and a boot read licence. Disabling it uses TCP startup readiness.
+# Metrics (GET /metrics), listener readiness (GET /ready), and initial index
+# completion (GET /index-ready). Cold pods can forward requests to the origin.
+# Disabling this listener uses TCP readiness.
 metrics:
   enabled: true
   port: 9090

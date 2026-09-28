@@ -12,12 +12,13 @@
 //! (see `sync`): a peer's write updates the index and invalidates the local hot copy;
 //! retained warm copies decode suspect and must validate against that newer index.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::mem::size_of;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
@@ -507,6 +508,9 @@ struct Core {
     /// The warm disk store, kept for whole-cache flushes (`clear`).
     warm_disk: Option<Arc<MmapDiskTier>>,
     fills: SingleFlight<CacheKey>,
+    /// Only keys with an active origin fill occupy this map. Mutations mark the
+    /// corresponding fill stale before they invalidate its cached body.
+    active_fills: Arc<Mutex<HashMap<CacheKey, Arc<FillFence>>>>,
     metrics: Arc<Metrics>,
     has_warm: bool,
     /// The generation a copy must carry to be served without proving itself first.
@@ -517,6 +521,29 @@ struct Core {
     /// revalidates it. Bumping this ([`LocalCache::distrust_all`]) makes every copy
     /// currently held suspect without dropping one.
     suspect_gen: AtomicU64,
+}
+
+struct FillFence {
+    stale: AtomicBool,
+    commit: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct ActiveFill {
+    key: CacheKey,
+    fence: Arc<FillFence>,
+    active: Arc<Mutex<HashMap<CacheKey, Arc<FillFence>>>>,
+}
+
+impl Drop for ActiveFill {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().unwrap();
+        if active
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.fence))
+        {
+            active.remove(&self.key);
+        }
+    }
 }
 
 impl Core {
@@ -563,6 +590,15 @@ impl Core {
     /// Drop an object from every local tier. A tier that fails to delete is counted; its
     /// copy lingers only until eviction and is never authoritative.
     async fn invalidate(&self, key: &CacheKey) {
+        let fence = self.active_fills.lock().unwrap().get(key).cloned();
+        if let Some(fence) = &fence {
+            fence.stale.store(true, Ordering::Release);
+        }
+        let _commit = if let Some(fence) = &fence {
+            Some(fence.commit.lock().await)
+        } else {
+            None
+        };
         if self.cache.invalidate(key).await.is_err() {
             self.metrics.warm_error();
         }
@@ -573,6 +609,15 @@ impl Core {
     /// applied frontier only after a stale hot body is unservable; warm disk I/O is kept
     /// off that acknowledgement path.
     async fn invalidate_hot(&self, key: &CacheKey) {
+        let fence = self.active_fills.lock().unwrap().get(key).cloned();
+        if let Some(fence) = &fence {
+            fence.stale.store(true, Ordering::Release);
+        }
+        let _commit = if let Some(fence) = &fence {
+            Some(fence.commit.lock().await)
+        } else {
+            None
+        };
         self.hot.inner().invalidate(key).await;
     }
 
@@ -633,6 +678,7 @@ impl TieredCache {
                 hot,
                 warm_disk,
                 fills: SingleFlight::new(),
+                active_fills: Arc::new(Mutex::new(HashMap::new())),
                 metrics,
                 has_warm,
                 suspect_gen: AtomicU64::new(1),
@@ -703,20 +749,79 @@ impl TieredCache {
     where
         Fut: Future<Output = Result<Arc<CachedObject>, E>> + Send,
     {
-        if let Some(obj) = self.core.lookup(key).await {
-            return Ok(obj);
+        self.get_or_fetch_with_commit(
+            key,
+            async { origin.await.map(|obj| (obj, ())) },
+            |obj| async move { Some(obj) },
+            || true,
+            |_, ()| {},
+        )
+        .await
+    }
+
+    /// Fill a missing body only while `can_commit` still proves its read and no
+    /// write invalidated this key during the origin fetch. `on_commit` updates
+    /// the matching index observation under the same mutation fence.
+    pub(crate) async fn get_or_fetch_with_commit<
+        Fut,
+        E,
+        Meta,
+        Validate,
+        Validated,
+        Accept,
+        Commit,
+    >(
+        &self,
+        key: &CacheKey,
+        origin: Fut,
+        validate: Validate,
+        can_commit: Accept,
+        on_commit: Commit,
+    ) -> Result<Arc<CachedObject>, E>
+    where
+        Fut: Future<Output = Result<(Arc<CachedObject>, Meta), E>> + Send,
+        Validate: Fn(Arc<CachedObject>) -> Validated,
+        Validated: Future<Output = Option<Arc<CachedObject>>>,
+        Accept: FnOnce() -> bool,
+        Commit: FnOnce(&Arc<CachedObject>, &Meta),
+    {
+        if let Some(obj) = self.core.lookup(key).await
+            && let Some(valid) = validate(obj).await
+        {
+            return Ok(valid);
         }
         let gate = self.core.fills.acquire(key.clone()).await;
-        if let Some(obj) = self.core.lookup(key).await {
+        if let Some(obj) = self.core.lookup(key).await
+            && let Some(valid) = validate(obj).await
+        {
             drop(gate);
-            return Ok(obj);
+            return Ok(valid);
         }
+        let fence = Arc::new(FillFence {
+            stale: AtomicBool::new(false),
+            commit: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        self.core
+            .active_fills
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::clone(&fence));
+        let active = ActiveFill {
+            key: key.clone(),
+            fence: Arc::clone(&fence),
+            active: Arc::clone(&self.core.active_fills),
+        };
         let result = origin.await;
-        if let Ok(obj) = &result {
-            self.core.insert(key.clone(), obj.clone()).await;
+        if let Ok((obj, meta)) = &result {
+            let _commit = fence.commit.lock().await;
+            if !fence.stale.load(Ordering::Acquire) && can_commit() {
+                on_commit(obj, meta);
+                self.core.insert(key.clone(), obj.clone()).await;
+            }
         }
+        drop(active);
         drop(gate);
-        result
+        result.map(|(obj, _)| obj)
     }
 }
 
@@ -728,6 +833,17 @@ pub struct LocalCache {
 }
 
 impl LocalCache {
+    /// Stop an active origin fill before a peer changes the index. Hold the
+    /// returned guard until the index mutation finishes, then invalidate hot.
+    pub(crate) async fn fence_mutation(
+        &self,
+        key: &CacheKey,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let fence = self.core.active_fills.lock().unwrap().get(key).cloned()?;
+        fence.stale.store(true, Ordering::Release);
+        Some(Arc::clone(&fence.commit).lock_owned().await)
+    }
+
     /// Drop a key from every node-local tier. Local writes and failed revalidation need
     /// this stronger operation because the next tier probe must not rediscover the copy.
     pub async fn invalidate(&self, key: &CacheKey) {
@@ -1187,5 +1303,99 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mutation_during_origin_get_prevents_stale_cache_commit() {
+        let cache = TieredCache::new(1024 * 1024, None, metrics());
+        let key = ck("b", "racing");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let reader = {
+            let cache = cache.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch_with_commit(
+                        &key,
+                        async move {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.await;
+                            Ok::<_, String>((Arc::new(sample()), ()))
+                        },
+                        |obj| async move { Some(obj) },
+                        || true,
+                        |_, ()| {},
+                    )
+                    .await
+            })
+        };
+        started_rx.await.expect("origin GET started");
+        cache.invalidate(&key).await;
+        release_tx.send(()).expect("release GET");
+        assert!(reader.await.expect("reader task").is_ok());
+        assert!(
+            cache.get(&key).await.is_none(),
+            "old GET must not refill after mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_during_origin_get_prevents_old_generation_commit() {
+        let cache = TieredCache::new(1024 * 1024, None, metrics());
+        let key = ck("b", "resync");
+        let generation = cache.suspect_gen();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let reader = {
+            let cache = cache.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch_with_commit(
+                        &key,
+                        async move {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.await;
+                            Ok::<_, String>((Arc::new(sample()), ()))
+                        },
+                        |obj| async move { Some(obj) },
+                        || cache.suspect_gen() == generation,
+                        |obj, ()| obj.mark_trusted(generation),
+                    )
+                    .await
+            })
+        };
+        started_rx.await.expect("origin GET started");
+        cache.local().distrust_all();
+        release_tx.send(()).expect("release GET");
+        assert!(reader.await.expect("reader task").is_ok());
+        assert!(
+            cache.get(&key).await.is_none(),
+            "old generation must not refill"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_reprobes_only_validated_cached_bodies() {
+        let cache = TieredCache::new(1024 * 1024, None, metrics());
+        let key = ck("b", "suspect");
+        cache.insert(key.clone(), Arc::new(sample())).await;
+        let validates = AtomicU64::new(0);
+        let fetched = cache
+            .get_or_fetch_with_commit(
+                &key,
+                async { Ok::<_, String>((Arc::new(sample()), ())) },
+                |_obj| {
+                    validates.fetch_add(1, Ordering::Relaxed);
+                    async { None }
+                },
+                || true,
+                |_, ()| {},
+            )
+            .await
+            .expect("origin GET");
+        assert_eq!(fetched.body, Bytes::from_static(b"hello"));
+        assert_eq!(validates.load(Ordering::Relaxed), 2);
     }
 }

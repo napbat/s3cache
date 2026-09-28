@@ -181,7 +181,11 @@ impl s3s::S3 for CachingProxy {
         // The bytes a client writes are the bytes its next read wants, and they are
         // already in hand: buffer them (bounded by the same per-object cap the read path
         // uses) so a freshly written object's first read is not a guaranteed origin GET.
-        let written = self.buffered_put_body(&mut req.input).await;
+        let written = if self.sync.as_ref().is_none_or(|sync| sync.may_serve_local()) {
+            self.buffered_put_body(&mut req.input).await
+        } else {
+            None
+        };
         let ckey = (bucket.clone(), key.clone());
         let locally_vouched = self.locally_vouches_for_put(&req.input);
         // Invalidate before the origin call. Besides closing the ordinary in-flight read
@@ -209,6 +213,9 @@ impl s3s::S3 for CachingProxy {
             // The origin's ETag rides back on the response, so the index learns it here
             // rather than paying a HEAD for what a later HEAD will want to report.
             entry.etag = resp.output.e_tag.clone();
+            // An origin GET that started during this PUT may have filled the old
+            // body after the pre-write invalidation. Fence it again at commit.
+            worker.obj_cache.invalidate(&ckey).await;
             // The body just written takes the dropped copy's place. An ETag-less write
             // response cannot faithfully describe the object and therefore fills nothing.
             if let (Some(body), Some(e_tag)) = (written, entry.etag.clone()) {
@@ -387,6 +394,11 @@ impl s3s::S3 for CachingProxy {
                 return Err(error);
             }
         };
+        // A GET could have cached the old destination after the pre-copy
+        // invalidation. Fence that fill after the origin commits the copy.
+        self.obj_cache
+            .invalidate(&(bucket.clone(), key.clone()))
+            .await;
         let copied_etag = resp
             .output
             .copy_object_result

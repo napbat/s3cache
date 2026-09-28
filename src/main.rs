@@ -71,7 +71,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     // Object-body cache: hot (node-local heap) in front of the optional disk tier (warm),
     // in front of the S3 origin (cold). Always layered — no mode to pick.
-    let cp = cache::proxy::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters);
+    let cp = cache::proxy::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters)
+        .with_index_scan(cfg.index_scan);
     cp.start_coherence(&cfg.buckets);
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the
@@ -83,15 +84,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // Optional Prometheus text endpoint on its own port, so the counters can be graphed
     // and alerted on instead of diffed out of the stats line by hand. Off by default;
     // a bad S3CACHE_METRICS_LISTEN fails startup rather than leaving a silent blind spot.
+    let readiness = Arc::new(metrics::StartupReady::default());
     if let Some(listen) = &cfg.metrics_listen {
-        let readiness = Arc::new(metrics::StartupReady::default());
         let probe = cp.clone();
         let buckets = cfg.buckets.clone();
         let latch = Arc::clone(&readiness);
         tokio::spawn(async move {
             loop {
                 if probe.initially_ready(&buckets) {
-                    latch.mark_ready();
+                    latch.mark_index_ready();
                     info!(
                         "initial index ready for {} configured buckets",
                         buckets.len()
@@ -101,7 +102,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         });
-        metrics::spawn_exporter(cp.metrics(), readiness, listen).await?;
+        metrics::spawn_exporter(cp.metrics(), Arc::clone(&readiness), listen).await?;
     }
 
     let service = {
@@ -119,6 +120,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     };
 
     let listener = TcpListener::bind(&cfg.listen).await?;
+    // Origin forwarding is available before the index is complete. Do not remove
+    // every cold pod from the Service during overlapping rollouts or a cold start.
+    readiness.mark_ready();
     let http_server = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut stopping = std::pin::pin!(stop_signal());

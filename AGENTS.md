@@ -125,7 +125,8 @@ reachable Docker daemon. Build the pinned source image first with
 `bash scripts/build-minio-test-image.sh`. The proxy reaches MinIO through a transparent
 counting forwarder in `tests/common/mod.rs`, which lets a test measure origin requests.
 Run the MinIO integration tests locally. CI runs unit tests and the Docker-free
-`metrics_endpoint` and `tier_cache` integration targets.
+`metrics_endpoint`, `tier_cache`, and `startup-readiness` integration targets.
+The `startup` target uses MinIO to verify early cache hits during index warm-up.
 Chart and production container checks are conditional on the changes above; an unrelated
 documentation-only edit does not require an image build.
 
@@ -148,6 +149,8 @@ documentation-only edit does not require an image build.
 | `S3CACHE_LISTEN` | `0.0.0.0:8014` | Bind address for the S3 API |
 | `S3CACHE_UPSTREAM_ENDPOINT` | — (required) | Upstream S3/R2 endpoint URL |
 | `S3CACHE_BUCKETS` | empty | Comma-separated buckets to index eagerly |
+| `S3CACHE_INDEX_SCAN_CONCURRENCY` | available CPU parallelism | Optional concurrent scan range override, clamped to 1–64 |
+| `S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS` | `16` | Extra LIST request budget for range discovery, clamped to 0–64 |
 | `S3CACHE_CACHE_BYTES` | `268435456` (256 MiB) | Hot (in-memory) tier capacity; the rollover point into the warm tier |
 | `S3CACHE_MAX_OBJECT_BYTES` | `8388608` (8 MiB) | Per-object cap; larger objects stream through uncached |
 | `S3CACHE_DISK_CACHE` | empty (disabled) | Directory for the warm (disk) tier |
@@ -157,6 +160,10 @@ documentation-only edit does not require an image build.
 | `S3CACHE_LEASE_MS` | `2000` | Coherence-lease duration `D` (`strong` only) — also the fleet's membership `dead_timeout` |
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval |
 | `S3CACHE_METRICS_LISTEN` | empty (disabled) | Bind address for the Prometheus text endpoint (`GET /metrics`) |
+
+`GET /ready` on the metrics listener reports whether the S3 listener can accept
+requests. Cold requests can go to the origin. `GET /index-ready` separately
+reports completion of the initial index and coherence warm-up.
 
 ## Helm chart knobs (deploy/helm/s3cache/values.yaml)
 
@@ -168,6 +175,8 @@ documentation-only edit does not require an image build.
   `diskCache.volume` when set) or a plain `diskCache.volume` pod-volume spec.
 - `replicaCount` — the one scaling knob; every pod is a gossip cluster member.
 - `upstream.endpoint` (required) / `upstream.buckets`.
+- `indexScan.concurrency` / `indexScan.discoveryRequests` — concurrent scan range
+  limit and extra LIST request budget for boundary discovery.
 - `metrics.enabled` / `metrics.port` — the Prometheus text endpoint
   (`S3CACHE_METRICS_LISTEN`) on a named `metrics` container port.
 - `gossip.consistency` / `gossip.leaseMs` — the coherence mode

@@ -113,15 +113,33 @@ writes and stalled waits never retire history because neither is an all-readers 
 With the feed on, **multiple replicas are safe** — this lifts the historical
 single-replica constraint with zero extra services.
 
-The Helm chart preserves that availability during routine operations: replicated
-releases wait for a new ordinal to finish its initial bucket index sync and gain
-a read licence before advancing a rollout. The `GET /ready` check is on the
-metrics port. It stays ready after the first success, so a later lease lapse
-still uses the safe origin fallback. The headless gossip Service publishes
-not-ready addresses so peers can connect during warm-up. Disabling the metrics
-listener selects a TCP readiness check, which admits a pod before index warm-up.
+The Helm chart admits a pod after its S3 listener can accept requests.
+Cold requests go to the origin while the index warms. The `GET /ready` check
+is on the metrics port. Index completion is a separate `GET /index-ready`
+diagnostic. This separation keeps cold pods available during overlapping rollouts.
+The headless gossip Service publishes not-ready addresses so peers can connect
+during startup. Disabling the metrics listener selects a TCP readiness check.
 The chart renders a `PodDisruptionBudget` with `maxUnavailable: 1`. Each ordinal
 owns its own warm PVC, so rollout availability does not require sharing cache files.
+
+### Index startup
+
+The index scan can run concurrent LIST chains over disjoint key ranges.
+The default concurrency follows the process's available CPU parallelism, capped
+at 64. Set `S3CACHE_INDEX_SCAN_CONCURRENCY` or Helm `indexScan.concurrency` to
+override it. A value of 1 selects a serial scan.
+
+Boundary discovery samples directory prefixes without assuming an application
+path layout. Each final range covers every key between its boundaries.
+Keys outside the sampled prefixes remain covered. The full index becomes
+available only after every range finishes in the same rebuild generation.
+An incomplete or failed discovery can reduce parallelism without omitting keys.
+
+Discovery uses up to 16 additional LIST requests per rebuild by default.
+`S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS` or Helm `indexScan.discoveryRequests`
+sets that budget. Zero disables discovery and uses a serial scan.
+Each additional range can also read one page past its boundary.
+These are startup or recovery costs. They do not add a periodic scan.
 
 ## Consistency
 
@@ -157,8 +175,11 @@ heuristic earlier releases used:
 - **A gap stands the lease down first.** A write-feed gap (ring overflow, a peer
   restart) is proof this node missed invalidations, so it drops its right to serve
   *before* the remediation runs — and only the resync that actually ran may hand it
-  back. A booting node likewise serves nothing local until its configured buckets have
-  warmed and the lease shell's own warm-up window has passed.
+  back. A booting node can obtain its first lease after feed catch-up and the
+  lease warm-up window, while its bucket scans continue. It can then cache fresh
+  GET responses and reuse them. Persisted bodies remain suspect until validated.
+  LIST and index-backed absence still require a complete bucket index.
+  A feed gap during boot cancels this early proof and requires the full recovery scan.
 - **A lapse with no gap behind it gets a recovery, and usually keeps the cache.** Not
   every way of losing the licence arrives as an event: a peer scaled in, lost for good,
   or restarted while the write feed was quiet freezes this node's confirmation with no
@@ -415,10 +436,11 @@ Every counter is logged as one `s3cache stats:` line each `S3CACHE_STATS_SECS`, 
 when `S3CACHE_METRICS_LISTEN` is set — served as Prometheus text at `GET /metrics` on
 that address, `s3cache_`-prefixed (`metrics.enabled` in the chart). Both are generated
 from one declaration, so a counter cannot exist in one and not the other.
-The same listener returns 503 at `GET /ready` until the configured bucket
-indexes are complete and the boot read licence is available. It returns 200
-afterward, including during later lease lapses. The S3 read barrier still
-routes those later reads to the origin.
+The same listener returns 503 at `GET /ready` until the S3 listener is bound.
+It then returns 200, including while the index warms or a read lease is absent.
+`GET /index-ready` returns 503 until the configured indexes and initial coherence
+warm-up complete. It then stays at 200. The S3 read barrier still routes reads
+to the origin whenever local state cannot safely answer them.
 
 What they attribute: LIST (`list_from_index` vs `list_passthrough`), GET
 (`get_hit` / `get_miss` / `get_bypass`, `range_*`), HEAD (`head_hit` from a cached body,

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -13,10 +13,10 @@ use tracing::info;
 use crate::cache::copy;
 use crate::index::{
     AuthoritativeKeyState, BodyMatch, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry,
-    ObjMeta, apply_del, apply_observed_put, apply_put, begin_bucket_resync, compare_entry_body,
-    complete_entry, fence_uncertain_key, head_object_from_index, list_objects_v2_from_index,
-    resolve_uncertain_key, standard_class, sync_bucket_generation, sync_bucket_into,
-    uncertain_key_is_current,
+    ObjMeta, ScanConfig, apply_del, apply_observed_put, apply_put, begin_bucket_resync,
+    compare_entry_body, complete_entry, fence_uncertain_key, head_object_from_index,
+    list_objects_v2_from_index, resolve_uncertain_key, standard_class,
+    sync_bucket_generation_with_config, sync_bucket_into_with_config, uncertain_key_is_current,
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync};
@@ -354,11 +354,11 @@ impl IndexedWrite {
     }
 }
 
-/// Wait for every warm-up in `warmups`, then affirm to the coherence lease that this
-/// node has caught up and may serve locally again — on behalf of `generation`, so a gap
-/// that arrives while the warm-ups run supersedes the affirmation instead of being
-/// papered over by it. `full_sync` independently rejects an older boot/gap task when a
-/// newer full-index recovery shares the same coherence generation.
+/// Wait for every warm-up in `warmups`, then affirm the coherence lease on behalf
+/// of `generation`. At boot this is a second affirmation after the full index is
+/// ready. An earlier boot affirmation can license fresh point reads while the
+/// index remains incomplete. A gap supersedes that early proof and requires this
+/// full-index recovery. `full_sync` rejects older boot/gap tasks independently.
 ///
 /// With **no** buckets the join is vacuous and the affirmation is immediate, which is
 /// safe rather than a hole: a node told to warm nothing has empty tiers and a
@@ -387,6 +387,24 @@ pub(super) async fn affirm_after(
     }
 }
 
+/// License fresh point reads during boot while the full LIST remains incomplete.
+/// A feed gap changes `generation` and leaves its full-index recovery in charge.
+pub(super) async fn affirm_bootstrap(
+    sync: Arc<WriteSync>,
+    generation: u64,
+    full_sync: FullSyncTicket,
+) {
+    while full_sync.is_current()
+        && sync.resync_gen() == generation
+        && !sync.await_fresh(READ_BARRIER_TIMEOUT).await
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if full_sync.is_current() && sync.resync_gen() == generation {
+        sync.affirm_resynced(generation).await;
+    }
+}
+
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
 /// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
 /// every write.
@@ -408,14 +426,18 @@ pub struct CachingProxy {
     /// configured (see [`crate::sync`]).
     pub(super) sync: Option<Arc<WriteSync>>,
     /// The newest boot/gap full-index recovery allowed to retry and affirm.
-    full_sync_owner: FullSyncOwner,
+    pub(super) full_sync_owner: FullSyncOwner,
+    /// Claimed before the feed apply loop can report a boot-time gap. The gap
+    /// then supersedes this ticket instead of a late boot task replacing it.
+    boot_full_sync: Arc<Mutex<Option<(FullSyncTicket, u64)>>>,
+    index_scan: ScanConfig,
     pub(super) metrics: Arc<Metrics>,
 }
 
 impl CachingProxy {
-    /// Whether the initial configured index is complete and this node may serve
-    /// from local state. Callers latch the first true result for startup
-    /// readiness. Later lease loss must keep the origin fallback available.
+    /// Whether every configured bucket has a complete LIST index and this node
+    /// holds its local-read licence. This is index readiness, distinct from the
+    /// S3 listener's ability to forward cold requests during startup.
     #[must_use]
     pub fn initially_ready(&self, buckets: &[String]) -> bool {
         buckets.iter().all(|bucket| self.is_synced(bucket))
@@ -446,8 +468,17 @@ impl CachingProxy {
             max_obj_bytes: cfg.max_obj_bytes,
             sync,
             full_sync_owner: FullSyncOwner::default(),
+            boot_full_sync: Arc::new(Mutex::new(None)),
+            index_scan: ScanConfig::default(),
             metrics,
         }
+    }
+
+    /// Set the limits for initial and recovery index scans.
+    #[must_use]
+    pub fn with_index_scan(mut self, config: ScanConfig) -> Self {
+        self.index_scan = config;
+        self
     }
 
     /// Start the gossip apply loop: peers' events fold into this node's LIST index and
@@ -457,6 +488,12 @@ impl CachingProxy {
     /// `buckets` from the origin. A no-op without gossip — single-node is already strict.
     pub fn start_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
+        let boot_ticket = self.full_sync_owner.claim();
+        *self
+            .boot_full_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((boot_ticket, sync.resync_gen()));
         sync.start_apply(
             self.obj_cache.local(),
             self.state.clone(),
@@ -485,6 +522,7 @@ impl CachingProxy {
         let state = self.state.clone();
         let sync = self.sync.clone();
         let full_sync_owner = self.full_sync_owner.clone();
+        let index_scan = self.index_scan;
         Arc::new(move || {
             let full_sync = full_sync_owner.claim();
             let mut reset: std::collections::BTreeSet<String> =
@@ -517,9 +555,15 @@ impl CachingProxy {
                         }
                         let result = match first_generation.take() {
                             Some(generation) => {
-                                sync_bucket_generation(&client, &state, &bucket, generation).await
+                                sync_bucket_generation_with_config(
+                                    &client, &state, &bucket, generation, index_scan,
+                                )
+                                .await
                             }
-                            None => sync_bucket_into(&client, &state, &bucket).await,
+                            None => {
+                                sync_bucket_into_with_config(&client, &state, &bucket, index_scan)
+                                    .await
+                            }
                         };
                         match result {
                             Ok(_) => break,
@@ -785,15 +829,37 @@ impl CachingProxy {
     /// passthrough for the process lifetime — a transient origin outage at startup
     /// should not cost every LIST for the next fortnight.
     ///
-    /// The **boot affirmation** rides on the same join (see `affirm_after`): a booting
-    /// node starts with no right to serve, and gets one only once every bucket it was
-    /// told to warm has landed. The generation is read here, before the first warm-up
-    /// runs, so a gap arriving during warm-up supersedes this affirmation rather than
-    /// being papered over by it.
+    /// A fresh process has no trusted hot bodies. Its persisted disk bodies are
+    /// suspect. The boot lease can affirm before the LIST scan completes, which
+    /// permits fresh GET fills while LIST and index-backed HEAD stay origin-routed.
+    /// A feed gap supersedes that boot proof and restores the full-scan requirement.
+    /// The full-scan affirmation remains as the recovery path.
     pub fn spawn_background_sync(&self, buckets: Vec<String>) {
-        let full_sync = self.full_sync_owner.claim();
+        let boot = self
+            .boot_full_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let (full_sync, generation, can_affirm_early) = match boot {
+            Some((ticket, generation)) => (ticket, Some(generation), true),
+            None if self.sync.is_some() => {
+                tracing::error!("start_coherence must run before background sync with gossip");
+                return;
+            }
+            None => (self.full_sync_owner.claim(), None, false),
+        };
+        let index_scan = self.index_scan;
         let sync = self.sync.clone();
-        let generation = sync.as_ref().map(|sync| sync.resync_gen());
+        if let (Some(boot_sync), Some(boot_generation)) = (sync.clone(), generation)
+            && can_affirm_early
+            && boot_generation == 0
+        {
+            tokio::spawn(affirm_bootstrap(
+                boot_sync,
+                boot_generation,
+                full_sync.clone(),
+            ));
+        }
         let mut warmups = Vec::with_capacity(buckets.len());
         for bucket in buckets {
             let client = self.client.clone();
@@ -805,7 +871,7 @@ impl CachingProxy {
                     if !full_sync.is_current() {
                         return;
                     }
-                    match sync_bucket_into(&client, &state, &bucket).await {
+                    match sync_bucket_into_with_config(&client, &state, &bucket, index_scan).await {
                         Ok(n) => {
                             info!("warmed LIST index for `{bucket}`: {n} keys");
                             return;
@@ -1036,13 +1102,27 @@ impl CachingProxy {
                     .ok_or_else(|| format!("oversize {declared} (body past declared length)"))?,
                 None => Bytes::new(),
             };
+            let observed = observed!(&resp.output);
             let obj = CachedObject::from_get(&resp.output, body);
-            obj.mark_trusted(generation);
-            Ok::<_, String>(Arc::new(obj))
+            Ok::<_, String>((Arc::new(obj), observed))
         };
         // Box the promotion future: it carries a full cloned request + buffered body,
         // large enough that keeping it on the stack trips clippy's `large_futures`.
-        let fetched = Box::pin(self.obj_cache.get_or_fetch(ckey, origin)).await;
+        let fetched = Box::pin(self.obj_cache.get_or_fetch_with_commit(
+            ckey,
+            origin,
+            |_candidate| self.validated_get(ckey),
+            || {
+                self.obj_cache.suspect_gen() == generation
+                    && self.sync.as_ref().is_none_or(|sync| sync.may_serve_local())
+                    && !self.key_uncertain(&ckey.0, &ckey.1)
+            },
+            |obj, observed| {
+                self.observe(&ckey.0, &ckey.1, observed);
+                obj.mark_trusted(generation);
+            },
+        ))
+        .await;
         match fetched {
             // A range starting past the end is refused by the origin with a shape only
             // the origin knows (AWS sends `Content-Range: bytes */<size>`, MinIO sends
@@ -1283,6 +1363,14 @@ impl CachingProxy {
             return self.inner.get_object(req).await;
         }
 
+        self.fill_whole_get(req, &ckey).await
+    }
+
+    async fn fill_whole_get(
+        &self,
+        req: S3Request<GetObjectInput>,
+        ckey: &(String, String),
+    ) -> S3Result<S3Response<GetObjectOutput>> {
         // Read before the fetch, not after it: a remediation that distrusts the cache
         // while this round-trip is in flight must leave the copy it lands suspect.
         // Whole-object misses use the SAME probe-then-gate singleflight as range
@@ -1313,15 +1401,31 @@ impl CachingProxy {
             })?;
             let observed = observed!(&resp.output);
             let filled = CachedObject::from_get(&resp.output, bytes);
-            filled.mark_trusted(generation);
-            // The whole of what a HEAD reports is in hand, so the index entry is
-            // completed here too — a body fill is the cheapest place to turn a
-            // skeletal entry faithful, and it costs the origin nothing extra.
-            self.observe(&ckey.0, &ckey.1, &observed);
             self.metrics.get_miss();
-            Ok(Arc::new(filled))
+            Ok((Arc::new(filled), observed))
         };
-        match self.obj_cache.get_or_fetch_with(&ckey, origin).await {
+        let can_commit = || {
+            self.obj_cache.suspect_gen() == generation
+                && self.sync.as_ref().is_none_or(|sync| sync.may_serve_local())
+                && !self.key_uncertain(&ckey.0, &ckey.1)
+        };
+        let on_commit = |filled: &Arc<CachedObject>, observed: &ObservedObject| {
+            // The GET supplies both body and HEAD metadata. Fold the observation
+            // before publishing the body, under the same key mutation fence.
+            self.observe(&ckey.0, &ckey.1, observed);
+            filled.mark_trusted(generation);
+        };
+        match self
+            .obj_cache
+            .get_or_fetch_with_commit(
+                ckey,
+                origin,
+                |_candidate| self.validated_get(ckey),
+                can_commit,
+                on_commit,
+            )
+            .await
+        {
             Ok(filled) => Ok(S3Response::new(filled.to_get())),
             Err(WholeGetFillError::Origin(error)) => Err(error),
             Err(WholeGetFillError::Uncacheable(resp)) => {

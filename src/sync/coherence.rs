@@ -848,6 +848,8 @@ impl WriteSync {
                         token,
                         key: event,
                     } => {
+                        let cache_key = (event.bucket.clone(), event.key.clone());
+                        let mutation = local.fence_mutation(&cache_key).await;
                         let ts = from_micros(event.ts_us);
                         match event.op {
                             IndexOp::Put {
@@ -877,12 +879,13 @@ impl WriteSync {
                                 apply_del(&state, &event.bucket, &event.key, ts);
                             }
                         }
+                        drop(mutation);
                         // The index must move first: a warm body promoted after this hot
                         // eviction decodes suspect and is checked against the new entry
                         // before it can be served. Awaiting moka removal before the ack
                         // closes the stale-hot window without putting disk I/O on the
                         // feed frontier.
-                        local.invalidate_hot(&(event.bucket, event.key)).await;
+                        local.invalidate_hot(&cache_key).await;
                         frontier.advance(&peer, token);
                         if let Some(ledger) = &ledger {
                             ledger.record(&peer, token).await;

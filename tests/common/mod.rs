@@ -24,6 +24,7 @@
 #![allow(dead_code)] // each test binary drives a different subset of the harness
 
 pub mod diff;
+mod response_pause;
 
 use bytes::Bytes;
 use http::{Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -32,6 +33,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use response_pause::ResponsePause;
 use s3cache::cache::proxy::{CacheConfig, CachingProxy};
 use s3cache::metrics::Metrics;
 use s3cache::sync::coherence::{Consistency, DEFAULT_LEASE_MS, WriteSync};
@@ -164,6 +166,8 @@ pub struct Origin {
     bucket: String,
     pub ops: Arc<Ops>,
     put_fault: Arc<AppliedPutFault>,
+    list_pause: Arc<ResponsePause>,
+    get_pause: Arc<ResponsePause>,
 }
 
 /// One-shot fault injection for a conditional PUT: let `MinIO` apply it, then hold and
@@ -253,7 +257,16 @@ impl Origin {
 
         let ops = Arc::new(Ops::default());
         let put_fault = Arc::new(AppliedPutFault::default());
-        let counted = counting_proxy(minio, Arc::clone(&ops), Arc::clone(&put_fault)).await;
+        let list_pause = Arc::new(ResponsePause::default());
+        let get_pause = Arc::new(ResponsePause::default());
+        let counted = counting_proxy(
+            minio,
+            Arc::clone(&ops),
+            Arc::clone(&put_fault),
+            Arc::clone(&list_pause),
+            Arc::clone(&get_pause),
+        )
+        .await;
         Arc::new(Self {
             _container: container,
             direct,
@@ -261,7 +274,39 @@ impl Origin {
             bucket: bucket.to_owned(),
             ops,
             put_fault,
+            list_pause,
+            get_pause,
         })
+    }
+
+    /// Hold the next origin LIST response. Arm this before starting index sync.
+    pub fn pause_next_list(&self) {
+        self.list_pause.arm();
+    }
+
+    /// Wait until the held LIST has reached the origin and its response is blocked.
+    pub async fn wait_for_paused_list(&self) {
+        self.list_pause.wait_held().await;
+    }
+
+    /// Let the held LIST response reach the index scanner.
+    pub fn release_paused_list(&self) {
+        self.list_pause.release();
+    }
+
+    /// Hold the next origin object GET response after `MinIO` returns it.
+    pub fn pause_next_get(&self) {
+        self.get_pause.arm();
+    }
+
+    /// Wait until an object GET response is held before it reaches the cache.
+    pub async fn wait_for_paused_get(&self) {
+        self.get_pause.wait_held().await;
+    }
+
+    /// Let the held object GET response reach the cache.
+    pub fn release_paused_get(&self) {
+        self.get_pause.release();
     }
 
     /// This test's bucket.
@@ -401,6 +446,8 @@ async fn counting_proxy(
     upstream: SocketAddr,
     ops: Arc<Ops>,
     put_fault: Arc<AppliedPutFault>,
+    list_pause: Arc<ResponsePause>,
+    get_pause: Arc<ResponsePause>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -414,16 +461,20 @@ async fn counting_proxy(
             };
             let ops = Arc::clone(&ops);
             let put_fault = Arc::clone(&put_fault);
+            let list_pause = Arc::clone(&list_pause);
+            let get_pause = Arc::clone(&get_pause);
             let conn = http
                 .serve_connection(
                     TokioIo::new(socket),
                     service_fn(move |req: Request<Incoming>| {
                         let ops = Arc::clone(&ops);
                         let put_fault = Arc::clone(&put_fault);
+                        let list_pause = Arc::clone(&list_pause);
+                        let get_pause = Arc::clone(&get_pause);
                         async move {
                             ops.record(req.method(), req.uri(), req.headers());
                             Ok::<_, std::convert::Infallible>(
-                                forward(upstream, req, &put_fault).await,
+                                forward(upstream, req, &put_fault, &list_pause, &get_pause).await,
                             )
                         }
                     }),
@@ -454,8 +505,14 @@ async fn forward(
     upstream: SocketAddr,
     req: Request<Incoming>,
     put_fault: &AppliedPutFault,
+    list_pause: &ResponsePause,
+    get_pause: &ResponsePause,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
     let faulted = put_fault.claim(&req);
+    let path = req.uri().path().trim_start_matches('/');
+    let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
+    let held_list = req.method() == Method::GET && !on_key && list_pause.claim();
+    let held_get = req.method() == Method::GET && on_key && get_pause.claim();
     match relay(upstream, req).await {
         Ok(resp) if faulted && resp.status().is_success() => {
             put_fault.origin_applied();
@@ -472,7 +529,15 @@ async fn forward(
                 )
                 .expect("an injected 500 is well-formed")
         }
-        Ok(resp) => resp.map(|body| body.map_err(std::io::Error::other).boxed()),
+        Ok(resp) => {
+            if held_list {
+                list_pause.hold().await;
+            }
+            if held_get {
+                get_pause.hold().await;
+            }
+            resp.map(|body| body.map_err(std::io::Error::other).boxed())
+        }
         Err(err) => Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .body(

@@ -56,6 +56,12 @@ spec:
               value: {{ required "upstream.endpoint is required" .Values.upstream.endpoint | quote }}
             - name: S3CACHE_BUCKETS
               value: {{ .Values.upstream.buckets | quote }}
+            {{- with .Values.indexScan.concurrency }}
+            - name: S3CACHE_INDEX_SCAN_CONCURRENCY
+              value: {{ . | int64 | quote }}
+            {{- end }}
+            - name: S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS
+              value: {{ .Values.indexScan.discoveryRequests | int64 | quote }}
             # Hot-tier sizing: the in-memory budget objects roll over from (into the
             # warm disk tier when enabled) and the per-object cacheability cap.
             # int64 before quote: Helm's YAML round-trip makes big numbers float64,
@@ -111,9 +117,9 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.auth.existingSecret }}
-          # Keep client traffic on an old ready pod until this pod has completed
-          # its initial index sync and gained a read licence. Liveness checks only
-          # the S3 listener; a slow origin sync must not restart the process.
+          # Admit cold pods once their S3 listener can forward to the origin.
+          # Index completion has a separate /index-ready diagnostic endpoint.
+          # A slow origin sync must not remove all pods from the Service.
           readinessProbe:
             {{- if .Values.metrics.enabled }}
             httpGet:

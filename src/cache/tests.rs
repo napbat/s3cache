@@ -13,6 +13,7 @@ use s3s::{S3, S3ErrorCode, S3Request};
 
 use crate::cache::proxy::{
     CacheConfig, CachingProxy, FullSyncOwner, ObservedObject, ReadRoute, affirm_after,
+    affirm_bootstrap,
 };
 use crate::index::{
     IndexedHead, ObjEntry, ObjMeta, apply_put, head_object_from_index, standard_class,
@@ -111,6 +112,62 @@ async fn the_boot_affirmation_waits_for_every_bucket_warmup() {
         sync.may_serve_local(),
         "and the warm-up landing is what puts the node in service"
     );
+}
+
+#[tokio::test]
+async fn a_boot_feed_gap_supersedes_early_point_read_affirmation() {
+    let (_node, sync) = solo("boot-gap");
+    let owner = FullSyncOwner::default();
+    let boot = owner.claim();
+    let boot_generation = sync.resync_gen();
+
+    // A feed gap arrived while the full LIST was still blocked. The old boot
+    // proof cannot license cached reads, even after the lease warm-up window.
+    sync.require_resync();
+    affirm_bootstrap(Arc::clone(&sync), boot_generation, boot.clone()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!sync.may_serve_local());
+
+    // Only the gap's current generation may affirm after its full scan lands.
+    affirm_after(
+        Vec::new(),
+        Some(Arc::clone(&sync)),
+        Some(sync.resync_gen()),
+        Some(owner.claim()),
+    )
+    .await;
+    assert!(sync.may_serve_local());
+}
+
+#[tokio::test]
+async fn a_gap_before_boot_sync_starts_keeps_its_recovery_owner() {
+    let (_node, sync) = solo("boot-gap-before-scan");
+    let proxy = proxy(Some(Arc::clone(&sync)));
+    // start_coherence claims boot ownership before the apply task can report
+    // a Gap. Model the Gap at the boundary before spawn_background_sync.
+    proxy.start_coherence(&[]);
+    sync.require_resync();
+    let gap_owner = proxy.full_sync_owner.claim();
+    proxy.spawn_background_sync(Vec::new());
+
+    assert!(
+        gap_owner.is_current(),
+        "late boot must not replace gap recovery"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !sync.may_serve_local(),
+        "late boot must not affirm the gap generation"
+    );
+}
+
+#[tokio::test]
+async fn gossip_boot_without_an_apply_loop_cannot_affirm() {
+    let (_node, sync) = solo("boot-without-apply");
+    let proxy = proxy(Some(Arc::clone(&sync)));
+    proxy.spawn_background_sync(Vec::new());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!sync.may_serve_local());
 }
 
 #[tokio::test]
@@ -464,6 +521,76 @@ async fn a_proved_copy_is_served_without_consulting_the_index() {
     assert!(proxy.validated_get(&ck("k")).await.is_some());
     assert_eq!(counter(&proxy, "body_revalidations"), 0);
     assert_eq!(counter(&proxy, "body_revalidation_evictions"), 0);
+}
+
+#[tokio::test]
+async fn peer_put_cannot_complete_new_index_metadata_from_an_older_get() {
+    let proxy = Arc::new(proxy(None));
+    let key = ck("racing");
+    let old = cached("old", at(1_700_000_000));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let reader = {
+        let proxy = Arc::clone(&proxy);
+        let key = key.clone();
+        tokio::spawn(async move {
+            proxy
+                .obj_cache
+                .get_or_fetch_with_commit(
+                    &key,
+                    async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<_, String>((old, ()))
+                    },
+                    |obj| async move { Some(obj) },
+                    || true,
+                    |obj, ()| {
+                        proxy.observe(
+                            "b",
+                            "racing",
+                            &ObservedObject {
+                                size: Some(4),
+                                last_modified: obj.last_modified().cloned(),
+                                etag: obj.e_tag().cloned(),
+                                content_type: Some("old/type".to_owned()),
+                                storage_class: standard_class(),
+                                meta: ObjMeta::default(),
+                            },
+                        );
+                    },
+                )
+                .await
+        })
+    };
+    started_rx.await.expect("old origin GET started");
+    let local = proxy.obj_cache.local();
+    let mutation = local.fence_mutation(&key).await;
+    apply_put(
+        &proxy.state,
+        "b",
+        "racing",
+        ObjEntry {
+            size: Some(4),
+            last_modified: at(1_700_000_001),
+            etag: Some(ETag::Strong("new".to_owned())),
+            storage_class: standard_class(),
+            content_type: None,
+            meta: None,
+        },
+    );
+    drop(mutation);
+    local.invalidate_hot(&key).await;
+    release_tx.send(()).expect("finish old GET");
+    assert!(reader.await.expect("GET task").is_ok());
+    assert!(proxy.obj_cache.get(&key).await.is_none());
+    let index = proxy.state.read().unwrap();
+    let entry = &index.get("b").expect("bucket").keys["racing"];
+    assert_eq!(entry.etag, Some(ETag::Strong("new".to_owned())));
+    assert!(
+        entry.meta.is_none(),
+        "old GET metadata must not complete the new row"
+    );
 }
 
 /// A suspect copy the index confirms is served — and stamped, so it is proved once

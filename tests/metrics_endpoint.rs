@@ -65,4 +65,11 @@ async fn the_exporter_serves_the_counters_as_prometheus_text() {
     assert_eq!(scrape(addr, "/").await.0, StatusCode::NOT_FOUND);
     readiness.mark_ready();
     assert_eq!(scrape(addr, "/ready").await.0, StatusCode::OK);
+    assert_eq!(
+        scrape(addr, "/index-ready").await.0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a cold proxy can serve through the origin before its index is complete"
+    );
+    readiness.mark_index_ready();
+    assert_eq!(scrape(addr, "/index-ready").await.0, StatusCode::OK);
 }

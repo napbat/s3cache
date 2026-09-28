@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::cache::proxy::CacheConfig;
+use crate::index::ScanConfig;
 
 /// Bind address for the S3 API when `S3CACHE_LISTEN` is unset.
 const DEFAULT_LISTEN: &str = "0.0.0.0:8014";
@@ -33,6 +34,9 @@ pub struct Config {
     pub endpoint: String,
     /// Buckets to index eagerly (`S3CACHE_BUCKETS`, comma-separated).
     pub buckets: Vec<String>,
+    /// Parallel index scan limits (`S3CACHE_INDEX_SCAN_CONCURRENCY`,
+    /// `S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS`).
+    pub index_scan: ScanConfig,
     /// Hot-tier capacity and the per-object cap (`S3CACHE_CACHE_BYTES`,
     /// `S3CACHE_MAX_OBJECT_BYTES`).
     pub cache: CacheConfig,
@@ -63,6 +67,16 @@ impl Config {
             endpoint: std::env::var("S3CACHE_UPSTREAM_ENDPOINT")
                 .expect("S3CACHE_UPSTREAM_ENDPOINT is required (the upstream S3/R2 endpoint URL)"),
             buckets: parse_list(&var("S3CACHE_BUCKETS").unwrap_or_default()),
+            index_scan: ScanConfig {
+                workers: parse_or(
+                    var("S3CACHE_INDEX_SCAN_CONCURRENCY"),
+                    ScanConfig::default().workers,
+                ),
+                discovery_budget: parse_or(
+                    var("S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS"),
+                    ScanConfig::default().discovery_budget,
+                ),
+            },
             cache: CacheConfig {
                 cache_bytes: parse_or(var("S3CACHE_CACHE_BYTES"), DEFAULT_CACHE_BYTES),
                 max_obj_bytes: parse_or(var("S3CACHE_MAX_OBJECT_BYTES"), DEFAULT_MAX_OBJECT_BYTES),

@@ -18,16 +18,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, Deref};
 use std::sync::{LockResult, PoisonError, RwLock, RwLockReadGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
+use crate::list_token;
+use crate::tier::CachedObject;
 use s3s::dto::{
     CommonPrefix, ETag, HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output, Metadata,
     Object, ObjectStorageClass, Timestamp,
 };
-use tracing::info;
 
-use crate::list_token;
-use crate::tier::CachedObject;
+mod scan;
+pub use scan::ScanConfig;
 
 /// S3's default storage class, and what an object reports when it carries no
 /// `x-amz-storage-class`. Used where a path proves a key exists without saying which
@@ -295,6 +296,10 @@ pub(crate) struct BucketState {
     /// prevents a merge-only retry from treating retained partial rows as proof that an
     /// absent key is gone.
     rebuild_generation: Option<u64>,
+    /// Definitive mutations and exact HEAD reconciliations applied after this
+    /// rebuild began. A LIST page cannot overwrite these keys, regardless of
+    /// differences between the origin clock and the proxy write clock.
+    rebuild_touched: BTreeSet<String>,
     /// Last per-key reconciliation token allocated in this bucket. It survives the
     /// remove/recreate implementation of full resync so an old async HEAD can never
     /// acquire a later fence by token reuse.
@@ -337,7 +342,9 @@ enum PutAuthority {
 /// equal-or-newer tombstone rejects it; ties between puts fall to
 /// last-applied (cross-writer same-microsecond puts are healed by the next
 /// origin sync). `entry.last_modified` is the write's timestamp — the LWW
-/// clock. An accepted definitive mutation supersedes any uncertainty for this key.
+/// clock. During a rebuild, the first definitive mutation for a key supersedes
+/// a LIST baseline even if the two clocks disagree. Later mutations of that
+/// key retain the normal LWW rule. An accepted mutation clears uncertainty.
 /// Returns whether the index changed.
 pub(crate) fn apply_put(state: &KeyIndex, bucket: &str, key: &str, entry: ObjEntry) -> bool {
     apply_put_with_authority(state, bucket, key, entry, PutAuthority::DefinitiveMutation)
@@ -365,11 +372,20 @@ fn apply_put_with_authority(
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
     let b = buckets.entry(bucket.to_owned()).or_default();
-    if b.gone.get(key).is_some_and(|dead| *dead >= ts) {
+    let definitive = matches!(authority, PutAuthority::DefinitiveMutation);
+    let first_rebuild_mutation =
+        definitive && b.rebuild_generation.is_some() && !b.rebuild_touched.contains(key);
+    if !first_rebuild_mutation && b.gone.get(key).is_some_and(|dead| *dead >= ts) {
         return false; // deletes win ties: never resurrect
     }
-    if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
+    if !first_rebuild_mutation && b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
         return false; // a newer put is already indexed
+    }
+    if !definitive && b.rebuild_touched.contains(key) {
+        return false; // an origin observation cannot replace a rebuild-time write
+    }
+    if first_rebuild_mutation {
+        b.gone.remove(key);
     }
     let current = IndexStats::for_entry(&entry);
     let previous = b
@@ -378,8 +394,11 @@ fn apply_put_with_authority(
         .as_ref()
         .map_or_else(IndexStats::default, IndexStats::for_entry);
     account_replacement(b, stats, previous, current);
-    if matches!(authority, PutAuthority::DefinitiveMutation) {
+    if definitive {
         b.uncertain_keys.remove(key);
+        if b.rebuild_generation.is_some() {
+            b.rebuild_touched.insert(key.to_owned());
+        }
     }
     true
 }
@@ -466,6 +485,9 @@ pub(crate) fn resolve_uncertain_key(
         }
     }
     b.uncertain_keys.remove(key);
+    if b.rebuild_generation.is_some() {
+        b.rebuild_touched.insert(key.to_owned());
+    }
     true
 }
 
@@ -525,23 +547,27 @@ pub(crate) fn apply_del(state: &KeyIndex, bucket: &str, key: &str, ts: SystemTim
     let mut index = state.inner.write().unwrap();
     let KeyIndexState { buckets, stats } = &mut *index;
     let b = buckets.entry(bucket.to_owned()).or_default();
+    let first_rebuild_mutation = b.rebuild_generation.is_some() && !b.rebuild_touched.contains(key);
     if b.gone.len() > TOMBSTONE_PRUNE_LEN
         && let Some(cutoff) = ts.checked_sub(TOMBSTONE_TTL)
     {
         b.gone.retain(|_, dead| *dead >= cutoff);
     }
-    let newer_tombstone = b.gone.get(key).is_some_and(|dead| *dead > ts);
+    let newer_tombstone = !first_rebuild_mutation && b.gone.get(key).is_some_and(|dead| *dead > ts);
     let dead = b.gone.entry(key.to_owned()).or_insert(ts);
-    if *dead < ts {
+    if first_rebuild_mutation || *dead < ts {
         *dead = ts;
     }
-    if b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
+    if !first_rebuild_mutation && b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
         return false; // the key was rewritten after this delete
     }
     if newer_tombstone {
         return false;
     }
     b.uncertain_keys.remove(key);
+    if b.rebuild_generation.is_some() {
+        b.rebuild_touched.insert(key.to_owned());
+    }
     if let Some(previous) = b.keys.remove(key) {
         account_replacement(
             b,
@@ -761,8 +787,9 @@ pub(crate) fn sync_listing_into(
 }
 
 /// Fold one origin LIST page only when it still belongs to the bucket's current rebuild.
-/// The generation check and every row application happen under the same lock, which is
-/// what prevents a superseded rebuild from slipping a stale page in after a newer reset.
+/// The generation check and every row application happen under the same lock.
+/// A definitive mutation or exact reconciliation since rebuild start owns its
+/// key, regardless of the LIST row's origin timestamp.
 fn sync_listing_into_generation(
     state: &KeyIndex,
     bucket: &str,
@@ -778,7 +805,9 @@ fn sync_listing_into_generation(
     let mut found = 0usize;
     for (key, entry) in rows {
         let ts = entry.last_modified;
-        if b.gone.get(&key).is_none_or(|dead| *dead < ts)
+        if !b.rebuild_touched.contains(&key)
+            && !b.uncertain_keys.contains_key(&key)
+            && b.gone.get(&key).is_none_or(|dead| *dead < ts)
             && b.keys
                 .get(&key)
                 .is_none_or(|current| current.last_modified <= ts)
@@ -806,12 +835,14 @@ fn finish_bucket_sync_generation(state: &KeyIndex, bucket: &str, generation: u64
     }
     b.synced = true;
     b.rebuild_generation = None;
+    b.rebuild_touched.clear();
     true
 }
 
 /// Full paginated LIST of a bucket into `state`, then mark it synced. Every invocation
 /// starts from a clean generation, so keys absent from the snapshot cannot survive a
-/// prior partial attempt; writes racing that generation still merge through per-key LWW.
+/// prior partial attempt; definitive writes racing that generation take
+/// precedence over its LIST rows. Conflicts between those writes retain LWW.
 /// Free-standing (takes the client + shared index) so the background warm-up task can
 /// run it without borrowing the proxy, which the S3 service owns by value.
 ///
@@ -820,15 +851,16 @@ fn finish_bucket_sync_generation(state: &KeyIndex, bucket: &str, generation: u64
 /// The upstream LIST error, leaving the bucket unsynced (and therefore passthrough).
 /// The caller retries through this function, whose next clean generation discards any
 /// rows retained by the failed attempt.
-pub(crate) async fn sync_bucket_into(
+pub(crate) async fn sync_bucket_into_with_config(
     client: &aws_sdk_s3::Client,
     state: &KeyIndex,
     bucket: &str,
+    config: ScanConfig,
 ) -> anyhow::Result<usize> {
     // Absence is authoritative only after a clean snapshot. A retry after a failed page
     // must not merge into rows retained from that partial attempt.
     let generation = begin_bucket_resync(state, bucket);
-    sync_bucket_generation(client, state, bucket, generation).await
+    sync_bucket_generation_with_config(client, state, bucket, generation, config).await
 }
 
 /// Full paginated LIST for one already-established rebuild generation. A newer reset
@@ -838,68 +870,14 @@ pub(crate) async fn sync_bucket_into(
 ///
 /// The upstream LIST error, or an error indicating that a newer rebuild superseded this
 /// one. In both cases the bucket remains origin-serving.
-pub(crate) async fn sync_bucket_generation(
+pub(crate) async fn sync_bucket_generation_with_config(
     client: &aws_sdk_s3::Client,
     state: &KeyIndex,
     bucket: &str,
     generation: u64,
+    config: ScanConfig,
 ) -> anyhow::Result<usize> {
-    let mut token: Option<String> = None;
-    let mut found = 0usize;
-    loop {
-        let mut req = client.list_objects_v2().bucket(bucket).max_keys(1000);
-        if let Some(t) = &token {
-            req = req.continuation_token(t);
-        }
-        let resp = req.send().await?;
-        let rows = resp.contents().iter().filter_map(|obj| {
-            let key = obj.key()?;
-            // Whole seconds are not what the origin reports: the LIST XML carries
-            // milliseconds, and a client comparing mtimes sees every indexed one land
-            // up to a second early. Keep the sub-second part the origin sent.
-            let last_modified = obj.last_modified().map_or_else(SystemTime::now, |d| {
-                u64::try_from(d.secs()).map_or_else(
-                    |_| SystemTime::now(),
-                    |secs| UNIX_EPOCH + Duration::new(secs, d.subsec_nanos()),
-                )
-            });
-            Some((
-                key.to_owned(),
-                ObjEntry {
-                    size: obj.size(),
-                    last_modified,
-                    // LIST reports the ETag and storage class per key, so the bootstrap
-                    // is where the index learns them; an unparseable ETag is simply not
-                    // carried.
-                    etag: obj.e_tag().and_then(|raw| raw.parse().ok()),
-                    storage_class: obj.storage_class().map_or_else(standard_class, |class| {
-                        ObjectStorageClass::from(class.as_str().to_owned())
-                    }),
-                    // A LIST row says nothing about Content-Type or user metadata, so
-                    // the entry is skeletal: it answers LIST, never a HEAD.
-                    content_type: None,
-                    meta: None,
-                },
-            ))
-        });
-        let Some(page_len) = sync_listing_into_generation(state, bucket, generation, rows) else {
-            anyhow::bail!("bucket sync superseded by a newer origin rebuild");
-        };
-        found += page_len;
-        if resp.is_truncated().unwrap_or(false) {
-            token = resp.next_continuation_token().map(str::to_owned);
-            if token.is_none() {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if !finish_bucket_sync_generation(state, bucket, generation) {
-        anyhow::bail!("bucket sync superseded by a newer origin rebuild");
-    }
-    info!("synced bucket `{bucket}` into index: {found} keys");
-    Ok(found)
+    scan::sync_bucket_generation(client, state, bucket, generation, config).await
 }
 
 #[cfg(test)]
@@ -916,6 +894,7 @@ mod tests {
     use crate::tier::CachedObject;
     use std::collections::HashMap;
     use std::time::Duration;
+    use std::time::UNIX_EPOCH;
 
     type Index = KeyIndex;
 
@@ -1358,8 +1337,6 @@ mod tests {
 
     use s3s::dto::{ETag, ListObjectsV2Input, ListObjectsV2Output};
     use std::collections::BTreeMap;
-    use std::time::UNIX_EPOCH;
-
     fn index(keys: &[&str]) -> BTreeMap<String, ObjEntry> {
         keys.iter()
             .map(|k| {
@@ -1759,5 +1736,103 @@ mod tests {
         assert_eq!(entry.etag, Some(ETag::Strong("original".to_owned())));
         assert_eq!(entry.size, Some(3), "the indexed size stands");
         assert_eq!(entry.content_type.as_deref(), Some("text/x-fixture"));
+    }
+
+    #[test]
+    fn rebuild_put_overrides_newer_clock_baseline_and_late_list_page() {
+        let state = Index::default();
+        let generation = begin_bucket_resync(&state, "b");
+        sync_listing_into_generation(&state, "b", generation, [("k".to_owned(), entry(1, 1000))]);
+
+        assert!(apply_put(&state, "b", "k", entry(2, 10)));
+        assert!(!apply_put(&state, "b", "k", entry(3, 9)));
+        sync_listing_into_generation(&state, "b", generation, [("k".to_owned(), entry(1, 1001))]);
+        assert_eq!(state.read().unwrap()["b"].keys["k"].size, Some(2));
+        assert!(apply_put(&state, "b", "k", entry(4, 11)));
+        assert!(finish_bucket_sync_generation(&state, "b", generation));
+        let index = state.read().unwrap();
+        assert_eq!(index["b"].keys["k"].size, Some(4));
+        assert!(index["b"].rebuild_touched.is_empty());
+    }
+
+    #[test]
+    fn rebuild_delete_overrides_newer_clock_baseline_and_blocks_late_list() {
+        let state = Index::default();
+        let generation = begin_bucket_resync(&state, "b");
+        sync_listing_into_generation(&state, "b", generation, [("k".to_owned(), entry(1, 1000))]);
+
+        assert!(apply_del(&state, "b", "k", ts(10)));
+        assert!(!apply_del(&state, "b", "not_yet_listed", ts(10)));
+        sync_listing_into_generation(
+            &state,
+            "b",
+            generation,
+            [
+                ("k".to_owned(), entry(1, 1001)),
+                ("not_yet_listed".to_owned(), entry(1, 1001)),
+            ],
+        );
+        assert!(finish_bucket_sync_generation(&state, "b", generation));
+        let index = state.read().unwrap();
+        assert!(!index["b"].keys.contains_key("k"));
+        assert!(!index["b"].keys.contains_key("not_yet_listed"));
+        assert_eq!(index["b"].gone["k"], ts(10));
+    }
+
+    #[test]
+    fn rebuild_uncertain_reconciliation_blocks_snapshot_rows() {
+        let state = Index::default();
+        let generation = begin_bucket_resync(&state, "b");
+        let present = fence_uncertain_key(&state, "b", "present");
+        sync_listing_into_generation(
+            &state,
+            "b",
+            generation,
+            [("present".to_owned(), entry(1, 1000))],
+        );
+        assert!(!state.read().unwrap()["b"].keys.contains_key("present"));
+        assert!(resolve_uncertain_key(
+            &state,
+            "b",
+            "present",
+            present,
+            AuthoritativeKeyState::Present(entry(2, 10)),
+        ));
+        let absent = fence_uncertain_key(&state, "b", "absent");
+        assert!(resolve_uncertain_key(
+            &state,
+            "b",
+            "absent",
+            absent,
+            AuthoritativeKeyState::Absent,
+        ));
+        sync_listing_into_generation(
+            &state,
+            "b",
+            generation,
+            [
+                ("present".to_owned(), entry(1, 1001)),
+                ("absent".to_owned(), entry(1, 1001)),
+            ],
+        );
+        assert!(finish_bucket_sync_generation(&state, "b", generation));
+        let index = state.read().unwrap();
+        assert_eq!(index["b"].keys["present"].size, Some(2));
+        assert!(!index["b"].keys.contains_key("absent"));
+    }
+
+    #[test]
+    fn superseded_rebuild_clears_old_mutation_overlay() {
+        let state = Index::default();
+        let old = begin_bucket_resync(&state, "b");
+        assert!(apply_put(&state, "b", "k", entry(1, 10)));
+        let current = begin_bucket_resync(&state, "b");
+        assert!(
+            sync_listing_into_generation(&state, "b", old, [("k".to_owned(), entry(2, 20))],)
+                .is_none()
+        );
+        sync_listing_into_generation(&state, "b", current, [("k".to_owned(), entry(2, 20))]);
+        assert!(finish_bucket_sync_generation(&state, "b", current));
+        assert_eq!(state.read().unwrap()["b"].keys["k"].size, Some(2));
     }
 }

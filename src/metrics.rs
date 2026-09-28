@@ -19,21 +19,35 @@ use tracing::info;
 
 use crate::index::{IndexStats, KeyIndex};
 
-/// Startup readiness is latched after the configured indexes and boot lease
-/// become usable. A later lease lapse still routes reads to the origin.
+/// Listener readiness and initial index completion are separate states.
+/// A listening cold proxy can forward requests while its index warms.
 #[derive(Default)]
-pub struct StartupReady(AtomicBool);
+pub struct StartupReady {
+    serving: AtomicBool,
+    indexed: AtomicBool,
+}
 
 impl StartupReady {
-    /// Mark the initial warm-up complete. This state never returns to false.
+    /// Mark the S3 listener ready to accept requests.
     pub fn mark_ready(&self) {
-        self.0.store(true, Ordering::Release);
+        self.serving.store(true, Ordering::Release);
     }
 
-    /// Whether the proxy completed its initial warm-up.
+    /// Whether the S3 listener can accept requests, including cold requests.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.serving.load(Ordering::Acquire)
+    }
+
+    /// Record completion of the initial index and coherence warm-up.
+    pub fn mark_index_ready(&self) {
+        self.indexed.store(true, Ordering::Release);
+    }
+
+    /// Whether the initial index and coherence warm-up completed.
+    #[must_use]
+    pub fn is_index_ready(&self) -> bool {
+        self.indexed.load(Ordering::Acquire)
     }
 }
 
@@ -317,8 +331,9 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
     });
 }
 
-/// Bind `listen` and serve counters at `GET /metrics` and startup readiness at
-/// `GET /ready`. Other paths return 404. The 60s stats line cannot be graphed
+/// Bind `listen` and serve counters at `GET /metrics`, listener readiness at
+/// `GET /ready`, and initial index completion at `GET /index-ready`.
+/// Other paths return 404. The 60s stats line cannot be graphed
 /// or alerted on; this is the same data in a form Prometheus can scrape.
 /// Off unless `S3CACHE_METRICS_LISTEN` is set.
 /// Returns the bound address, which is the requested one unless port 0 asked the OS to
@@ -335,7 +350,7 @@ pub async fn spawn_exporter(
 ) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(listen).await?;
     let bound = listener.local_addr()?;
-    info!("metrics exporter on {bound} (GET /metrics, GET /ready)");
+    info!("metrics exporter on {bound} (GET /metrics, GET /ready, GET /index-ready)");
     tokio::spawn(async move {
         let http = ConnBuilder::new(TokioExecutor::new());
         loop {
@@ -388,9 +403,14 @@ fn scrape(
             .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
             .body(Full::new(Bytes::from(metrics.prometheus_text())))
             .unwrap_or_else(|_| Response::new(Full::default()))
-    } else if method == Method::GET && path == "/ready" {
+    } else if method == Method::GET && matches!(path, "/ready" | "/index-ready") {
+        let ready = if path == "/ready" {
+            readiness.is_ready()
+        } else {
+            readiness.is_index_ready()
+        };
         Response::builder()
-            .status(if readiness.is_ready() {
+            .status(if ready {
                 StatusCode::OK
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -552,11 +572,21 @@ mod tests {
             scrape(&metrics, &readiness, &Method::GET, "/ready").status(),
             StatusCode::OK
         );
+        assert_eq!(
+            scrape(&metrics, &readiness, &Method::GET, "/index-ready").status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        readiness.mark_index_ready();
+        assert_eq!(
+            scrape(&metrics, &readiness, &Method::GET, "/index-ready").status(),
+            StatusCode::OK
+        );
         for (method, path) in [
             (Method::GET, "/"),
             (Method::GET, "/metrics/"),
             (Method::POST, "/metrics"),
             (Method::POST, "/ready"),
+            (Method::POST, "/index-ready"),
         ] {
             assert_eq!(
                 scrape(&metrics, &readiness, &method, path).status(),
