@@ -37,6 +37,9 @@ pub struct Config {
     /// Parallel index scan limits (`S3CACHE_INDEX_SCAN_CONCURRENCY`,
     /// `S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS`).
     pub index_scan: ScanConfig,
+    /// Opt in to bounded automatic origin recovery after a finite outage
+    /// (`S3CACHE_RECOVERY_REARM`, default false).
+    pub recovery_rearm: bool,
     /// Hot-tier capacity and the per-object cap (`S3CACHE_CACHE_BYTES`,
     /// `S3CACHE_MAX_OBJECT_BYTES`).
     pub cache: CacheConfig,
@@ -77,6 +80,7 @@ impl Config {
                     ScanConfig::default().discovery_budget,
                 ),
             },
+            recovery_rearm: parse_or(var("S3CACHE_RECOVERY_REARM"), false),
             cache: CacheConfig {
                 cache_bytes: parse_or(var("S3CACHE_CACHE_BYTES"), DEFAULT_CACHE_BYTES),
                 max_obj_bytes: parse_or(var("S3CACHE_MAX_OBJECT_BYTES"), DEFAULT_MAX_OBJECT_BYTES),
@@ -142,6 +146,13 @@ mod tests {
             7,
             "so does a bad sign"
         );
+    }
+
+    #[test]
+    fn recovery_rearm_requires_an_explicit_true_value() {
+        assert!(parse_or(Some("true".to_owned()), false));
+        assert!(!parse_or(None, false));
+        assert!(!parse_or(Some("typo".to_owned()), false));
     }
 
     #[test]

@@ -151,6 +151,7 @@ documentation-only edit does not require an image build.
 | `S3CACHE_BUCKETS` | empty | Comma-separated buckets to index eagerly |
 | `S3CACHE_INDEX_SCAN_CONCURRENCY` | available CPU parallelism | Optional concurrent scan range override, clamped to 1–64 |
 | `S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS` | `16` | Extra LIST request budget for range discovery, clamped to 0–64 |
+| `S3CACHE_RECOVERY_REARM` | `false` | Opt in to Groupnet-owned automatic full recovery after an exhausted episode (5s initial, 60s cap) |
 | `S3CACHE_CACHE_BYTES` | `268435456` (256 MiB) | Hot (in-memory) tier capacity; the rollover point into the warm tier |
 | `S3CACHE_MAX_OBJECT_BYTES` | `8388608` (8 MiB) | Per-object cap; larger objects stream through uncached |
 | `S3CACHE_DISK_CACHE` | empty (disabled) | Directory for the warm (disk) tier |
@@ -177,6 +178,8 @@ reports completion of the initial index and coherence warm-up.
 - `upstream.endpoint` (required) / `upstream.buckets`.
 - `indexScan.concurrency` / `indexScan.discoveryRequests` — concurrent scan range
   limit and extra LIST request budget for boundary discovery.
+- `recovery.rearm` — opt in to capped automatic full recovery after an
+  exhausted episode; no S3 coordination metadata is written.
 - `metrics.enabled` / `metrics.port` — the Prometheus text endpoint
   (`S3CACHE_METRICS_LISTEN`) on a named `metrics` container port.
 - `gossip.consistency` / `gossip.leaseMs` — the coherence mode

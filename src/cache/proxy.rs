@@ -383,6 +383,7 @@ pub struct CachingProxy {
     pub(super) full_sync_owner: FullSyncOwner,
     index_scan: ScanConfig,
     recovery_config: Option<groupnet::consistency::volatile_recovery::RecoveryConfig>,
+    recovery_rearm: Option<groupnet::consistency::volatile_recovery::RecoveryRearm>,
     #[cfg(test)]
     pub(super) read_return_pause: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     pub(super) metrics: Arc<Metrics>,
@@ -424,6 +425,7 @@ impl CachingProxy {
             full_sync_owner: FullSyncOwner::default(),
             index_scan: ScanConfig::default(),
             recovery_config: None,
+            recovery_rearm: None,
             #[cfg(test)]
             read_return_pause: Arc::new(std::sync::Mutex::new(None)),
             metrics,
@@ -459,6 +461,19 @@ impl CachingProxy {
         Ok(self)
     }
 
+    /// Opt in to capped automatic full recovery after a finite episode exhausts.
+    /// Individual origin scans still use the configured recovery attempt budget.
+    ///
+    /// # Errors
+    /// Rejects zero or inverted delay bounds.
+    pub fn with_recovery_rearm(
+        mut self,
+        policy: groupnet::consistency::volatile_recovery::RecoveryRearm,
+    ) -> Result<Self, groupnet::consistency::volatile_recovery::RecoveryError> {
+        self.recovery_rearm = Some(policy.validate()?);
+        Ok(self)
+    }
+
     /// Start one Groupnet-owned cold origin scan and the gossip apply loop.
     /// Peer events update the LIST index and invalidate hot bodies. A gap, or
     /// an unprovable strong serve-lease lapse, closes local serving and starts
@@ -474,6 +489,7 @@ impl CachingProxy {
             scan: self.index_scan,
             metrics: self.metrics.clone(),
             config: self.recovery_config,
+            rearm: self.recovery_rearm,
         });
         sync.start_apply(
             self.obj_cache.local(),

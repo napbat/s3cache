@@ -62,6 +62,8 @@ spec:
             {{- end }}
             - name: S3CACHE_INDEX_SCAN_DISCOVERY_REQUESTS
               value: {{ .Values.indexScan.discoveryRequests | int64 | quote }}
+            - name: S3CACHE_RECOVERY_REARM
+              value: {{ .Values.recovery.rearm | quote }}
             # Hot-tier sizing: the in-memory budget objects roll over from (into the
             # warm disk tier when enabled) and the per-object cacheability cap.
             # int64 before quote: Helm's YAML round-trip makes big numbers float64,

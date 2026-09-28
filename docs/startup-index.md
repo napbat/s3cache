@@ -18,10 +18,14 @@ Connected nodes currently scan independently. Fleet-wide single-builder
 bootstrap and peer index transfer remain a separate follow-up; skipping another
 node's scan without a transferred, validated index would leave it origin-only.
 Recovery retries individual failed scans within a finite total budget. If that
-budget expires during a prolonged origin outage, the node remains origin-routed
-until `CachingProxy::restart_coherence` explicitly starts a new episode (or a
-new feed gap does). Automatic capped rearm belongs in the Groupnet recovery
-policy follow-up; this consumer does not run a second retry loop.
+budget expires during a prolonged origin outage, the default node remains
+origin-routed until `CachingProxy::restart_coherence` explicitly starts a new
+episode (or a new feed gap does). Opting in with
+`S3CACHE_RECOVERY_REARM=true` (Helm `recovery.rearm`) lets Groupnet start a new
+full episode after a capped delay: 5 seconds initially, doubling to at most
+60 seconds between exhausted episodes. Failed scans inside one episode still
+retry at the ordinary finite poll interval, so this is not per-request
+exponential backoff. The rearm timer does not grant local read authority.
 An incomplete index cannot prove that a key is absent or that a LIST is complete.
 Those requests continue to use the origin.
 

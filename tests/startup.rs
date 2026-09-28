@@ -12,7 +12,7 @@ use common::{
     Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, gossip_pair, list,
     proxy_over, proxy_over_with_metrics, put_typed, request, warm_proxy_over,
 };
-use groupnet::consistency::volatile_recovery::{RecoveryConfig, RecoveryStage};
+use groupnet::consistency::volatile_recovery::{RecoveryConfig, RecoveryRearm, RecoveryStage};
 use s3cache::cache::proxy::CachingProxy;
 use s3cache::metrics::Metrics;
 use s3s::S3;
@@ -103,6 +103,58 @@ async fn prolonged_list_outage_requires_explicit_recovery_restart() {
             .is_some_and(|status| status.state.stage == RecoveryStage::Ready)
     );
     assert_eq!(list(&proxy, &bucket).await, ["present"]);
+}
+
+/// Opt-in rearm starts a new finite full scan without an application retry
+/// loop. During the outage, positive reads still use the origin, and no
+/// exhausted generation licenses the incomplete LIST index.
+#[tokio::test]
+async fn prolonged_list_outage_auto_rearms_only_when_opted_in() {
+    let origin = Origin::start("startup-outage-rearm").await;
+    origin.seed("present", b"origin").await;
+    let bucket = origin.bucket().to_owned();
+    let sync = gossip_node("startup-rearm-node", free_udp_port(), &[]).await;
+    let metrics = Arc::new(Metrics::default());
+    let proxy = proxy_over_with_metrics(&origin.counted_client(), CAP, Some(sync), &metrics)
+        .with_recovery_config(short_recovery())
+        .expect("bounded recovery configuration")
+        .with_recovery_rearm(RecoveryRearm {
+            initial_ms: 500,
+            max_ms: 2_000,
+        })
+        .expect("bounded automatic rearm policy");
+
+    origin.fail_lists(true);
+    proxy.start_coherence(std::slice::from_ref(&bucket));
+    eventually!(
+        "the first finite recovery episode exhausts",
+        proxy
+            .recovery_status()
+            .is_some_and(|status| status.state.stage == RecoveryStage::OriginOnly)
+    );
+    let scans_during_outage = counter(&metrics, "recovery_origin_scans");
+    let lists_during_outage = origin.ops.list();
+    assert!(scans_during_outage >= 2);
+    assert!(lists_during_outage >= scans_during_outage);
+    let gets_before = origin.ops.get();
+    assert_eq!(get(&proxy, &bucket, "present").await.as_ref(), b"origin");
+    assert_eq!(origin.ops.get(), gets_before + 1);
+    assert!(!proxy.initially_ready(std::slice::from_ref(&bucket)));
+
+    origin.fail_lists(false);
+    eventually!(
+        "Groupnet's rearm confirms a new origin scan",
+        proxy
+            .recovery_status()
+            .is_some_and(|status| status.state.stage == RecoveryStage::Ready)
+    );
+    assert!(counter(&metrics, "recovery_origin_scans") > scans_during_outage);
+    assert!(origin.ops.list() > lists_during_outage);
+    assert_eq!(list(&proxy, &bucket).await, ["present"]);
+    assert!(
+        origin.ops.writes().is_empty(),
+        "rearm creates no control objects"
+    );
 }
 
 /// The default cold bootstrap has no local authority until its scan finishes:

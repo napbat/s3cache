@@ -140,6 +140,11 @@ Discovery uses up to 16 additional LIST requests per rebuild by default.
 sets that budget. Zero disables discovery and uses a serial scan.
 Each additional range can also read one page past its boundary.
 These are startup or recovery costs. They do not add a periodic scan.
+`S3CACHE_RECOVERY_REARM=true` (Helm `recovery.rearm`) optionally retries a
+full origin scan after a recovery episode exhausts its finite budget. The
+interval starts at 5 seconds and caps at 60 seconds; local reads remain
+origin-routed until a new generation is affirmed. The default is off and
+continues to use explicit restart after an exhausted episode.
 
 ## Consistency
 
@@ -417,6 +422,7 @@ Unrelated documentation-only edits do not require a container build.
 | `S3CACHE_LISTEN` | `0.0.0.0:8014` | S3 API listen address |
 | `S3CACHE_UPSTREAM_ENDPOINT` | (required) | Upstream S3 endpoint URL (e.g. R2) |
 | `S3CACHE_BUCKETS` | (empty) | Comma-separated buckets to index eagerly at startup |
+| `S3CACHE_RECOVERY_REARM` | `false` | Opt in to Groupnet-owned capped full-recovery retries after a finite episode exhausts (5s initially, 60s cap); no S3 control writes |
 | `S3CACHE_CACHE_BYTES` | `268435456` (256 MB) | Hot (in-memory) tier capacity (bytes) |
 | `S3CACHE_MAX_OBJECT_BYTES` | `8388608` (8 MB) | Per-object cache cap; bigger objects stream through |
 | `S3CACHE_DISK_CACHE` | (empty) | Directory for the warm disk tier; unset = no disk tier |

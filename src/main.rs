@@ -16,6 +16,24 @@ use s3s::service::S3ServiceBuilder;
 use tokio::net::TcpListener;
 use tracing::info;
 
+const RECOVERY_REARM_INITIAL_MS: u64 = 5_000;
+const RECOVERY_REARM_MAX_MS: u64 = 60_000;
+
+fn configure_recovery_rearm(
+    proxy: cache::proxy::CachingProxy,
+    enabled: bool,
+) -> cache::proxy::CachingProxy {
+    if !enabled {
+        return proxy;
+    }
+    proxy
+        .with_recovery_rearm(groupnet::consistency::volatile_recovery::RecoveryRearm {
+            initial_ms: RECOVERY_REARM_INITIAL_MS,
+            max_ms: RECOVERY_REARM_MAX_MS,
+        })
+        .expect("fixed automatic recovery rearm policy is valid")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     tracing_subscriber::fmt()
@@ -73,6 +91,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // in front of the S3 origin (cold). Always layered — no mode to pick.
     let cp = cache::proxy::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters)
         .with_index_scan(cfg.index_scan);
+    let cp = configure_recovery_rearm(cp, cfg.recovery_rearm);
     cp.start_coherence(&cfg.buckets);
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the

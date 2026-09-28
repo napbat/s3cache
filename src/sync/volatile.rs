@@ -10,6 +10,7 @@ use groupnet::consistency::{
     volatile_recovery::{
         AdapterError, BoxRecoveryFuture, Mark, Peer, PeerObservation, PublicationPermit,
         RecoveryAdapter, RecoveryConfig, RecoveryHandle, RecoveryMode, RecoveryOperation,
+        RecoveryRearm,
     },
 };
 use groupnet::core::{NodeId, Status};
@@ -48,6 +49,7 @@ pub(crate) struct RecoveryInputs {
     pub(crate) scan: ScanConfig,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) config: Option<RecoveryConfig>,
+    pub(crate) rearm: Option<RecoveryRearm>,
 }
 
 impl WriteSync {
@@ -62,6 +64,7 @@ impl WriteSync {
             scan,
             metrics,
             config,
+            rearm,
         } = inputs;
         assert!(
             buckets.len() <= MAX_RECOVERY_BUCKETS,
@@ -103,8 +106,12 @@ impl WriteSync {
             poll_ms: 100,
         });
         let session = NEXT_SESSION.fetch_add(1, Ordering::AcqRel);
-        let recovery = RecoveryHandle::open(adapter, config, mode, self.me.clone(), session)
-            .expect("valid recovery configuration and Tokio runtime");
+        let recovery = if let Some(policy) = rearm {
+            RecoveryHandle::open_with_rearm(adapter, config, mode, self.me.clone(), session, policy)
+        } else {
+            RecoveryHandle::open(adapter, config, mode, self.me.clone(), session)
+        }
+        .expect("valid recovery configuration and Tokio runtime");
         self.install_recovery(recovery);
     }
 }
