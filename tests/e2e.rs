@@ -14,8 +14,8 @@ mod common;
 use std::sync::Arc;
 
 use common::{
-    Origin, delete, get, get_if_none_match, get_range, head, head_if_none_match, list, list_entry,
-    node, proxy_over, put, put_conditional, put_typed, put_typed_conditional, request,
+    Origin, delete, get, get_if_none_match, get_range, get_suffix, head, head_if_none_match, list,
+    list_entry, node, proxy_over, put, put_conditional, put_typed, put_typed_conditional, request,
     wait_for_index,
 };
 use http::HeaderValue;
@@ -292,6 +292,56 @@ async fn ranged_reads_slice_the_cached_body_locally() {
         origin.ops.get(),
         fetched,
         "the slice came out of the cached body"
+    );
+}
+
+/// A suffix uses a cached whole body. An uncached suffix keeps the origin's
+/// range request, so it does not fetch a whole object for a small slice.
+#[tokio::test]
+async fn suffix_ranges_use_the_cached_body() {
+    let origin = Origin::start("e2e-suffix-range").await;
+    origin.seed("obj", b"0123456789").await;
+    origin.seed("cold", b"abcdefghij").await;
+    let proxy = node(&origin, 1024 * 1024);
+    wait_for_index(&proxy, &origin, origin.bucket()).await;
+
+    let fetched = origin.ops.get();
+    let (cold, cold_range) = get_suffix(&proxy, origin.bucket(), "cold", 3).await;
+    assert_eq!(cold, "hij");
+    assert_eq!(cold_range.as_deref(), Some("bytes 7-9/10"));
+    assert_eq!(origin.ops.get(), fetched + 1);
+    let (cold_again, _) = get_suffix(&proxy, origin.bucket(), "cold", 3).await;
+    assert_eq!(cold_again, "hij");
+    assert_eq!(
+        origin.ops.get(),
+        fetched + 2,
+        "a cold suffix does not promote"
+    );
+
+    assert_eq!(get(&proxy, origin.bucket(), "obj").await, "0123456789");
+    let fetched = origin.ops.get();
+    let (slice, range) = get_suffix(&proxy, origin.bucket(), "obj", 3).await;
+    assert_eq!(slice, "789");
+    assert_eq!(range.as_deref(), Some("bytes 7-9/10"));
+    assert_eq!(
+        origin.ops.get(),
+        fetched,
+        "the suffix reads the cached body"
+    );
+
+    for (length, bytes, header) in [
+        (3, "789", "bytes 7-9/10"),
+        (10, "0123456789", "bytes 0-9/10"),
+        (99, "0123456789", "bytes 0-9/10"),
+    ] {
+        let (slice, range) = get_suffix(&proxy, origin.bucket(), "obj", length).await;
+        assert_eq!(slice, bytes);
+        assert_eq!(range.as_deref(), Some(header));
+    }
+    assert_eq!(
+        origin.ops.get(),
+        fetched,
+        "cached suffixes avoid the origin"
     );
 }
 

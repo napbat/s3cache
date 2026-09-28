@@ -23,10 +23,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> starting MinIO"
+RUNTIME="$RUNTIME" bash scripts/build-minio-test-image.sh
 "$RUNTIME" rm -f s3cache-e2e-minio >/dev/null 2>&1 || true
 "$RUNTIME" run -d --name s3cache-e2e-minio -p 9000:9000 \
   -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  quay.io/minio/minio:latest server /data >/dev/null
+  s3cache-minio-test:7aac2a2c server /data >/dev/null
 
 echo "==> waiting for MinIO"
 for _ in $(seq 1 50); do

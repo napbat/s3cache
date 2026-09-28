@@ -121,11 +121,13 @@ docker build --tag s3cache:check .
 
 `tests/e2e.rs` and `tests/coherence.rs` start **MinIO** through testcontainers (one
 container per test, torn down on drop), so the locked workspace test command needs a
-reachable Docker daemon. The proxy reaches MinIO through a transparent counting
-forwarder in `tests/common/mod.rs`, which is what lets a test assert that an answer cost
-the origin *nothing*. The image (`minio/minio:latest`) is pulled once. Chart and
-container checks are conditional on the changes above; an unrelated documentation-only
-edit does not require an image build.
+reachable Docker daemon. Build the pinned source image first with
+`bash scripts/build-minio-test-image.sh`. The proxy reaches MinIO through a transparent
+counting forwarder in `tests/common/mod.rs`, which lets a test measure origin requests.
+Run the MinIO integration tests locally. CI runs unit tests and the Docker-free
+`metrics_endpoint` and `tier_cache` integration targets.
+Chart and production container checks are conditional on the changes above; an unrelated
+documentation-only edit does not require an image build.
 
 ## Conventions
 

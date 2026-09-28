@@ -53,9 +53,8 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-/// The `MinIO` image the repo's shell-driven e2e suite already uses, so both suites test
-/// the same origin. Pulled once; every run after that starts from the local image.
-const MINIO_IMAGE: (&str, &str) = ("minio/minio", "latest");
+/// The locally built `MinIO` image from the pinned official source revision.
+const MINIO_IMAGE: (&str, &str) = ("s3cache-minio-test", "7aac2a2c");
 /// `MinIO`'s S3 port inside the container.
 const MINIO_PORT: u16 = 9000;
 /// `MinIO`'s root credentials, which are also the S3 keys the client signs with.
@@ -817,6 +816,28 @@ pub async fn get_range(
     let out = get_output(proxy, bucket, key, Some((first, last)))
         .await
         .expect("ranged get succeeds");
+    let range = out.content_range.clone();
+    (read_body(out).await, range)
+}
+
+/// A suffix GET and its `Content-Range` response header.
+pub async fn get_suffix(
+    proxy: &CachingProxy,
+    bucket: &str,
+    key: &str,
+    length: u64,
+) -> (Bytes, Option<String>) {
+    let input = GetObjectInput {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        range: Some(Range::Suffix { length }),
+        ..Default::default()
+    };
+    let out = proxy
+        .get_object(request(input))
+        .await
+        .expect("suffix get succeeds")
+        .output;
     let range = out.content_range.clone();
     (read_body(out).await, range)
 }

@@ -218,6 +218,14 @@ counters! {
     /// is what it is for; sustained movement outside a restart means writes are being
     /// missed.
     body_revalidation_evictions => body_revalidation_eviction,
+    /// Record a suspect body whose key is absent from the synced LIST index.
+    body_revalidation_index_absent => body_revalidation_index_absent,
+    /// Record a suspect body whose entry or body lacks an `ETag` or modification time.
+    body_revalidation_missing_identity => body_revalidation_missing_identity,
+    /// Record a suspect body whose `ETag` differs from the indexed `ETag`.
+    body_revalidation_etag_mismatch => body_revalidation_etag_mismatch,
+    /// Record a suspect body whose indexed modification time is newer.
+    body_revalidation_timestamp_mismatch => body_revalidation_timestamp_mismatch,
     /// Record a write advertised to peers over the gossip write feed.
     feed_published => feed_published,
     /// Record a peer's write applied from the feed (index + invalidation).
@@ -270,6 +278,10 @@ counters! {
     /// lapsed, awaiting a resync affirmation, or a granter gone silent), or a membership
     /// view that was not fully alive (`strong-acks`).
     unhealthy_bypasses => unhealthy_bypass,
+    /// Record a read routed to the origin because this node cannot serve locally.
+    read_licence_bypasses => read_licence_bypass,
+    /// Record a read routed to the origin after the freshness barrier timed out.
+    read_freshness_bypasses => read_freshness_bypass,
     /// Record a skeletal index entry completed from an origin response (the one
     /// forwarded HEAD that makes every later HEAD of that key local *and* faithful).
     index_backfills => index_backfill,

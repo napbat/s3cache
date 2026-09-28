@@ -12,9 +12,9 @@ use tracing::info;
 
 use crate::cache::copy;
 use crate::index::{
-    AuthoritativeKeyState, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry, ObjMeta,
-    apply_del, apply_observed_put, apply_put, begin_bucket_resync, complete_entry,
-    entry_matches_body, fence_uncertain_key, head_object_from_index, list_objects_v2_from_index,
+    AuthoritativeKeyState, BodyMatch, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry,
+    ObjMeta, apply_del, apply_observed_put, apply_put, begin_bucket_resync, compare_entry_body,
+    complete_entry, fence_uncertain_key, head_object_from_index, list_objects_v2_from_index,
     resolve_uncertain_key, standard_class, sync_bucket_generation, sync_bucket_into,
     uncertain_key_is_current,
 };
@@ -41,6 +41,32 @@ pub struct CacheConfig {
 pub(super) enum ReadRoute {
     Local,
     Origin,
+}
+
+/// A byte range that a complete cached body can answer.
+#[derive(Clone, Copy)]
+enum CachedRange {
+    Int { first: u64, last: Option<u64> },
+    Suffix { length: u64 },
+}
+
+impl CachedRange {
+    fn from_request(unconditional: bool, range: Option<s3s::dto::Range>) -> Option<Self> {
+        match (unconditional, range) {
+            (true, Some(s3s::dto::Range::Int { first, last })) => Some(Self::Int { first, last }),
+            (true, Some(s3s::dto::Range::Suffix { length })) if length > 0 => {
+                Some(Self::Suffix { length })
+            }
+            _ => None,
+        }
+    }
+
+    fn slice(self, obj: &CachedObject) -> Option<GetObjectOutput> {
+        match self {
+            Self::Int { first, last } => obj.to_get_range(first, last),
+            Self::Suffix { length } => obj.to_get_suffix(length),
+        }
+    }
 }
 
 /// How long a write response may be held waiting for every alive peer to
@@ -522,11 +548,13 @@ impl CachingProxy {
         // so it serves via the origin until the licence comes back.
         if !sync.may_serve_local() {
             self.metrics.unhealthy_bypass();
+            self.metrics.read_licence_bypass();
             return ReadRoute::Origin;
         }
         if !sync.await_fresh(READ_BARRIER_TIMEOUT).await {
             tracing::debug!("freshness barrier timed out; serving via origin");
             self.metrics.unhealthy_bypass();
+            self.metrics.read_freshness_bypass();
             return ReadRoute::Origin;
         }
         // A client-echoed write token upgrades the read to strict
@@ -934,7 +962,7 @@ impl CachingProxy {
         }
     }
 
-    /// Serve an int-range GET by promoting the whole object into the tiered cache (one
+    /// Serve an integer-range GET by promoting the whole object into the tiered cache (one
     /// upstream fetch, singleflighted when hot is active) and slicing it. `Some` when served — a
     /// slice, or `InvalidRange` past EOF; `None` when the promote was refused/failed and
     /// the caller should stream the range through (the loader gets its own range-cleared
@@ -1077,7 +1105,7 @@ impl CachingProxy {
     ///   state, and it costs nothing.
     /// * **Suspect, synced bucket** — the LIST index is this node's own re-read of the
     ///   origin, so it can arbitrate: a matching `ETag` and an mtime it has not moved
-    ///   past ([`entry_matches_body`]) proves the copy, and the stamp puts the next read
+    ///   past ([`compare_entry_body`]) proves the copy, and the stamp puts the next read
     ///   of it back on the fast path. Anything else — a different version, a comparison
     ///   neither side carries, or a key the index no longer holds, which is precisely the
     ///   DELETE this node missed — drops the copy and sends the read to the origin.
@@ -1107,18 +1135,31 @@ impl CachingProxy {
             g.get(ckey.0.as_str()).filter(|b| b.synced).map(|b| {
                 b.keys
                     .get(ckey.1.as_str())
-                    .is_some_and(|entry| entry_matches_body(entry, &obj))
+                    .map(|entry| compare_entry_body(entry, &obj))
             })
         };
         match proved {
-            Some(true) => {
+            Some(Some(BodyMatch::Match)) => {
                 obj.mark_trusted(generation);
                 self.metrics.body_revalidation();
                 Some(obj)
             }
-            Some(false) => {
+            Some(reason) => {
                 self.obj_cache.invalidate(ckey).await;
                 self.metrics.body_revalidation_eviction();
+                match reason {
+                    None => self.metrics.body_revalidation_index_absent(),
+                    Some(BodyMatch::MissingIdentity) => {
+                        self.metrics.body_revalidation_missing_identity();
+                    }
+                    Some(BodyMatch::EtagMismatch) => {
+                        self.metrics.body_revalidation_etag_mismatch();
+                    }
+                    Some(BodyMatch::TimestampMismatch) => {
+                        self.metrics.body_revalidation_timestamp_mismatch();
+                    }
+                    Some(BodyMatch::Match) => unreachable!("matching bodies return above"),
+                }
                 None
             }
             None => {
@@ -1152,30 +1193,27 @@ impl CachingProxy {
             && req.input.if_unmodified_since.is_none();
         let cacheable = unconditional && req.input.range.is_none();
         let ckey = (req.input.bucket.clone(), req.input.key.clone());
-        let int_range = match (unconditional, req.input.range) {
-            (true, Some(s3s::dto::Range::Int { first, last })) => Some((first, last)),
-            _ => None,
-        };
+        let cached_range = CachedRange::from_request(unconditional, req.input.range);
         // Before any read served from a node-local hot copy, barrier so a peer's
         // overwrite is never read stale; a token-carrying read that cannot be
         // verified in time skips every local copy and streams from the origin.
-        let local_ok = if cacheable || int_range.is_some() {
+        let local_ok = if cacheable || cached_range.is_some() {
             !self.key_uncertain(&ckey.0, &ckey.1)
                 && self.read_barrier(&req.headers).await == ReadRoute::Local
         } else {
             true
         };
-        if let Some((first, last)) = int_range {
+        if let Some(range) = cached_range {
             // Cached whole object → serve the slice locally.
             if local_ok
                 && let Some(obj) = self.validated_get(&ckey).await
-                && let Some(out) = obj.to_get_range(first, last)
+                && let Some(out) = range.slice(&obj)
             {
                 self.metrics.range_hit();
                 return Ok(S3Response::new(out));
             }
-            // Promote when caching is on and the index says the whole object fits: one
-            // upstream GET (deduped across concurrent ranges when hot is active), then
+            // Promote an integer range when the index says the whole object fits: one
+            // upstream GET (deduped across concurrent ranges), then
             // every range — this one included — is a slice. A refused/failed promote
             // degrades to the passthrough below, never an error.
             let small = self.index_size(&ckey.0, &ckey.1).is_some_and(|sz| {
@@ -1183,6 +1221,7 @@ impl CachingProxy {
             });
             if local_ok
                 && small
+                && let CachedRange::Int { first, last } = range
                 && let Some(resp) = self.promote_range(&ckey, &req, first, last).await
             {
                 return resp;

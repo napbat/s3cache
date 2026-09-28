@@ -118,12 +118,20 @@ const BODY_MTIME_SLACK: Duration = Duration::from_secs(1);
 /// Anything missing is a mismatch, never a pass: an entry with no `ETag` (a bootstrap
 /// row or skeletal write) or a body with no `ETag`/`Last-Modified` cannot be compared,
 /// and an uncomparable copy is one the origin has to re-serve.
-pub(crate) fn entry_matches_body(entry: &ObjEntry, obj: &CachedObject) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyMatch {
+    Match,
+    MissingIdentity,
+    EtagMismatch,
+    TimestampMismatch,
+}
+
+pub(crate) fn compare_entry_body(entry: &ObjEntry, obj: &CachedObject) -> BodyMatch {
     let (Some(indexed), Some(cached)) = (entry.etag.as_ref(), obj.e_tag()) else {
-        return false;
+        return BodyMatch::MissingIdentity;
     };
     let Some(filled_at) = obj.last_modified() else {
-        return false;
+        return BodyMatch::MissingIdentity;
     };
     // `entry.last_modified <= filled_at + SLACK`, with the slack taken off the entry
     // rather than added to the body: a `Timestamp` has no way back to a `SystemTime`
@@ -134,7 +142,18 @@ pub(crate) fn entry_matches_body(entry: &ObjEntry, obj: &CachedObject) -> bool {
         .last_modified
         .checked_sub(BODY_MTIME_SLACK)
         .unwrap_or(entry.last_modified);
-    indexed == cached && Timestamp::from(floor) <= *filled_at
+    if indexed != cached {
+        BodyMatch::EtagMismatch
+    } else if Timestamp::from(floor) > *filled_at {
+        BodyMatch::TimestampMismatch
+    } else {
+        BodyMatch::Match
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn entry_matches_body(entry: &ObjEntry, obj: &CachedObject) -> bool {
+    compare_entry_body(entry, obj) == BodyMatch::Match
 }
 
 /// What an origin response adds to an already-indexed entry (see [`complete_entry`]).
@@ -1630,6 +1649,30 @@ mod tests {
             !entry_matches_body(&indexed(Some("v1"), now), &body(Some("v1"), None)),
             "a body with no mtime cannot answer the rewrite question at all"
         );
+    }
+
+    #[test]
+    fn body_match_reasons_keep_the_trust_decision() {
+        use super::{BodyMatch, compare_entry_body};
+
+        let now = ts(1_700_000_000);
+        let current = body(Some("v1"), Some(now));
+        assert!(matches!(
+            compare_entry_body(&indexed(Some("v1"), now), &current),
+            BodyMatch::Match
+        ));
+        assert!(matches!(
+            compare_entry_body(&indexed(None, now), &current),
+            BodyMatch::MissingIdentity
+        ));
+        assert!(matches!(
+            compare_entry_body(&indexed(Some("v2"), now), &current),
+            BodyMatch::EtagMismatch
+        ));
+        assert!(matches!(
+            compare_entry_body(&indexed(Some("v1"), now + Duration::from_secs(2)), &current),
+            BodyMatch::TimestampMismatch
+        ));
     }
 
     /// The clause that closes the byte-identical rewrite: same content re-PUT keeps the

@@ -342,6 +342,21 @@ async fn a_freshness_timeout_routes_to_origin_and_is_counted() {
         ReadRoute::Origin
     ));
     assert_eq!(counter(&proxy, "unhealthy_bypasses"), 1);
+    assert_eq!(counter(&proxy, "read_freshness_bypasses"), 1);
+    assert_eq!(counter(&proxy, "read_licence_bypasses"), 0);
+}
+
+#[tokio::test]
+async fn an_unlicensed_read_records_its_bypass_reason() {
+    let (_node, sync) = solo("unlicensed-read");
+    let proxy = proxy(Some(sync));
+    assert!(matches!(
+        proxy.read_barrier(&HeaderMap::new()).await,
+        ReadRoute::Origin
+    ));
+    assert_eq!(counter(&proxy, "unhealthy_bypasses"), 1);
+    assert_eq!(counter(&proxy, "read_licence_bypasses"), 1);
+    assert_eq!(counter(&proxy, "read_freshness_bypasses"), 0);
 }
 
 /// Single node: no feed, so this proxy is the only writer and its own tiers cannot
@@ -444,6 +459,9 @@ async fn a_suspect_copy_the_index_contradicts_is_dropped() {
         );
     }
     assert_eq!(counter(&proxy, "body_revalidation_evictions"), 3);
+    assert_eq!(counter(&proxy, "body_revalidation_etag_mismatch"), 1);
+    assert_eq!(counter(&proxy, "body_revalidation_index_absent"), 1);
+    assert_eq!(counter(&proxy, "body_revalidation_missing_identity"), 1);
     assert_eq!(counter(&proxy, "body_revalidations"), 0);
 }
 
@@ -488,6 +506,7 @@ async fn a_byte_identical_rewrite_is_caught_by_the_mtime_and_a_fresh_fill_is_not
         "and the stamp order of a real write fill must still validate"
     );
     assert_eq!(counter(&proxy, "body_revalidation_evictions"), 1);
+    assert_eq!(counter(&proxy, "body_revalidation_timestamp_mismatch"), 1);
     assert_eq!(counter(&proxy, "body_revalidations"), 1);
 }
 

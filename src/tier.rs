@@ -281,6 +281,17 @@ impl CachedObject {
         })
     }
 
+    /// A suffix range from the cached whole body. Empty bodies and zero-length
+    /// suffixes retain the origin's own error response.
+    #[must_use]
+    pub fn to_get_suffix(&self, length: u64) -> Option<GetObjectOutput> {
+        let total = self.body.len() as u64;
+        if total == 0 || length == 0 {
+            return None;
+        }
+        self.to_get_range(total.saturating_sub(length), None)
+    }
+
     /// Reconstruct a HEAD response from the cached metadata.
     #[must_use]
     pub fn to_head(&self) -> HeadObjectOutput {
@@ -785,6 +796,26 @@ mod tests {
             ..Default::default()
         };
         CachedObject::from_get(&out, Bytes::from_static(b"hello"))
+    }
+
+    #[tokio::test]
+    async fn suffix_slice_uses_cached_body_and_preserves_range_headers() {
+        let object = sample();
+        for (length, bytes, header) in [
+            (2, b"lo".as_slice(), "bytes 3-4/5"),
+            (5, b"hello".as_slice(), "bytes 0-4/5"),
+            (50, b"hello".as_slice(), "bytes 0-4/5"),
+        ] {
+            let mut out = object.to_get_suffix(length).expect("valid suffix");
+            assert_eq!(out.content_range.as_deref(), Some(header));
+            assert_eq!(
+                out.content_length,
+                Some(i64::try_from(bytes.len()).unwrap())
+            );
+            let body = out.body.take().expect("ranged body");
+            assert_eq!(buffer_body(body, 5).await.as_deref(), Some(bytes));
+        }
+        assert!(object.to_get_suffix(0).is_none());
     }
 
     fn ck(bucket: &str, key: &str) -> super::CacheKey {

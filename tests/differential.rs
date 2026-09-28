@@ -240,8 +240,8 @@ const INT_RANGES: &[(&str, Range)] = &[
     ),
 ];
 
-/// Suffix ranges, which `s3s` models separately and the cache never slices locally.
-/// These rows prove the passthrough stays exact rather than the slicing does.
+/// Suffix ranges, which `s3s` models separately. These rows compare cached
+/// slices with the origin response, including a suffix longer than the body.
 const SUFFIX_RANGES: &[(&str, Range)] = &[
     ("bytes=-3", Range::Suffix { length: 3 }),
     ("bytes=-10 (whole object)", Range::Suffix { length: 10 }),

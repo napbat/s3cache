@@ -29,8 +29,10 @@ endpoint to this proxy; no client code changes.
   node-local *disk* cache (`S3CACHE_DISK_CACHE`), falling through to **cold** — the S3
   origin — on a miss. Concurrent misses for the same cacheable object share one origin
   fill; different keys remain fully concurrent, and known oversized objects stream
-  straight through. Always layered, no mode to pick. Ranged reads slice the cached whole
-  object; HEAD is served from the same cache. See [Cache tiers](#cache-tiers).
+  straight through. Always layered, no mode to pick. Integer and suffix byte ranges
+  slice the cached whole object. A first integer range promotes a small object
+  when the index knows its size. An uncached suffix stays a small origin range
+  request. HEAD is served from the same cache. See [Cache tiers](#cache-tiers).
 - **Write-through + invalidation, and fill-on-write.** `PutObject` / `DeleteObject` /
   multipart / `CopyObject` forward to the upstream (which stays the authority for
   conditional/OCC writes — identical semantics). A `PutObject` **invalidates the object
@@ -350,7 +352,18 @@ RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --all-features --no-de
 ```
 
 The integration tests start MinIO through testcontainers and require a reachable Docker
-daemon. After Helm chart changes, lint and render with the required upstream value:
+daemon. Build the pinned test origin before the Rust test gate. The build fetches MinIO
+source at commit `7aac2a2c5b7c882e68c1ce017d8256be2feea27f` and compiles it in the
+official Go 1.24.8 image. It tags the local image as `s3cache-minio-test:7aac2a2c`:
+
+```sh
+bash scripts/build-minio-test-image.sh
+```
+
+Set `RUNTIME=podman` to build the image with Podman. The shell end-to-end harness
+builds the image before it starts MinIO. CI runs unit tests and the Docker-free
+`metrics_endpoint` and `tier_cache` integration targets. Run the real MinIO tests
+locally. After Helm chart changes, lint and render with the required upstream value:
 
 ```sh
 helm lint deploy/helm/s3cache --set upstream.endpoint=https://example.com
@@ -424,7 +437,15 @@ behind when the wait's deadline passed (in `strong`, the fail-slow reader — re
 not applying — plus any un-leased peer that did not ack). Alert on that one.
 `unhealthy_bypasses` counts reads sent to the origin because this node held no licence or
 could not reach every advertised feed head before the freshness-barrier deadline.
-It is expected to be non-zero at every startup and after every gap.
+`read_licence_bypasses` and `read_freshness_bypasses` split those causes. They
+do not include a read whose session token could not be verified in time.
+Some unhealthy bypasses are expected at startup and after a feed gap.
+`body_revalidation_evictions` counts suspect cached bodies rejected by the
+synced index. Its reason counters are `body_revalidation_index_absent`,
+`body_revalidation_missing_identity`, `body_revalidation_etag_mismatch`, and
+`body_revalidation_timestamp_mismatch`. These reasons keep the same trust
+decision. A body in an unsynced bucket is invalidated without incrementing
+`body_revalidation_evictions`.
 The lapse pair is the read side of the same story: this node's *own* lease lapsed with no
 gap to explain it (a peer stopped granting). `lapse_barrier_retains` is the cheap arm —
 the staged recovery proved the cache and kept it, so the node came back **warm** — and
