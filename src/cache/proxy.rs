@@ -141,11 +141,12 @@ pub(super) struct ResponseOverrides {
 /// that way: an entry is never given a number the origin did not report.
 #[derive(Clone)]
 pub(super) struct ObservedObject {
-    size: Option<i64>,
-    etag: Option<ETag>,
-    content_type: Option<String>,
-    storage_class: ObjectStorageClass,
-    meta: ObjMeta,
+    pub(super) size: Option<i64>,
+    pub(super) last_modified: Option<Timestamp>,
+    pub(super) etag: Option<ETag>,
+    pub(super) content_type: Option<String>,
+    pub(super) storage_class: ObjectStorageClass,
+    pub(super) meta: ObjMeta,
 }
 
 /// A whole-object cache fill can fail normally, or discover from the origin's
@@ -309,6 +310,7 @@ macro_rules! observed {
         let out = $out;
         ObservedObject {
             size: out.content_length,
+            last_modified: out.last_modified.clone(),
             etag: out.e_tag.clone(),
             content_type: out.content_type.clone(),
             storage_class: out
@@ -327,6 +329,10 @@ macro_rules! observed {
         }
     }};
 }
+
+#[cfg(test)]
+#[path = "proxy/observation_tests.rs"]
+mod observation_tests;
 
 /// Which write folded a key into the LIST index. Each of these is a separately
 /// billed upstream (R2 class A) operation, so each gets its own counter — one
@@ -846,7 +852,12 @@ impl CachingProxy {
         }
         let entry = ObjEntry {
             size: observed.size,
-            last_modified: wire_stamp(SystemTime::now()),
+            last_modified: observed
+                .last_modified
+                .as_ref()
+                .map_or_else(SystemTime::now, |stamp| {
+                    SystemTime::from(time::OffsetDateTime::from(stamp.clone()))
+                }),
             etag: observed.etag.clone(),
             storage_class: observed.storage_class.clone(),
             content_type: observed.content_type.clone(),
@@ -903,6 +914,14 @@ impl CachingProxy {
                 Ok(head) => {
                     return Some(ObservedObject {
                         size: head.content_length(),
+                        last_modified: head.last_modified().and_then(|stamp| {
+                            u64::try_from(stamp.secs()).ok().map(|secs| {
+                                Timestamp::from(
+                                    SystemTime::UNIX_EPOCH
+                                        + Duration::new(secs, stamp.subsec_nanos()),
+                                )
+                            })
+                        }),
                         etag: head.e_tag().and_then(|raw| raw.parse().ok()),
                         content_type: head.content_type().map(str::to_owned),
                         storage_class: head.storage_class().map_or_else(standard_class, |class| {

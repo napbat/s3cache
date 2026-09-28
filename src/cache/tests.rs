@@ -11,8 +11,12 @@ use http::HeaderMap;
 use s3s::dto::{ETag, GetObjectOutput, ListObjectsV2Input, Timestamp};
 use s3s::{S3, S3ErrorCode, S3Request};
 
-use crate::cache::proxy::{CacheConfig, CachingProxy, FullSyncOwner, ReadRoute, affirm_after};
-use crate::index::{ObjEntry, apply_put, standard_class};
+use crate::cache::proxy::{
+    CacheConfig, CachingProxy, FullSyncOwner, ObservedObject, ReadRoute, affirm_after,
+};
+use crate::index::{
+    IndexedHead, ObjEntry, ObjMeta, apply_put, head_object_from_index, standard_class,
+};
 use crate::list_token;
 use crate::metrics::Metrics;
 use crate::sync::coherence::{Consistency, WriteSync};
@@ -302,6 +306,46 @@ fn counter(proxy: &CachingProxy, name: &str) -> u64 {
         .find_map(|line| line.strip_prefix(&prefix))
         .and_then(|value| value.parse().ok())
         .unwrap_or_else(|| panic!("{name} is not exposed:\n{text}"))
+}
+
+/// A read during bucket warm-up can discover an old object before LIST reaches it.
+/// Its index clock must be the origin's mtime so HEAD stays faithful and a warm
+/// body of that same version can pass revalidation after warm-up completes.
+#[tokio::test]
+async fn an_unknown_read_observation_keeps_the_origin_mtime() {
+    let (_node, sync) = solo("observed-origin-mtime");
+    let proxy = proxy(Some(sync));
+    let modified = at(1_700_000_000);
+    let observed = ObservedObject {
+        size: Some(4),
+        last_modified: Some(Timestamp::from(modified)),
+        etag: Some(ETag::Strong("v1".to_owned())),
+        content_type: Some("text/x-fixture".to_owned()),
+        storage_class: standard_class(),
+        meta: ObjMeta::default(),
+    };
+    proxy.observe("b", "old", &observed);
+
+    let indexed_head = {
+        let state = proxy.state.read().expect("index lock");
+        head_object_from_index(state.get("b").map(|bucket| &bucket.keys), "old")
+    };
+    let IndexedHead::Faithful(head) = indexed_head else {
+        panic!("the read observation must supply a faithful HEAD");
+    };
+    assert_eq!(head.last_modified, observed.last_modified);
+    assert_eq!(head.content_length, observed.size);
+    assert_eq!(head.e_tag, observed.etag);
+
+    proxy
+        .obj_cache
+        .insert(ck("old"), cached("v1", modified))
+        .await;
+    synced(&proxy);
+    assert!(proxy.validated_get(&ck("old")).await.is_some());
+    assert_eq!(counter(&proxy, "body_revalidations"), 1);
+    assert_eq!(counter(&proxy, "body_revalidation_timestamp_mismatch"), 0);
+    assert_eq!(counter(&proxy, "body_revalidation_evictions"), 0);
 }
 
 /// A peer can advertise a head before its frame is usable locally. The read barrier

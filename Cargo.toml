@@ -36,6 +36,7 @@ tierstore = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-mmap = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-moka = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tokio = { version = "1", features = ["full"] }
+time = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -79,6 +80,7 @@ tierstore.workspace = true
 tierstore-mmap.workspace = true
 tierstore-moka.workspace = true
 tokio.workspace = true
+time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
