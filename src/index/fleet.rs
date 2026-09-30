@@ -947,38 +947,4 @@ mod tests {
         assert!(index.buckets["bucket"].keys.contains_key("invalid-cut"));
         assert!(index.buckets["bucket"].keys.contains_key("capacity-cut"));
     }
-    #[test]
-    #[ignore = "throwaway sizing probe"]
-    fn zz_sizing_probe() {
-        let rows = 800_000usize;
-        let mut keys = BTreeMap::new();
-        for i in 0..rows {
-            let entry = ObjEntry {
-                size: Some(4_194_304),
-                last_modified: UNIX_EPOCH + Duration::from_secs(1_790_000_000 + i as u64),
-                etag: Some(format!("\"{:032x}\"", i as u128 * 7919).parse().unwrap()),
-                storage_class: ObjectStorageClass::from("STANDARD".to_owned()),
-                content_type: Some("application/octet-stream".to_owned()),
-                meta: None,
-            };
-            keys.insert(format!("ns/{:016x}/shard/{:04}/seg/{:020}.seg", i / 400, i % 2048, i), entry);
-        }
-        let bucket = BucketState { synced: true, keys, ..BucketState::default() };
-        let state = KeyIndexState { buckets: HashMap::from([("docres".to_owned(), bucket)]), stats: IndexStats::default(), capture: None, native_cuts: BTreeMap::new() };
-        let caps = ImageCaps { bytes: 1 << 30, decoded_bytes: 4 << 30, buckets: 1, rows: 4_000_000, name_bytes: 1024 };
-        let t = std::time::Instant::now();
-        let encoded = encode(&state, &["docres".to_owned()], caps).unwrap();
-        let enc_t = t.elapsed();
-        let t = std::time::Instant::now();
-        let cloned = super::clone_state(&state, &["docres".to_owned()], caps).unwrap();
-        let clone_t = t.elapsed();
-        drop(cloned);
-        let mut need = 0usize;
-        for d in [64usize<<20, 128<<20, 256<<20, 512<<20, 1<<30, 2<<30, 4<<30] { if decode(&encoded, ImageCaps { decoded_bytes: d, ..caps }).is_ok() { need = d; break; } }
-        let t = std::time::Instant::now();
-        let _ = decode(&encoded, caps).unwrap();
-        let dec_t = t.elapsed();
-        println!("PROBE rows={rows} encoded={} B ({} B/row) decoded_cap_needed<={} MiB encode={enc_t:?} clone={clone_t:?} decode={dec_t:?}", encoded.len(), encoded.len()/rows, need>>20);
-    }
-
 }
