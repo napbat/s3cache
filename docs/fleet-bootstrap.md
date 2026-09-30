@@ -189,6 +189,15 @@ same lock: proxied PUT/DELETE/COPY/multipart results, peer feed mutations,
 local origin GET/HEAD repairs, and per-key uncertainty resolutions. A
 whole-bucket LIST/rebuild invalidates the candidate; a new complete capture
 is required before donor service resumes.
+Forgetting an expired delete tombstone is not a key effect and is never
+journaled: while a capture is attached the index forgets none, so the image
+plus suffix stays exactly the donor's rows, and a follower replaying the
+suffix forgets none either. The one-hour tombstone TTL is a floor, not a
+deadline, and a capture's lifetime is bounded, so deferring costs only the
+tombstones deleted meanwhile. Uncaptured, a bucket holding more than 65,536
+tombstones sweeps them incrementally: each delete visits at most 16, from a
+cursor that wraps over the key order, and none while the oldest held
+tombstone is provably unexpired.
 Rejected duplicate native events still append a bounded native `Noop` so
 writer coverage advances contiguously. The record includes an exact native
 writer incarnation/sequence when one exists; other effects get a fresh

@@ -1173,4 +1173,112 @@ mod tests {
         drop(newer);
         assert_eq!(budget.usage().0, 0);
     }
+
+    #[test]
+    fn expired_tombstones_stay_while_captured_and_are_swept_a_step_at_a_time_after() {
+        use crate::index::fleet::IndexDelta;
+        use crate::index::rows::SWEEP_STEP;
+        use crate::index::{TOMBSTONE_PRUNE_LEN, TOMBSTONE_TTL};
+
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        let dead = UNIX_EPOCH + Duration::from_secs(1);
+        let late = dead + TOMBSTONE_TTL * 2;
+        let held = TOMBSTONE_PRUNE_LEN + 1;
+        {
+            let mut live = index.inner.write().unwrap();
+            let gone = &mut live.buckets.get_mut("bucket").unwrap().gone;
+            for n in 0..held {
+                gone.insert(format!("dead/{n:06}"), dead);
+            }
+        }
+        let universe = ["bucket".to_owned()];
+        let caps = ImageCaps {
+            bytes: 1 << 24,
+            decoded_bytes: 1 << 26,
+            buckets: 1,
+            rows: held + 2,
+            name_bytes: 64,
+        };
+        let config = JournalConfig {
+            max_encoded_bytes: caps.bytes,
+            max_decoded_bytes: caps.decoded_bytes,
+            ..config()
+        };
+        let budget = ByteAdmission::new(AdmissionLimits {
+            max_total_bytes: 1 << 28,
+            max_encoded_bytes: caps.bytes,
+            max_decoded_bytes: caps.decoded_bytes,
+            max_suffix_bytes: 900_000,
+            max_native_overlap_bytes: 1,
+            max_inflight_bytes: 1,
+            max_reservations: 16,
+        })
+        .unwrap();
+        let suffix = budget
+            .reserve(
+                AdmissionClass::Suffix,
+                DonorJournal::storage_bound(config).unwrap(),
+            )
+            .unwrap();
+        let mut pending = index
+            .begin_fleet_capture(
+                DonorJournal::new(config, capture_id(1)).unwrap(),
+                suffix,
+                &budget,
+                Arc::new(Notify::new()),
+                vec![member()],
+                &universe,
+                caps,
+                LogicalClock::start(),
+            )
+            .unwrap();
+        pending.encode(&universe, caps).unwrap();
+        let gone_len = |index: &KeyIndex| index.inner.read().unwrap().buckets["bucket"].gone.len();
+
+        // Every held tombstone has expired, yet none is forgotten under the
+        // capture: its image plus suffix stays exactly the live rows.
+        apply_del(&index, "bucket", "fresh", late);
+        assert_eq!(gone_len(&index), held + 1);
+        assert_eq!(
+            pending
+                .ingress
+                .with_journal(|journal| journal.invalidation()),
+            None
+        );
+        let donor = pending.finish().unwrap();
+        assert_eq!(
+            donor
+                .ingress()
+                .with_journal(|journal| journal.current_cursor().unwrap().position),
+            1,
+            "the delete is the capture's only effect"
+        );
+        // Its follower replays that delete without sweeping, into the same rows.
+        let stage = staged(super::super::decode(donor.image().as_bytes(), caps).unwrap());
+        IndexDelta::Delete {
+            bucket: "bucket".to_owned(),
+            key: "fresh".to_owned(),
+            deleted_at: late,
+        }
+        .apply(&stage);
+        {
+            let staged = stage.inner.read().unwrap();
+            let live = index.inner.read().unwrap();
+            assert!(
+                staged.buckets["bucket"]
+                    .gone
+                    .iter()
+                    .eq(live.buckets["bucket"].gone.iter())
+            );
+        }
+        drop(donor);
+
+        // Uncaptured, a delete forgets one bounded step of expired tombstones,
+        // and none once the bucket is back under the sweep threshold.
+        apply_del(&index, "bucket", "later/0", late);
+        assert_eq!(gone_len(&index), held + 2 - SWEEP_STEP);
+        apply_del(&index, "bucket", "later/1", late);
+        assert_eq!(gone_len(&index), held + 3 - SWEEP_STEP);
+    }
 }

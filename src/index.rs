@@ -295,7 +295,7 @@ impl KeyIndex {
 pub(crate) struct BucketState {
     pub(crate) synced: bool,
     pub(crate) keys: KeyRows,
-    /// Deleted keys and when: consulted by [`apply_put`], pruned amortized.
+    /// Deleted keys and when: consulted by [`apply_put`], swept incrementally.
     pub(crate) gone: GoneRows,
     /// Generation of the origin rebuild currently allowed to publish into this bucket.
     /// Only whole-bucket rebuild lifecycle changes this generation; per-key HEAD
@@ -332,11 +332,21 @@ fn account_replacement(
 
 /// How long a delete tombstone shields its key from older, late-arriving
 /// cross-writer puts. Conflicts past this window resolve at the next origin
-/// sync — the origin stays the authority, this index is a cache of it.
+/// sync — the origin stays the authority, this index is a cache of it. It is a
+/// floor, not a deadline: nothing depends on an expired tombstone being gone.
 const TOMBSTONE_TTL: Duration = Duration::from_hours(1);
 
-/// Tombstones per bucket before an amortized TTL prune runs.
+/// Tombstones per bucket before deletes start sweeping expired ones.
 const TOMBSTONE_PRUNE_LEN: usize = 65_536;
+
+/// Whether a delete may forget expired tombstones. A replayed donor delete
+/// may not: the private stage mirrors exactly the donor's rows, and the donor
+/// forgets none while its capture is attached.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TombstoneSweep {
+    Run,
+    Hold,
+}
 
 /// Whether an accepted put is a definitive mutation that supersedes an uncertainty, or
 /// a read/list observation that must leave a fence for its authoritative HEAD owner.
@@ -641,7 +651,19 @@ pub(crate) fn restart_bucket_resync_if_current(
 /// not older than either the retained live entry or tombstone. Returns whether a live
 /// entry was removed.
 pub(crate) fn apply_del(state: &KeyIndex, bucket: &str, key: &str, ts: SystemTime) -> bool {
-    apply_del_with_identity(state, bucket, key, ts, || None)
+    apply_del_with_identity(state, bucket, key, ts, || None, TombstoneSweep::Run)
+}
+
+/// Applies one donor delete to a private stage, as [`apply_del`] does, but
+/// never forgets an expired tombstone: the stage holds exactly the rows the
+/// donor journaled, and the donor forgets none while it is captured.
+pub(crate) fn apply_replayed_del(
+    state: &KeyIndex,
+    bucket: &str,
+    key: &str,
+    ts: SystemTime,
+) -> bool {
+    apply_del_with_identity(state, bucket, key, ts, || None, TombstoneSweep::Hold)
 }
 
 /// Applies this node's own delete. `assign` runs once the index lock is
@@ -657,11 +679,18 @@ pub(crate) fn apply_own_del<R>(
     assign: impl FnOnce() -> (R, NativeCut),
 ) -> (bool, R) {
     let mut assigned = None;
-    let removed = apply_del_with_identity(state, bucket, key, ts, || {
-        let (value, position) = assign();
-        assigned = Some(value);
-        Some(DeltaIdentity::Native(position))
-    });
+    let removed = apply_del_with_identity(
+        state,
+        bucket,
+        key,
+        ts,
+        || {
+            let (value, position) = assign();
+            assigned = Some(value);
+            Some(DeltaIdentity::Native(position))
+        },
+        TombstoneSweep::Run,
+    );
     (
         removed,
         assigned.expect("an own delete is assigned under the index lock"),
@@ -675,7 +704,14 @@ pub(crate) fn apply_del_native(
     ts: SystemTime,
     cut: NativeCut,
 ) -> bool {
-    apply_del_with_identity(state, bucket, key, ts, || Some(DeltaIdentity::Native(cut)))
+    apply_del_with_identity(
+        state,
+        bucket,
+        key,
+        ts,
+        || Some(DeltaIdentity::Native(cut)),
+        TombstoneSweep::Run,
+    )
 }
 
 fn apply_del_with_identity(
@@ -684,6 +720,7 @@ fn apply_del_with_identity(
     key: &str,
     ts: SystemTime,
     identity: impl FnOnce() -> Option<DeltaIdentity>,
+    sweep: TombstoneSweep,
 ) -> bool {
     let mut index = state.inner.write().unwrap();
     let identity = identity();
@@ -703,15 +740,17 @@ fn apply_del_with_identity(
     } = &mut *index;
     let b = buckets.entry(bucket.to_owned()).or_default();
     let first_rebuild_mutation = b.rebuild_generation.is_some() && !b.rebuild_touched.contains(key);
-    let prior_tombstone = b.gone.get(key).copied();
-    if b.gone.len() > TOMBSTONE_PRUNE_LEN
+    // A capture journals only whole key effects, so while one is attached no
+    // tombstone is forgotten and its image plus suffix stays exactly these
+    // rows. The TTL is a floor, and a capture lives for a bounded time.
+    if sweep == TombstoneSweep::Run
+        && capture.is_none()
+        && b.gone.len() > TOMBSTONE_PRUNE_LEN
         && let Some(cutoff) = ts.checked_sub(TOMBSTONE_TTL)
     {
-        if let Some(capture) = capture.as_ref() {
-            capture.invalidate(groupnet::core::volatile_bootstrap::journal::Invalidation::Rebuild);
-        }
-        b.gone.retain(|_, dead| *dead >= cutoff);
+        b.gone.sweep_expired(cutoff);
     }
+    let prior_tombstone = b.gone.get(key).copied();
     let newer_tombstone = !first_rebuild_mutation && b.gone.get(key).is_some_and(|dead| *dead > ts);
     if first_rebuild_mutation {
         b.gone.insert(key.to_owned(), ts);

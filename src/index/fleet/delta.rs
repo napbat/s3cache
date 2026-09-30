@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use crate::index::{KeyIndex, ObjEntry, apply_del, apply_put};
+use crate::index::{KeyIndex, ObjEntry, apply_put, apply_replayed_del};
 
 use super::{
     DecodeBudget, ImageError, Reader, Writer, read_entry, read_timestamp, timestamp, write_entry,
@@ -43,7 +43,7 @@ impl IndexDelta {
                 key,
                 deleted_at,
             } => {
-                let changed = apply_del(stage, &bucket, &key, deleted_at);
+                let changed = apply_replayed_del(stage, &bucket, &key, deleted_at);
                 (changed, Some(bucket))
             }
             Self::Noop => (false, None),
