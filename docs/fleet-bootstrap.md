@@ -143,13 +143,14 @@ The bounded image contains one record per bucket known complete, sorted key
 rows, and delete tombstones. The empty bucket universe is a valid complete
 image. Donor generation numbers are deliberately omitted; the guarded local
 install assigns the current recovery generation to fence older async
-LIST/HEAD callbacks. A row carries exact key, size when
-known, origin `Last-Modified`, `ETag`, and storage class. Peer rows deliberately
-become **skeletal**: `Content-Type` and user HEAD metadata are not fabricated;
-HEAD falls through to origin. The donor cannot offer an image while any
-unresolved per-key uncertainty exists. A follower also rejects an image if
-its own unresolved uncertainty would be hidden by the swap; it keeps serving
-such reads from origin until exact HEAD reconciliation or origin rebuild.
+LIST/HEAD callbacks. A row carries exact key, size when known,
+`Last-Modified` as the donor holds it (see Follower handoff), `ETag`, and
+storage class. Peer rows deliberately become **skeletal**: `Content-Type` and
+user HEAD metadata are not fabricated; HEAD falls through to origin. The
+donor cannot offer an image while any unresolved per-key uncertainty exists.
+A follower carries its own unresolved uncertainty across the swap with its
+reconciliation token (see Follower handoff); such reads keep going to the
+origin until exact HEAD reconciliation or origin rebuild.
 Absence and LIST can be served locally only after a complete image, continuous
 native handoff, independent frontier check, and the existing lease/domain
 gate. Direct external S3 mutations still lack a fleet event and remain outside
@@ -217,12 +218,13 @@ B exactly (Groupnet's `align_cuts`). A cut behind or ahead of B in the same
 writer incarnation answers `NativePending`: the follower keeps its private
 stage and Groupnet samples a later barrier, replaying the further suffix,
 until the cuts align or the original transfer deadline expires. A changed
-writer incarnation or an incomparable version aborts the peer candidate and
-keeps origin recovery available. The donor image and suffix through exact B
-are staged privately; B's cuts and membership are sampled in the same journal
-decision, so a delayed B response cannot borrow later cuts. Native events
-already covered by those exact writer cuts are represented by the donor image
-and suffix. Timestamp ties never silently choose arrival order.
+writer incarnation, or a pair of versions coverage cannot order, aborts the
+peer candidate and keeps origin recovery available. The donor image and
+suffix through exact B are staged privately; B's cuts and membership are
+sampled in the same journal decision, so a delayed B response cannot borrow
+later cuts. Native events already covered by those exact writer cuts are
+represented by the donor image and suffix. Timestamp ties never silently
+choose arrival order.
 
 Every node, donor or follower, registers its own feed as a native writer at
 its current position when its apply loop starts. A proxied PUT or DELETE
@@ -231,18 +233,6 @@ it, so the node's own writes reach the index, an open donor journal, and the
 feed in one contiguous order. A donor that keeps writing during a join
 therefore covers its own writes in B like any other writer's, and a follower
 that already applied those feed events aligns with it.
-
-Coverage also compares every local key and tombstone against the staged donor
-image, up to 100,000 local rows. A local origin-validated GET/HEAD repair that
-predates B is accepted only when the donor row has the same ETag,
-Last-Modified, size, and storage class. A donor delete, missing row, or
-incomparable version declines transfer. The guarded install repeats the whole
-check under the write lock that performs the swap, so an effect arriving
-after coverage can only refuse the swap, never be overwritten: a native effect
-answers `NativePending` and keeps the stage, a local repair declines. This
-read-lock walk is priced under concurrent hot reads and mutations; if it
-repeatedly causes fallback or latency regression, the next slice must use
-bounded scoped overlap or reconciliation rather than weaken the check.
 
 Under one current recovery publication permit and the `KeyIndex` write lock,
 the final callback validates schema, exact scope/universe, source membership,
@@ -256,16 +246,130 @@ may open. A gap, cancellation, timeout, or old callback drops the candidate
 and leaves the origin path usable. Body fills use their existing fence and
 recheck recovery generation outside the index lock before a local response.
 
+### Coverage of this node's own effects
+
+Aligned cuts prove that the stage and the live index applied the same native
+effects in the same writer order. Everything else the live index holds came
+from this node alone and is ordered by no writer cut: rows from
+origin-validated GET/HEAD observations, the row or tombstone an exact-token
+HEAD writes when it reconciles an uncertain write, a delete of a key the
+donor never held, and every still-open reconciliation. A follower that
+proxies client traffic while it bootstraps holds such effects from its first
+origin HEAD. Coverage walks every live row and tombstone, up to 100,000,
+against the staged donor state of the same key.
+
+Every origin time enters the index rounded down to whole seconds, through one
+helper (`index::origin_time`): a LIST row's milliseconds, a GET or HEAD's
+HTTP-date, and the reconciling HEAD's `Last-Modified` alike. Whole seconds
+are the one unit every origin path can express, so a version one node saw in
+LIST and another in a HEAD holds the same time on both, and an index-served
+LIST reports the origin's mtime in whole seconds. Rows written through the
+fleet are different. An own PUT, COPY, or multipart write, and a peer's feed
+event, carry the writer's clock, stamped at the feed's microseconds after the
+origin answered, because a PutObject response carries no `Last-Modified`.
+That stamp becomes the row's `Last-Modified` on every node that applies the
+write; it is never rounded, and LIST reports it at the XML's millisecond
+precision. Write stamps and tombstones keep their microseconds because they
+order same-second writes and deletes: rounded, two writes in one second would
+tie, and a recreate in the same second as its delete would lose to its own
+tombstone. Rows decoded from a donor image or suffix are taken exactly as the
+donor holds them, its origin rows already rounded at its own entry.
+
+So one version can reach the two sides under different clocks. A key written
+through the donor after its scan holds the writer's stamp in the donor's row,
+while the follower, which never applied that write's feed event, learns it
+from its own origin HEAD with the origin's mtime. The two times differ by the
+write's latency plus the offset between the writer's and the origin's clocks,
+and even in whole seconds they disagree whenever that interval crosses a
+second boundary. Time therefore cannot decide whether two rows are one
+version. The `ETag`, size, and storage class are the origin's version
+identity and compare exactly: a live row with the candidate's identity is the
+same version whatever clock stamped either time, and the candidate's row is
+installed. That also covers a byte-identical rewrite the donor has not seen;
+readers get the same bytes, size, and class, and only `Last-Modified` reports
+the donor's earlier write, as the donor itself does. A row without an `ETag`
+has no identity beyond its exact time.
+
+Time only orders two different versions of a key, or a row and a delete, and
+only where it can. An origin time never runs ahead of its version's true time
+and runs behind it by less than a second, so two times are ordered wherever
+their whole seconds differ, and a row whose exact time is after a tombstone's
+was written after that delete. Each live effect is then exactly one of:
+
+- **Covered**: the candidate holds the same version, a row or delete of the
+  key in a later whole second, or, for a live tombstone, a tombstone at least
+  as late or a row written after it. The swap installs the candidate's state.
+- **Carried**: the live effect is provably later than everything the
+  candidate holds for the key. The install applies it to the candidate before
+  the swap by the index's own per-key rules, as if the same origin answer
+  arrived just after it: a carried row replaces the older row and keeps the
+  tombstone history; a carried delete raises the tombstone and removes the
+  older row.
+- **Refused**: a live row and the candidate's are different versions within
+  one whole second (`RowMismatch`, naming the first differing field, identity
+  before time), or a row and a delete of the key share a second without the
+  row being exactly after the delete (`TombstoneMismatch`). Neither side is
+  provably later, and timestamp ties never silently choose arrival order.
+
+Open reconciliations cross the swap with their exact tokens and the bucket's
+token epoch. The fenced key stays origin-read, and its bucket's LIST stays
+origin-served, until that key's own HEAD resolves it in the installed index or
+a later definitive mutation supersedes it, as on a node that never
+bootstrapped. No later fence can reuse a carried token.
+
+**No live effect is lost.** A native effect the barrier does not cover
+misaligns the cuts and answers `NativePending`; the stage waits for a later
+barrier. A local effect is covered by an equal-or-later candidate state,
+carried, or refuses, and an uncertain write keeps its fence. So neither a
+write the donor has not covered nor the origin's evidence of one disappears in
+the swap: it is pending, carried, or refused.
+
+**No stale read results.** For every key, the installed state is the same
+version the live index held, or at least as recent in the index's own order
+as both the live index's and the candidate's: covered keys install a
+candidate state no older than the live one, carried keys install the live
+state later than the candidate's, and pairs that cannot be ordered refuse. A
+key whose last mutation outcome is unknown keeps its fence and is never
+served locally before its origin HEAD. The ordinary frontier and lease
+affirmation still decide when local serving opens. The carried result is an
+index a node that never bootstrapped could reach by receiving the same
+effects in another legal order, so it rests on the same origin-versus-write
+clock assumption as every other last-writer-wins decision in the index.
+
+**A safe install stays safe.** The guarded install repeats the whole
+classification under the write lock that performs the swap and carries
+exactly what the live index holds at that instant. An effect arriving after
+the coverage check is covered, carried, or refuses there; a native effect
+answers `NativePending` and keeps the stage. Nothing lands between the check
+and the swap.
+
+A live bucket outside the universe or under an origin rebuild, an incomplete
+or uncertain candidate bucket, and more live rows than the walk bound also
+refuse. Every refusal logs at info with its clause, bucket, and key, such as
+`RowMismatch(LastModified)` and the observed row's key. Before this rule, a
+follower that answered origin HEADs while it joined declined the image: an
+observed row's whole-second time differed from the donor's millisecond LIST
+row of the same version, or from the writer's stamp on a donor row written
+through the fleet, and an open reconciliation declined as live uncertainty.
+The walk runs under the index read lock at coverage and the write lock at
+install; if it causes fallback or latency regression under hot traffic, the
+next slice must bound it rather than weaken the classification.
+
 ## Verification and rollout
 
 Default mode must retain zero Groupnet bootstrap writes and all existing
 origin fallback behavior. The current MinIO cases price connected cold and
 warm rolling joins, an immediate unconverged join, a third join, live writes,
-and an unreachable donor using native gossip and loopback TCP. They count
-actual origin request attempts and require bounded positive progress or
-fallback. The index unit tests cover exact tombstone/repair conflict and
-guarded publication refusal; Groupnet runtime tests cover capture retirement
-and its claim withdrawal. Partition, builder-death takeover, delayed chunk,
-and restart fault schedules remain to be verified before broad fleet claims.
+a follower serving client HEAD, GET, PUT, and DELETE traffic while it joins
+(its HEADs include objects the donor listed and objects written through the
+donor after its scan), one whose uncertain PUT's reconciliation is still open
+at its install, and an unreachable donor using native gossip and loopback
+TCP. They count actual origin request attempts and require bounded positive
+progress or fallback.
+The index unit tests cover each coverage clause, the covered and carried
+cases, and guarded publication refusal; Groupnet runtime tests cover capture
+retirement and its claim withdrawal. Partition, builder-death takeover,
+delayed chunk, and restart fault schedules remain to be verified before broad
+fleet claims.
 No single-builder or latency claim is made until the relevant integration
 tests pass.

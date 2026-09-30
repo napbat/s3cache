@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{
-    Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, head, list, proxy_over,
-    proxy_over_with_metrics, put, request, synthetic_key, wait_for_index, warm_proxy_over,
+    Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, head, list, list_entry,
+    proxy_over, proxy_over_with_metrics, put, put_conditional, request, synthetic_key,
+    wait_for_index, warm_proxy_over,
 };
 use futures::StreamExt;
 use groupnet::consistency::volatile_recovery::{RecoveryConfig, RecoveryStage};
@@ -19,7 +20,7 @@ use s3cache::metrics::Metrics;
 use s3cache::sync::coherence::WriteSync;
 use s3cache::sync::fleet::config::FleetConfig;
 use s3s::S3;
-use s3s::dto::ListObjectsV2Input;
+use s3s::dto::{ETag, ETagCondition, ListObjectsV2Input, Timestamp};
 
 const CAP: usize = 1024 * 1024;
 const READY_DEADLINE: Duration = Duration::from_secs(30);
@@ -976,6 +977,260 @@ async fn live_mutations_overlap_follower_bootstrap() {
         both_current_ready.as_millis(),
         join_started.elapsed().as_millis()
     );
+}
+
+/// Objects seeded before either node starts. The follower's clients read,
+/// rewrite, and delete some of them while it bootstraps.
+const SERVED_OBJECTS: usize = 16;
+
+fn document(n: usize) -> String {
+    format!("doc-{n:03}")
+}
+
+/// Objects written through the donor after its scan, before the follower
+/// starts: the follower never applies their feed events, so it learns them
+/// only from its own origin HEADs.
+const FLEET_WRITTEN: usize = 8;
+
+fn fleet_written(n: usize) -> String {
+    format!("fleet-{n:02}")
+}
+
+/// What a LIST reports for one object: key, size, `ETag`, `Last-Modified`,
+/// and storage class.
+type ListedRow = (
+    String,
+    Option<i64>,
+    Option<String>,
+    Option<Timestamp>,
+    Option<String>,
+);
+
+/// Every object a LIST through `proxy` reports, with each field a client sees.
+async fn listing(proxy: &CachingProxy, bucket: &str) -> Vec<ListedRow> {
+    let out = proxy
+        .list_objects_v2(request(ListObjectsV2Input {
+            bucket: bucket.to_owned(),
+            ..Default::default()
+        }))
+        .await
+        .expect("list succeeds");
+    out.output
+        .contents
+        .into_iter()
+        .flatten()
+        .map(|object| {
+            (
+                object.key.unwrap_or_default(),
+                object.size,
+                object.e_tag.map(ETag::into_value),
+                object.last_modified,
+                object.storage_class.map(|class| class.as_str().to_owned()),
+            )
+        })
+        .collect()
+}
+
+/// Commit a conditional PUT at the origin behind `node`'s back: `MinIO`
+/// applies it, `node` sees an injected 500 and fences the key, and its
+/// reconciling origin HEAD is held until [`Origin::release_paused_head`].
+async fn uncertain_put(
+    origin: &Origin,
+    node: &CachingProxy,
+    bucket: &str,
+    key: &str,
+    body: &'static [u8],
+) {
+    let current = origin
+        .etag(key)
+        .await
+        .expect("the key exists at the origin");
+    origin.fail_next_conditional_put_after_apply();
+    let writer = node.clone();
+    let (bucket_name, key_name) = (bucket.to_owned(), key.to_owned());
+    let write = tokio::spawn(async move {
+        put_conditional(
+            &writer,
+            &bucket_name,
+            &key_name,
+            body,
+            None,
+            Some(ETagCondition::ETag(ETag::Strong(current))),
+        )
+        .await
+    });
+    origin.wait_for_faulted_put_to_apply().await;
+    origin.pause_next_head(key);
+    origin.release_faulted_put();
+    assert!(
+        write.await.expect("the write task joins").is_err(),
+        "the client saw the injected failure"
+    );
+    origin.wait_for_paused_head().await;
+}
+
+/// A follower keeps proxying client traffic while it bootstraps, as a
+/// restarted production pod does: origin HEADs and GETs of existing objects,
+/// including objects written through the donor after its scan, whose donor
+/// rows carry the writer's clock rather than the origin's mtime, and its own
+/// PUTs and DELETEs. With `uncertain`, one conditional PUT also commits at the
+/// origin behind a failed response, and the follower's reconciliation of that
+/// key is still open when it installs. The follower must install the donor's
+/// image without an origin LIST, keep the open reconciliation, and end with
+/// the donor's index.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one client schedule through the joining follower and its final index comparison form one scenario"
+)]
+async fn follower_serves_traffic_while_joining(label: &str, uncertain: bool) {
+    trace_decisions();
+    let origin = Origin::start(label).await;
+    for n in 0..SERVED_OBJECTS {
+        origin
+            .seed(&document(n), format!("document {n}").as_bytes())
+            .await;
+    }
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    let (a_name, b_name) = (format!("{label}-a"), format!("{label}-b"));
+    let ports = [
+        (a_name.as_str(), free_tcp_port()),
+        (b_name.as_str(), free_tcp_port()),
+    ];
+    let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
+    let a_sync = gossip_node(&a_name, a_udp, &[(b_name.as_str(), b_udp)]).await;
+    let a = proxy_over(&client, CAP, Some(Arc::clone(&a_sync)))
+        .with_fleet_config(fleet_config(&origin, &bucket, &a_name, &ports));
+    a.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    a.spawn_background_sync(vec![bucket.clone()]);
+    ready(&a, &bucket).await;
+    for n in 0..FLEET_WRITTEN {
+        put(&a, &bucket, &fleet_written(n), b"written through the donor").await;
+    }
+
+    let b_sync = gossip_node(&b_name, b_udp, &[(a_name.as_str(), a_udp)]).await;
+    let b = proxy_over(&client, CAP, Some(Arc::clone(&b_sync)))
+        .with_fleet_config(fleet_config(&origin, &bucket, &b_name, &ports));
+    mutual_alive(&a_sync, &a_name, &b_sync, &b_name).await;
+    let before_join = Counts::take(&origin);
+    let join_started = Instant::now();
+    b.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    b.spawn_background_sync(vec![bucket.clone()]);
+    // The donor keeps serving writes during the join, as production does:
+    // the follower learns the donor's own feed position only from a write
+    // it applies, and cannot align with the barrier's cut for that writer
+    // before one arrives.
+    put(&a, &bucket, "written-during-join", b"donor traffic").await;
+
+    for n in 0..FLEET_WRITTEN {
+        head(&b, &bucket, &fleet_written(n))
+            .await
+            .expect("origin HEAD of a fleet-written object");
+    }
+    for n in 2..SERVED_OBJECTS {
+        head(&b, &bucket, &document(n))
+            .await
+            .expect("origin HEAD of a seeded object");
+    }
+    for n in 2..6 {
+        assert_eq!(
+            get(&b, &bucket, &document(n)).await,
+            format!("document {n}").as_bytes()
+        );
+    }
+    for n in 0..2 {
+        delete(&b, &bucket, &document(n)).await;
+    }
+    for n in 0..3 {
+        put(&b, &bucket, &format!("new-{n}"), b"new document").await;
+    }
+    put(&b, &bucket, &document(6), b"rewritten document").await;
+    if uncertain {
+        uncertain_put(
+            &origin,
+            &b,
+            &bucket,
+            &document(7),
+            b"committed behind a failure",
+        )
+        .await;
+    }
+    assert!(
+        !serves_locally(&b, &bucket),
+        "the client traffic preceded the follower's install"
+    );
+
+    let join_ready = ready(&b, &bucket).await;
+    let join = Counts::take(&origin).since(before_join);
+    assert_eq!(
+        join.list, 0,
+        "the follower installed the donor image without an origin LIST: {join:?}"
+    );
+    if uncertain {
+        // The open reconciliation crossed the swap: a LIST through the
+        // follower reports the version the origin committed, not the
+        // donor's older row.
+        let committed = origin.etag(&document(7)).await;
+        assert_eq!(
+            list_entry(&b, &bucket, &document(7))
+                .await
+                .and_then(|(_, etag)| etag),
+            committed
+        );
+        origin.release_paused_head();
+        eventually!("the follower reconciles the uncertain key locally", {
+            let before = origin.ops.list();
+            let listed = list_entry(&b, &bucket, &document(7)).await;
+            origin.ops.list() == before && listed.and_then(|(_, etag)| etag) == committed
+        });
+        // The client retries its failed write, which the donor covers.
+        put(&b, &bucket, &document(7), b"committed behind a failure").await;
+    }
+
+    let before_compare = origin.ops.list();
+    let donor = listing(&a, &bucket).await;
+    let follower = listing(&b, &bucket).await;
+    assert_eq!(
+        origin.ops.list(),
+        before_compare,
+        "both nodes list from their own index"
+    );
+    assert_eq!(follower, donor, "the follower's index is the donor's");
+    let stored = origin
+        .client()
+        .list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("direct origin LIST");
+    let stored = stored
+        .contents()
+        .iter()
+        .filter_map(|object| object.key().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        follower.into_iter().map(|row| row.0).collect::<Vec<_>>(),
+        stored,
+        "the index holds exactly the origin's keys"
+    );
+    println!(
+        "fleet_bootstrap serving_join uncertain={uncertain} {join:?} index_ready_ms={} elapsed_ms={}",
+        join_ready.as_millis(),
+        join_started.elapsed().as_millis()
+    );
+}
+
+/// The follower's origin HEADs must be covered by the donor's rows of the
+/// same versions: seeded objects the donor listed, and objects written
+/// through the donor, whose rows hold the writer's clock.
+#[tokio::test(flavor = "multi_thread")]
+async fn follower_serving_traffic_installs_the_donor_image() {
+    follower_serves_traffic_while_joining("fleet-serving", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn follower_keeps_an_open_reconciliation_across_the_install() {
+    follower_serves_traffic_while_joining("fleet-uncertain", true).await;
 }
 
 /// Flat keys with one serial LIST chain: the scan is exactly `ceil(rows / 1000)`

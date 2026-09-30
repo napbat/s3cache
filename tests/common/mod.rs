@@ -295,6 +295,9 @@ struct Interference {
     list_fault: AtomicBool,
     list_delay_ms: AtomicU64,
     get_pause: ResponsePause,
+    head_pause: ResponsePause,
+    /// The only key whose HEAD the armed `head_pause` holds.
+    head_pause_key: Mutex<String>,
     /// Rows of the synthetic listing that answers bucket LISTs; zero forwards
     /// them to `MinIO`.
     synthetic_rows: AtomicUsize,
@@ -399,6 +402,23 @@ impl Origin {
     /// Let the held object GET response reach the cache.
     pub fn release_paused_get(&self) {
         self.interference.get_pause.release();
+    }
+
+    /// Hold the next origin HEAD response for `key` after `MinIO` returns it.
+    /// HEADs of every other key pass.
+    pub fn pause_next_head(&self, key: &str) {
+        key.clone_into(&mut self.interference.head_pause_key.lock().unwrap());
+        self.interference.head_pause.arm();
+    }
+
+    /// Wait until the armed HEAD's response is held before it reaches the cache.
+    pub async fn wait_for_paused_head(&self) {
+        self.interference.head_pause.wait_held().await;
+    }
+
+    /// Let the held HEAD response reach the cache.
+    pub fn release_paused_head(&self) {
+        self.interference.head_pause.release();
     }
 
     /// This test's bucket.
@@ -606,6 +626,8 @@ async fn forward(
         list_fault,
         list_delay_ms,
         get_pause,
+        head_pause,
+        head_pause_key,
         synthetic_rows,
     } = interference;
     let faulted = put_fault.claim(&req);
@@ -613,6 +635,11 @@ async fn forward(
     let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
     let held_list = req.method() == Method::GET && !on_key && list_pause.claim();
     let held_get = req.method() == Method::GET && on_key && get_pause.claim();
+    let held_head = req.method() == Method::HEAD
+        && path
+            .split_once('/')
+            .is_some_and(|(_, key)| percent_decoded(key) == *head_pause_key.lock().unwrap())
+        && head_pause.claim();
     if req.method() == Method::GET && !on_key && list_fault.load(Ordering::SeqCst) {
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -659,6 +686,9 @@ async fn forward(
             }
             if held_get {
                 get_pause.hold().await;
+            }
+            if held_head {
+                head_pause.hold().await;
             }
             resp.map(|body| body.map_err(std::io::Error::other).boxed())
         }
