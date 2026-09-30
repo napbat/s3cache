@@ -65,6 +65,11 @@ impl PendingFleetCapture {
             .with_journal(|journal| journal.image_members() == observed)
     }
 
+    /// The image's size, measured at C.
+    pub(crate) fn size(&self) -> ImageSize {
+        self.size
+    }
+
     /// Encode away from the live publication lock into exactly the size
     /// measured at C, retaining both image permits.
     pub(crate) fn encode(

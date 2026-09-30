@@ -44,9 +44,10 @@ use s3s::dto::{
     HeadObjectOutput, ListObjectsV2Input, PutObjectInput, Range, StreamingBlob,
 };
 use s3s::{S3, S3Request, S3Result};
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -228,11 +229,7 @@ pub struct Origin {
     counted_endpoint: String,
     bucket: String,
     pub ops: Arc<Ops>,
-    put_fault: Arc<AppliedPutFault>,
-    list_pause: Arc<ResponsePause>,
-    list_fault: Arc<AtomicBool>,
-    list_delay_ms: Arc<AtomicU64>,
-    get_pause: Arc<ResponsePause>,
+    interference: Arc<Interference>,
 }
 
 /// One-shot fault injection for a conditional PUT: let `MinIO` apply it, then hold and
@@ -289,6 +286,20 @@ impl AppliedPutFault {
     }
 }
 
+/// Everything the forwarder does besides forwarding: injected faults, delays,
+/// and the optional synthetic listing.
+#[derive(Default)]
+struct Interference {
+    put_fault: AppliedPutFault,
+    list_pause: ResponsePause,
+    list_fault: AtomicBool,
+    list_delay_ms: AtomicU64,
+    get_pause: ResponsePause,
+    /// Rows of the synthetic listing that answers bucket LISTs; zero forwards
+    /// them to `MinIO`.
+    synthetic_rows: AtomicUsize,
+}
+
 impl Origin {
     /// Start `MinIO`, create this test's bucket, and put a request counter in front.
     /// `bucket` is the test's own name so parallel tests never share state.
@@ -321,77 +332,73 @@ impl Origin {
             .expect("create the test bucket");
 
         let ops = Arc::new(Ops::default());
-        let put_fault = Arc::new(AppliedPutFault::default());
-        let list_pause = Arc::new(ResponsePause::default());
-        let list_fault = Arc::new(AtomicBool::new(false));
-        let list_delay_ms = Arc::new(AtomicU64::new(0));
-        let get_pause = Arc::new(ResponsePause::default());
-        let counted = counting_proxy(
-            minio,
-            Arc::clone(&ops),
-            Arc::clone(&put_fault),
-            Arc::clone(&list_pause),
-            Arc::clone(&list_fault),
-            Arc::clone(&list_delay_ms),
-            Arc::clone(&get_pause),
-        )
-        .await;
+        let interference = Arc::new(Interference::default());
+        let counted = counting_proxy(minio, Arc::clone(&ops), Arc::clone(&interference)).await;
         Arc::new(Self {
             _container: container,
             direct,
             counted_endpoint: format!("http://{counted}"),
             bucket: bucket.to_owned(),
             ops,
-            put_fault,
-            list_pause,
-            list_fault,
-            list_delay_ms,
-            get_pause,
+            interference,
         })
     }
 
     /// Hold the next origin LIST response. Arm this before starting index sync.
     pub fn pause_next_list(&self) {
-        self.list_pause.arm();
+        self.interference.list_pause.arm();
     }
 
     /// Wait until the held LIST has reached the origin and its response is blocked.
     pub async fn wait_for_paused_list(&self) {
-        self.list_pause.wait_held().await;
+        self.interference.list_pause.wait_held().await;
     }
 
     /// Let the held LIST response reach the index scanner.
     pub fn release_paused_list(&self) {
-        self.list_pause.release();
+        self.interference.list_pause.release();
     }
 
     /// Make every counted LIST fail until cleared, including recovery retries.
     pub fn fail_lists(&self, enabled: bool) {
-        self.list_fault.store(enabled, Ordering::SeqCst);
+        self.interference
+            .list_fault
+            .store(enabled, Ordering::SeqCst);
     }
 
     /// Delay every counted LIST by `delay` before it reaches `MinIO`, making an
     /// origin scan as slow as a large production bucket's.
     pub fn delay_lists(&self, delay: std::time::Duration) {
-        self.list_delay_ms.store(
+        self.interference.list_delay_ms.store(
             u64::try_from(delay.as_millis()).expect("test LIST delay fits"),
             Ordering::SeqCst,
         );
     }
 
+    /// Answer every bucket LIST from a synthetic listing of `rows` keys
+    /// ([`synthetic_key`]) instead of `MinIO`, still counted. It stands in for a
+    /// production-sized bucket whose objects would take far too long to PUT
+    /// one at a time. Only LIST sees these rows: their bodies do not exist,
+    /// so a test must never GET or HEAD them.
+    pub fn serve_synthetic_listing(&self, rows: usize) {
+        self.interference
+            .synthetic_rows
+            .store(rows, Ordering::SeqCst);
+    }
+
     /// Hold the next origin object GET response after `MinIO` returns it.
     pub fn pause_next_get(&self) {
-        self.get_pause.arm();
+        self.interference.get_pause.arm();
     }
 
     /// Wait until an object GET response is held before it reaches the cache.
     pub async fn wait_for_paused_get(&self) {
-        self.get_pause.wait_held().await;
+        self.interference.get_pause.wait_held().await;
     }
 
     /// Let the held object GET response reach the cache.
     pub fn release_paused_get(&self) {
-        self.get_pause.release();
+        self.interference.get_pause.release();
     }
 
     /// This test's bucket.
@@ -512,18 +519,18 @@ impl Origin {
 
     /// Arm the next `If-Match` PUT to commit at `MinIO` while its response is withheld.
     pub fn fail_next_conditional_put_after_apply(&self) {
-        self.put_fault.arm();
+        self.interference.put_fault.arm();
     }
 
     /// Wait until the armed PUT has received a successful response from `MinIO`, proving
     /// that cancellation now occurs after the mutation reached durable origin state.
     pub async fn wait_for_faulted_put_to_apply(&self) {
-        self.put_fault.wait_applied().await;
+        self.interference.put_fault.wait_applied().await;
     }
 
     /// Release the withheld response as an injected upstream 500.
     pub fn release_faulted_put(&self) {
-        self.put_fault.release();
+        self.interference.put_fault.release();
     }
 }
 
@@ -536,11 +543,7 @@ impl Origin {
 async fn counting_proxy(
     upstream: SocketAddr,
     ops: Arc<Ops>,
-    put_fault: Arc<AppliedPutFault>,
-    list_pause: Arc<ResponsePause>,
-    list_fault: Arc<AtomicBool>,
-    list_delay_ms: Arc<AtomicU64>,
-    get_pause: Arc<ResponsePause>,
+    interference: Arc<Interference>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -553,35 +556,18 @@ async fn counting_proxy(
                 continue;
             };
             let ops = Arc::clone(&ops);
-            let put_fault = Arc::clone(&put_fault);
-            let list_pause = Arc::clone(&list_pause);
-            let list_fault = Arc::clone(&list_fault);
-            let list_delay_ms = Arc::clone(&list_delay_ms);
-            let get_pause = Arc::clone(&get_pause);
+            let interference = Arc::clone(&interference);
             let conn = http
                 .serve_connection(
                     TokioIo::new(socket),
                     service_fn(move |req: Request<Incoming>| {
                         let ops = Arc::clone(&ops);
-                        let put_fault = Arc::clone(&put_fault);
-                        let list_pause = Arc::clone(&list_pause);
-                        let list_fault = Arc::clone(&list_fault);
-                        let list_delay_ms = Arc::clone(&list_delay_ms);
-                        let get_pause = Arc::clone(&get_pause);
+                        let interference = Arc::clone(&interference);
                         async move {
                             ops.record(req.method(), req.uri(), req.headers());
                             let method = req.method().clone();
                             let uri = req.uri().clone();
-                            let response = forward(
-                                upstream,
-                                req,
-                                &put_fault,
-                                &list_pause,
-                                &list_fault,
-                                &list_delay_ms,
-                                &get_pause,
-                            )
-                            .await;
+                            let response = forward(upstream, req, &interference).await;
                             ops.record_success(&method, &uri, response.status());
                             Ok::<_, std::convert::Infallible>(response)
                         }
@@ -612,12 +598,16 @@ const HOP_BY_HOP: [&str; 7] = [
 async fn forward(
     upstream: SocketAddr,
     req: Request<Incoming>,
-    put_fault: &AppliedPutFault,
-    list_pause: &ResponsePause,
-    list_fault: &AtomicBool,
-    list_delay_ms: &AtomicU64,
-    get_pause: &ResponsePause,
+    interference: &Interference,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
+    let Interference {
+        put_fault,
+        list_pause,
+        list_fault,
+        list_delay_ms,
+        get_pause,
+        synthetic_rows,
+    } = interference;
     let faulted = put_fault.claim(&req);
     let path = req.uri().path().trim_start_matches('/');
     let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
@@ -639,6 +629,13 @@ async fn forward(
     let list_delay = list_delay_ms.load(Ordering::SeqCst);
     if req.method() == Method::GET && !on_key && list_delay > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(list_delay)).await;
+    }
+    let synthetic = synthetic_rows.load(Ordering::SeqCst);
+    if req.method() == Method::GET && !on_key && synthetic > 0 {
+        let query = req.uri().query().unwrap_or_default();
+        if query.split('&').any(|pair| pair == "list-type=2") {
+            return synthetic_list(path, query, synthetic);
+        }
     }
     match relay(upstream, req).await {
         Ok(resp) if faulted && resp.status().is_success() => {
@@ -674,6 +671,136 @@ async fn forward(
             )
             .expect("a 502 is well-formed"),
     }
+}
+
+/// Key `n` of a synthetic listing. Fixed width, so lexicographic order is
+/// numeric order, and as long as a production document key, so a synthetic
+/// row encodes to about the measured production image row.
+#[must_use]
+pub fn synthetic_key(n: usize) -> String {
+    format!("tenants/acme/documents/{n:08}/{:032x}.json", mix(n, 1))
+}
+
+/// The `ETag` a synthetic listing reports for key `n`, quoted as on the wire.
+#[must_use]
+pub fn synthetic_etag(n: usize) -> String {
+    format!("\"{:032x}\"", mix(n, 2))
+}
+
+fn synthetic_size(n: usize) -> u64 {
+    1_024 + u64::try_from(n % 65_536).expect("small size")
+}
+
+/// A fixed 128-bit mix of `n`: realistic, uncorrelated hex for keys and tags.
+fn mix(n: usize, lane: u64) -> u128 {
+    let mut z = u64::try_from(n).expect("row fits u64") ^ lane.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut next = || {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    };
+    (u128::from(next()) << 64) | u128::from(next())
+}
+
+fn percent_decoded(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).expect("ASCII escape");
+            out.push(u8::from_str_radix(hex, 16).expect("percent escape"));
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).expect("UTF-8 query value")
+}
+
+/// One `ListObjectsV2` page of the synthetic listing. The continuation token is
+/// the next row's number; `start-after` finds its row by binary search.
+/// Prefix and delimiter listings are not modelled and fail loudly.
+fn synthetic_list(
+    bucket: &str,
+    query: &str,
+    rows: usize,
+) -> Response<BoxBody<Bytes, std::io::Error>> {
+    let mut from = 0;
+    let mut max_keys = 1_000;
+    let mut token = None;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match name {
+            "max-keys" => max_keys = value.parse::<usize>().expect("max-keys").clamp(1, 1_000),
+            "continuation-token" => {
+                from = value.parse().expect("a synthetic continuation token");
+                token = Some(value.to_owned());
+            }
+            "start-after" => {
+                let after = percent_decoded(value);
+                let (mut low, mut high) = (0, rows);
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    if synthetic_key(mid) <= after {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+                from = low;
+            }
+            "prefix" | "delimiter" if !value.is_empty() => {
+                return Response::builder()
+                    .status(StatusCode::NOT_IMPLEMENTED)
+                    .body(
+                        Full::new(Bytes::from_static(b"synthetic listing: no prefix scans"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .expect("a 501 is well-formed");
+            }
+            _ => {}
+        }
+    }
+    let end = from.saturating_add(max_keys).min(rows);
+    let truncated = end < rows;
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult \
+         xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{bucket}</Name><Prefix></Prefix>\
+         <KeyCount>{}</KeyCount><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
+        end.saturating_sub(from),
+    );
+    if let Some(token) = token {
+        write!(xml, "<ContinuationToken>{token}</ContinuationToken>").expect("to a String");
+    }
+    if truncated {
+        write!(xml, "<NextContinuationToken>{end}</NextContinuationToken>").expect("to a String");
+    }
+    for n in from..end {
+        write!(
+            xml,
+            "<Contents><Key>{}</Key><LastModified>2026-09-30T00:00:00.000Z</LastModified>\
+             <ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            synthetic_key(n),
+            synthetic_etag(n).replace('"', "&quot;"),
+            synthetic_size(n),
+        )
+        .expect("to a String");
+    }
+    xml.push_str("</ListBucketResult>");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(
+            Full::new(Bytes::from(xml))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("a synthetic LIST page is well-formed")
 }
 
 async fn relay(

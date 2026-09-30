@@ -71,14 +71,28 @@ impl FleetStatePort {
                     || encoded_bytes > capture::IMAGE_CAPS.bytes
                     || decoded_bytes > capture::IMAGE_CAPS.decoded_bytes
                 {
+                    tracing::debug!(
+                        encoded_bytes,
+                        decoded_bytes,
+                        "fleet peer image declined: over the image codec ceilings"
+                    );
                     return Err(AdapterError);
                 }
-                let encoded = admission
+                let reserved = admission
                     .reserve(AdmissionClass::Encoded, encoded_bytes)
-                    .map_err(|_| AdapterError)?;
-                let decoded = admission
-                    .reserve(AdmissionClass::Decoded, decoded_bytes)
-                    .map_err(|_| AdapterError)?;
+                    .and_then(|encoded| {
+                        admission
+                            .reserve(AdmissionClass::Decoded, decoded_bytes)
+                            .map(|decoded| (encoded, decoded))
+                    });
+                let Ok((encoded, decoded)) = reserved else {
+                    tracing::debug!(
+                        encoded_bytes,
+                        decoded_bytes,
+                        "fleet peer image declined: memory admission"
+                    );
+                    return Err(AdapterError);
+                };
                 let stage = FleetStage::new(
                     encoded_bytes,
                     chunks,
@@ -106,7 +120,11 @@ impl FleetStatePort {
                     Ok::<_, AdapterError>(stage)
                 })
                 .await
-                .map_err(|_| AdapterError)??;
+                .map_err(|_| AdapterError)
+                .flatten()
+                .inspect_err(|_| {
+                    tracing::debug!("fleet peer image declined: commitment or decode failed");
+                })?;
                 resources.stage = Some(verified);
                 Ok(Some(
                     Self::event_charge(admission, false)?
@@ -141,7 +159,10 @@ impl FleetStatePort {
                                 .hold(TransferEvent::NativePending { op }),
                         ));
                     }
-                    Err(InstallRefusal::Incompatible) => return Err(AdapterError),
+                    Err(InstallRefusal::Incompatible) => {
+                        tracing::debug!("fleet peer image declined: live index incompatible");
+                        return Err(AdapterError);
+                    }
                 }
                 let charge = Self::event_charge(admission, true)?;
                 let coverage = NativeCoverageReceipt {
@@ -200,7 +221,18 @@ impl FleetStatePort {
                 match installed {
                     // The image moved into the live index; release the
                     // emptied stage and its private memory permits.
-                    Ok(()) => drop(resources.stage.take()),
+                    Ok(()) => {
+                        if let Some(mut emptied) = resources.stage.take() {
+                            let stage = emptied.stage_mut();
+                            let (rows, encoded_bytes) = stage.image();
+                            tracing::info!(
+                                rows,
+                                encoded_bytes,
+                                transfer_ms = stage.elapsed().as_millis(),
+                                "fleet peer image installed"
+                            );
+                        }
+                    }
                     // A live effect landed after the coverage check. Keep the
                     // stage; Groupnet samples a later barrier.
                     Err(InstallRefusal::Pending) => {
@@ -209,7 +241,10 @@ impl FleetStatePort {
                                 .hold(TransferEvent::NativePending { op }),
                         ));
                     }
-                    Err(InstallRefusal::Incompatible) => return Err(AdapterError),
+                    Err(InstallRefusal::Incompatible) => {
+                        tracing::debug!("fleet peer image declined: live index incompatible");
+                        return Err(AdapterError);
+                    }
                 }
                 let handoff = NativeHandoffReceipt {
                     recovery: permit.operation(),

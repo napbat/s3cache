@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{
     Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, head, list, proxy_over,
-    proxy_over_with_metrics, put, wait_for_index, warm_proxy_over,
+    proxy_over_with_metrics, put, request, synthetic_key, wait_for_index, warm_proxy_over,
 };
 use futures::StreamExt;
 use groupnet::consistency::volatile_recovery::{RecoveryConfig, RecoveryStage};
@@ -18,6 +18,8 @@ use s3cache::index::ScanConfig;
 use s3cache::metrics::Metrics;
 use s3cache::sync::coherence::WriteSync;
 use s3cache::sync::fleet::config::FleetConfig;
+use s3s::S3;
+use s3s::dto::ListObjectsV2Input;
 
 const CAP: usize = 1024 * 1024;
 const READY_DEADLINE: Duration = Duration::from_secs(30);
@@ -1104,37 +1106,92 @@ async fn concurrent_start_follower_waits_for_a_slow_builder_and_lists_once() {
     assert!(origin.ops.writes().is_empty(), "no origin control writes");
 }
 
-/// 100,000 rows were the old image cap. A donor over it offers its whole
-/// measured image, and a joining node installs it without listing the origin.
-const LARGE_ROWS: usize = 100_000 + 1_234;
+/// The production index has about 798,000 rows, eight times the old 100,000-row
+/// image cap. `MinIO` cannot be seeded with that many objects in test time, so
+/// the counting forwarder answers the donor's LIST pages from a synthetic
+/// listing of production-shaped rows. Everything after those pages is the
+/// production path: the donor's measured capture at C, the bulk transfer, and
+/// the joiner's guarded install.
+const PRODUCTION_ROWS: usize = 800_000;
+const PRODUCTION_READY_DEADLINE: Duration = Duration::from_secs(300);
 
+/// One page of `bucket` after `start_after`, as `(key, unquoted ETag, size)`,
+/// through the joiner.
+async fn local_page(
+    proxy: &CachingProxy,
+    bucket: &str,
+    start_after: &str,
+) -> Vec<(String, String, i64)> {
+    proxy
+        .list_objects_v2(request(ListObjectsV2Input {
+            bucket: bucket.to_owned(),
+            start_after: Some(start_after.to_owned()),
+            max_keys: Some(1_000),
+            ..Default::default()
+        }))
+        .await
+        .expect("local LIST page")
+        .output
+        .contents
+        .into_iter()
+        .flatten()
+        .map(|object| {
+            (
+                object.key.expect("listed key"),
+                object.e_tag.expect("listed ETag").into_value(),
+                object.size.expect("listed size"),
+            )
+        })
+        .collect()
+}
+
+/// A joiner installs a production-sized donor image without listing the
+/// origin, then answers a page from deep in the keyspace exactly as one
+/// bounded origin LIST does. `RUST_LOG` overrides the fleet's info logs,
+/// which record the image's encoded bytes and the transfer time.
 #[tokio::test]
-async fn peer_bootstrap_transfers_an_index_above_the_old_row_cap() {
-    let origin = Origin::start("fleet-large-index").await;
-    seed_rows(&origin, LARGE_ROWS).await;
+async fn peer_bootstrap_transfers_a_production_scale_index() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "s3cache::sync::volatile::fleet=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+    let origin = Origin::start("fleet-production-index").await;
+    origin.serve_synthetic_listing(PRODUCTION_ROWS);
     let bucket = origin.bucket().to_owned();
     let client = origin.counted_client();
     let ports = [
-        ("fleet-large-a", free_tcp_port()),
-        ("fleet-large-b", free_tcp_port()),
+        ("fleet-scale-a", free_tcp_port()),
+        ("fleet-scale-b", free_tcp_port()),
     ];
     let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
-    let a_sync = gossip_node("fleet-large-a", a_udp, &[("fleet-large-b", b_udp)]).await;
+    let a_sync = gossip_node("fleet-scale-a", a_udp, &[("fleet-scale-b", b_udp)]).await;
     let a_metrics = Arc::new(Metrics::default());
     let a = proxy_over_with_metrics(&client, CAP, Some(Arc::clone(&a_sync)), &a_metrics)
-        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-large-a", &ports));
+        .with_index_scan(SERIAL_SCAN)
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-scale-a", &ports));
+    let before_scan = Counts::take(&origin);
     a.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
-    ready_by(&a, &bucket, Instant::now() + SLOW_READY_DEADLINE).await;
-    assert_eq!(indexed_rows(&a_metrics), LARGE_ROWS as u64);
+    let scan = ready_by(&a, &bucket, Instant::now() + PRODUCTION_READY_DEADLINE).await;
+    let scan_cost = Counts::take(&origin).since(before_scan);
+    assert_eq!(indexed_rows(&a_metrics), PRODUCTION_ROWS as u64);
+    assert_eq!(
+        scan_cost.list,
+        PRODUCTION_ROWS.div_ceil(1000) as u64,
+        "the donor scanned the origin once: {scan_cost:?}"
+    );
 
     let before_join = Counts::take(&origin);
-    let b_sync = gossip_node("fleet-large-b", b_udp, &[("fleet-large-a", a_udp)]).await;
+    let b_sync = gossip_node("fleet-scale-b", b_udp, &[("fleet-scale-a", a_udp)]).await;
     let b_metrics = Arc::new(Metrics::default());
     let b = proxy_over_with_metrics(&client, CAP, Some(Arc::clone(&b_sync)), &b_metrics)
-        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-large-b", &ports));
-    mutual_alive(&a_sync, "fleet-large-a", &b_sync, "fleet-large-b").await;
+        .with_index_scan(SERIAL_SCAN)
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-scale-b", &ports));
+    mutual_alive(&a_sync, "fleet-scale-a", &b_sync, "fleet-scale-b").await;
     b.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
-    let join_ready = ready_by(&b, &bucket, Instant::now() + SLOW_READY_DEADLINE).await;
+    let join = ready_by(&b, &bucket, Instant::now() + PRODUCTION_READY_DEADLINE).await;
     let join_cost = Counts::take(&origin).since(before_join);
     assert_eq!(
         join_cost.list, 0,
@@ -1143,8 +1200,43 @@ async fn peer_bootstrap_transfers_an_index_above_the_old_row_cap() {
     assert_eq!(counter(&b_metrics, "recovery_origin_scans"), 0);
     assert_eq!(indexed_rows(&b_metrics), indexed_rows(&a_metrics));
     join_cost.assert_no_writes();
+
+    // One bounded origin check: the joiner answers a page from the middle of
+    // the keyspace locally, and one origin LIST of that page agrees with it.
+    let after = synthetic_key(PRODUCTION_ROWS / 2 + 7);
+    let before_check = Counts::take(&origin);
+    let local = local_page(&b, &bucket, &after).await;
+    assert_eq!(Counts::take(&origin).since(before_check).list, 0);
+    let listed = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .start_after(&after)
+        .max_keys(1_000)
+        .send()
+        .await
+        .expect("one origin LIST page");
+    assert_eq!(Counts::take(&origin).since(before_check).list, 1);
+    let from_origin: Vec<_> = listed
+        .contents()
+        .iter()
+        .map(|object| {
+            (
+                object.key().expect("origin key").to_owned(),
+                object
+                    .e_tag()
+                    .expect("origin ETag")
+                    .trim_matches('"')
+                    .to_owned(),
+                object.size().expect("origin size"),
+            )
+        })
+        .collect();
+    assert_eq!(local.len(), 1_000);
+    assert_eq!(local, from_origin);
     println!(
-        "fleet_bootstrap large_join={join_cost:?} rows={LARGE_ROWS} index_ready_ms={}",
-        join_ready.as_millis()
+        "fleet_bootstrap production_join rows={PRODUCTION_ROWS} donor_scan_ms={} \
+         join_ready_ms={} scan={scan_cost:?} join={join_cost:?}",
+        scan.as_millis(),
+        join.as_millis()
     );
 }

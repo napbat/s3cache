@@ -1,6 +1,7 @@
 //! Charged private image and suffix replay before the guarded live swap.
 
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 use groupnet::core::volatile_bootstrap::journal::{JournalBatch, JournalCursor, NativeCut};
 
@@ -21,6 +22,7 @@ pub(crate) struct FleetStage {
     rows: usize,
     through: JournalCursor,
     max_event_bytes: usize,
+    reserved_at: Instant,
 }
 
 impl FleetStage {
@@ -59,6 +61,7 @@ impl FleetStage {
             rows: 0,
             through: cut,
             max_event_bytes,
+            reserved_at: Instant::now(),
         })
     }
 
@@ -181,6 +184,16 @@ impl FleetStage {
     /// Exact donor-local cut reached by this private stage.
     pub(crate) fn through(&self) -> &JournalCursor {
         &self.through
+    }
+
+    /// Rows of the verified image, and its encoded bytes.
+    pub(crate) fn image(&self) -> (usize, usize) {
+        (self.rows, self.expected_bytes)
+    }
+
+    /// Time since this stage was reserved: the transfer so far.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.reserved_at.elapsed()
     }
 
     /// Pre-check that the live index sits exactly at the barrier `cuts` with

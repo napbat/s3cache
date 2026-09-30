@@ -184,6 +184,7 @@ impl FleetStatePort {
             tracing::debug!("fleet Ready recapture declined: source roster changed");
             return Err(AdapterError);
         }
+        let started = Instant::now();
         let id = capture::next_id(
             self.scope.clone(),
             request.selected.clone(),
@@ -208,15 +209,24 @@ impl FleetStatePort {
                     request.wake,
                 )
             })
-            .ok_or(AdapterError)??;
+            .ok_or(AdapterError)
+            .flatten()
+            .inspect_err(|_| {
+                tracing::debug!(
+                    "fleet Ready recapture declined at C: stale guard, local reads \
+                     closed, or the measured image is over a ceiling or admission"
+                );
+            })?;
+        let size = pending.size();
         let pending = capture::encode(pending, self.universe.clone()).await?;
         if !self
             .source_matches_pending(request.operation, &pending, admission, request.deadline)
             .await
         {
+            tracing::debug!("fleet Ready recapture declined: roster changed while encoding");
             return Err(AdapterError);
         }
-        request
+        let captured = request
             .guard
             .capture(|generation| {
                 if generation != request.recovery_generation
@@ -227,7 +237,19 @@ impl FleetStatePort {
                 }
                 capture::finish(pending)
             })
-            .ok_or(AdapterError)?
+            .ok_or(AdapterError)
+            .flatten();
+        match &captured {
+            Ok(_) => tracing::info!(
+                rows = size.rows,
+                encoded_bytes = size.encoded_bytes,
+                decoded_charge = size.decoded_bytes,
+                capture_ms = started.elapsed().as_millis(),
+                "fleet donor image captured"
+            ),
+            Err(_) => tracing::debug!("fleet Ready recapture declined at its guarded finish"),
+        }
+        captured
     }
 }
 
