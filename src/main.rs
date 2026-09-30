@@ -14,9 +14,7 @@ use s3cache::{cache, metrics, sync, tier};
 use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use tokio::net::TcpListener;
-use tracing::info;
-#[cfg(feature = "fleet")]
-use tracing::warn;
+use tracing::{info, warn};
 
 const RECOVERY_REARM_INITIAL_MS: u64 = 5_000;
 const RECOVERY_REARM_MAX_MS: u64 = 60_000;
@@ -36,9 +34,8 @@ fn configure_recovery_rearm(
         .expect("fixed automatic recovery rearm policy is valid")
 }
 
-/// Start gossip coherence, with fleet index bootstrap when it is both built and
-/// configured; otherwise the guarded origin recovery path.
-#[cfg(feature = "fleet")]
+/// Start gossip coherence with peer index bootstrap when the deployment supplies
+/// its peer book; otherwise the guarded origin recovery path.
 async fn start_coherence(
     cp: cache::proxy::CachingProxy,
     cfg: &Config,
@@ -73,21 +70,6 @@ async fn start_coherence(
             cp
         }
     }
-}
-
-/// Start gossip coherence on the guarded origin recovery path.
-#[cfg(not(feature = "fleet"))]
-#[expect(
-    clippy::unused_async,
-    reason = "one call shape with the fleet build, whose startup awaits the bulk listener"
-)]
-async fn start_coherence(
-    cp: cache::proxy::CachingProxy,
-    cfg: &Config,
-    _region: &str,
-) -> cache::proxy::CachingProxy {
-    cp.start_coherence(&cfg.buckets);
-    cp
 }
 
 /// Optional Prometheus text endpoint on its own port, so the counters can be graphed

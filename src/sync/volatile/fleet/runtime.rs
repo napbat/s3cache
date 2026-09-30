@@ -1,4 +1,4 @@
-//! One opt-in TCP listener and claim/transfer child of the recovery worker.
+//! One TCP listener and claim/transfer child of the recovery worker.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

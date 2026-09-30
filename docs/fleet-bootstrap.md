@@ -1,17 +1,18 @@
-# Optional peer bootstrap for the whole LIST index
+# Peer bootstrap for the whole LIST index
 
-Status: **opt-in adapter wired; cost and fault acceptance pending**. The standard
-container image compiles fleet support, while the Helm `fleet.enabled` value
-and direct-process fleet environment variables remain off by default. The existing
-Groupnet volatile recovery driver remains the only recovery scheduler. Fleet
-mode is explicit opt-in; the default makes no coordination or metadata writes
-to S3. Fleet mode uses Groupnet TTL entries and bounded bulk streams. Neither
-mode writes control objects into the origin bucket.
+Status: **on by default wherever an index exists**. Every build includes peer
+bootstrap, and the Helm chart wires it whenever `upstream.buckets` is set: a
+joining pod copies a ready peer's verified index instead of listing the origin.
+A process started without the `S3CACHE_FLEET_*` peer book (a bare local run, or
+a deployment with no configured buckets) keeps the guarded origin recovery path.
+The existing Groupnet volatile recovery driver remains the only recovery
+scheduler. Peer bootstrap uses Groupnet TTL entries and bounded bulk streams;
+neither path writes control or metadata objects into the origin bucket.
 
 ## First measurable cost slice
 
 The first production target is one explicitly configured bucket universe and
-two connected, fleet-enabled nodes starting cold against the same origin. Each
+two connected nodes starting cold against the same origin. Each
 node starts the existing lease and feed tasks. Groupnet's one recovery worker
 selects one provisional origin builder; it performs the **only** initial
 guarded full LIST scan in the healthy schedule. The other node remains
@@ -44,7 +45,7 @@ actual origin GET counters. Partition and donor-failure cases must reach
 either a verified peer baseline or bounded origin fallback, never merely
 remain safely closed. No fleet-wide savings claim precedes these tests.
 
-The opt-in worker waits up to three seconds in its existing claim settle
+The bootstrap worker waits up to three seconds in its existing claim settle
 phase before the first donor observation, within the original finite recovery
 episode. This setting is provisional until the paired workload measures its
 LIST savings and index-startup delay. Requests continue through origin during
@@ -84,8 +85,8 @@ timeouts in the existing worker.
 
 ## Production data plane
 
-Fleet mode separately binds Groupnet's `TcpBulkTransport`; UDP gossip remains
-the ordinary control plane. Its opt-in `S3CACHE_FLEET_BIND` listens on a TCP
+Peer bootstrap separately binds Groupnet's `TcpBulkTransport`; UDP gossip remains
+the ordinary control plane. `S3CACHE_FLEET_BIND` listens on a TCP
 port, `S3CACHE_FLEET_ADVERTISE` names the address peers dial, and
 `S3CACHE_FLEET_PEERS` supplies a complete bounded `NodeId=host:port` book.
 `S3CACHE_FLEET_ORIGIN_ID` (Helm `fleet.originId`) is a nonsecret,
@@ -114,7 +115,7 @@ native TTL bounds stale advertisement while listener admission closes. A
 failed accept loop immediately retires its current donor capture and wakes
 the worker to withdraw the exact Ready claim; it does not revoke a healthy
 local read gate. No TCP socket, listener task,
-peer registry, or extra S3 metadata write exists with fleet mode disabled.
+peer registry, or extra S3 metadata write exists without a peer book.
 
 ## Scope and image
 

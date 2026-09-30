@@ -1,6 +1,4 @@
-//! Origin cost and liveness of opt-in fleet index bootstrap against real `MinIO`.
-
-#![cfg(feature = "fleet")]
+//! Origin cost and liveness of peer index bootstrap against real `MinIO`.
 
 mod common;
 
