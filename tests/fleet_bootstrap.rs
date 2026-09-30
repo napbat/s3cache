@@ -1117,9 +1117,10 @@ const PACED_PAGE: Duration = Duration::from_millis(250);
 const PACED_READY_DEADLINE: Duration = Duration::from_mins(10);
 /// How long the loaded pair runs on after both serve locally.
 const PACED_SETTLE: Duration = Duration::from_secs(15);
-/// Ready recaptures the load may fail and Groupnet retry, after its backoff,
-/// beyond the one after the scan and one per lease lapse. No member joins or
-/// leaves, so SWIM churn alone must never add more.
+/// Ready recaptures a load stall may cost the builder, after Groupnet's
+/// backoff, beyond the one after the scan: a failed attempt, or a lease lapse
+/// that retires its Ready capture. No member joins or leaves, so SWIM churn
+/// alone must never add more.
 const PACED_RETRIES: u64 = 1;
 
 /// When one node first counted an origin scan and first served locally,
@@ -1362,12 +1363,14 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
     );
     let builder = usize::from(scans[1] == 1);
     let follower = 1 - builder;
-    // One recapture after the scan, one after each lease lapse the load
-    // causes, and at most one paced retry if the load fails an attempt; not
-    // one per suspicion and refutation.
+    // One recapture after the scan, and at most one paced retry if the load
+    // fails an attempt or lapses a lease; not one per suspicion and
+    // refutation, and not one per lapse: C holds the index lock for
+    // microseconds, so a capture no longer lapses the lease that retires it.
     assert!(
-        recaptures[builder] <= lapses[builder] + 1 + PACED_RETRIES && recaptures[follower] == 0,
-        "the builder's Ready recapture is paced, not retried on every refutation: {report}"
+        recaptures[builder] <= 1 + PACED_RETRIES && recaptures[follower] == 0,
+        "the builder's Ready recapture is paced, not retried on every refutation or lapse: \
+         {report}"
     );
     let built = seen[builder].ready.expect("the builder served locally");
     assert!(
