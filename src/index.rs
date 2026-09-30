@@ -66,8 +66,10 @@ pub(crate) struct ObjEntry {
     /// not reported as a LIST row's `Size`.
     pub(crate) size: Option<i64>,
     /// The write's timestamp: both the last-writer-wins clock and the `Last-Modified`
-    /// reported. It is the origin's own mtime wherever the indexing path carried one
-    /// (the bootstrap LIST, a read observation) and the local write clock otherwise.
+    /// reported. It is the origin's own mtime, in whole seconds ([`origin_time`]),
+    /// wherever the indexing path carried one (the bootstrap LIST, a read observation),
+    /// and the writer's clock at the feed's microseconds otherwise (a write through this
+    /// proxy or a peer's feed event).
     pub(crate) last_modified: SystemTime,
     /// The origin's entity tag, when the path that indexed the key carried one: LIST,
     /// write responses and feed events do. An entry without one still answers
@@ -99,15 +101,31 @@ impl ObjEntry {
 /// * **Stamp order on a write fill.** A `PutObject` stamps the body from
 ///   `SystemTime::now()` and then stamps the index entry from a second `now()`, so the
 ///   entry is always microseconds *later* than the body it describes.
-/// * **Wire precision.** A LIST row carries milliseconds; the `Last-Modified` a GET or
-///   HEAD carries is an HTTP-date, whole seconds, rounded **down**. The same origin
-///   write therefore reads as `T.813` in the index and `T` on the body.
+/// * **Wire precision.** The `Last-Modified` a GET or HEAD carries is an HTTP-date,
+///   whole seconds, rounded **down**, and every origin time enters the index the same
+///   way ([`origin_time`]); an entry written through the fleet holds the writer's
+///   microseconds instead. The same write therefore reads as `T.813` in the index and
+///   `T` on a body later filled from the origin.
 ///
 /// A second is comfortably above both and far below anything that matters: the corner it
 /// is guarding is a rewrite with byte-identical content (same `ETag`, new mtime), and a
 /// rewrite inside a one-second window of the fill it is racing was already indistinguishable
 /// from the fill itself.
 const BODY_MTIME_SLACK: Duration = Duration::from_secs(1);
+
+/// An origin timestamp as the index keeps it, from its whole seconds since the epoch.
+/// The origin reports one version's mtime at different precisions — milliseconds in a
+/// LIST row, whole seconds rounded down in a GET or HEAD's HTTP-date `Last-Modified` —
+/// so every origin time enters the index through here, rounded down to the unit every
+/// path can express, and one version reads the same time from each path on every node.
+/// `None` before the epoch; the caller falls back to its own clock. Write and feed
+/// stamps are the writer's clock, not origin times, and never pass through here: their
+/// microseconds order same-second writes and deletes.
+pub(crate) fn origin_time(unix_secs: i64) -> Option<SystemTime> {
+    u64::try_from(unix_secs)
+        .ok()
+        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+}
 
 /// Whether this bucket's index entry for a key describes the **same version of the
 /// object** as a cached body of it — the question a suspect body has to answer before it

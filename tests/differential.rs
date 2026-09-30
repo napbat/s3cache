@@ -35,7 +35,7 @@ use s3s::dto::{
 };
 
 /// The LIST fields every matrix row compares. `Last-Modified` and the storage class are
-/// left to [`list_last_modified_matches_the_origin`] and
+/// left to [`list_last_modified_is_the_origins_whole_second`] and
 /// [`list_storage_class_matches_the_origin`], which compare them on their own so a single
 /// divergence cannot blanket-ignore the matrix.
 const LIST_SHAPE: Fields = Fields::LIST
@@ -449,15 +449,20 @@ async fn list_matches_the_origin_across_the_matrix() {
     );
 }
 
-/// The `Last-Modified` a LIST reports per key, compared at the granularity the LIST XML
-/// carries (ISO 8601 with milliseconds).
+/// The `Last-Modified` a LIST served from the index reports per key: the origin's own
+/// mtime, rounded down to whole seconds.
 ///
 /// Was: proxy `"2026-08-05T04:46:40.000Z"` where the origin said
-/// `"2026-08-05T04:46:40.042Z"` — the bootstrap in `sync_bucket_into` (src/index.rs)
-/// kept only `d.secs()` of each listed timestamp, so every indexed mtime landed up to a
-/// second early. It now keeps the sub-second part the origin sent.
+/// `"2026-08-05T04:46:40.042Z"`, because the bootstrap kept only `d.secs()` of each
+/// listed timestamp by accident. It is now deliberate and uniform: every origin time
+/// enters the index through `index::origin_time`, rounded down to whole seconds, the one
+/// unit a GET or HEAD `Last-Modified` can express. So one version reads the same time
+/// whether a node learned it from LIST, GET, or HEAD, and fleet peers compare it
+/// exactly. The version itself is the `ETag`, size, and storage class, which stay
+/// exact. A row the index holds from a write through the fleet keeps the writer's
+/// microsecond clock instead, which LIST reports at the XML's millisecond precision.
 #[tokio::test]
-async fn list_last_modified_matches_the_origin() {
+async fn list_last_modified_is_the_origins_whole_second() {
     let origin = Origin::start("diff-list-mtime").await;
     for key in ["a", "b/1", "c"] {
         origin.seed(key, key.as_bytes()).await;
@@ -465,12 +470,24 @@ async fn list_last_modified_matches_the_origin() {
     let r = routes(&origin, 1024 * 1024);
     wait_for_index(&r.proxy, &origin, &r.bucket).await;
 
-    r.list(
-        "LIST reports the origin's own mtimes",
-        Fields::KEYS | Fields::LAST_MODIFIED,
-        || list_input(&r.bucket),
-    )
-    .await;
+    let lists = origin.ops.list();
+    let proxy = common::diff::answer_list(&r.proxy, list_input(&r.bucket)).await;
+    let reference = common::diff::answer_list(&r.origin, list_input(&r.bucket)).await;
+    assert_eq!(origin.ops.list(), lists, "the index answered the LIST");
+    // ISO 8601 with milliseconds: keep the whole second, zero the fraction.
+    let whole_second = |stamp: &str| format!("{}.000Z", &stamp[..19]);
+    let listed = |answer: &Answer, stamp: &dyn Fn(&str) -> String| {
+        answer
+            .rows
+            .iter()
+            .map(|row| (row.key.clone(), row.last_modified.as_deref().map(stamp)))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed(&proxy, &str::to_owned),
+        listed(&reference, &whole_second),
+        "LIST reports the origin's own mtimes, in whole seconds"
+    );
 }
 
 /// The storage class a LIST reports per key.

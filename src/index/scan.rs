@@ -1,7 +1,7 @@
 //! Bounded, exhaustive LIST scans over disjoint lexicographic key ranges.
 
 use std::collections::VecDeque;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use futures::future::try_join_all;
 use groupnet::consistency::volatile_recovery::PublicationPermit;
@@ -9,7 +9,8 @@ use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
 use super::{
-    KeyIndex, ObjEntry, finish_bucket_sync_generation, standard_class, sync_listing_into_generation,
+    KeyIndex, ObjEntry, finish_bucket_sync_generation, origin_time, standard_class,
+    sync_listing_into_generation,
 };
 
 // Limit connection bursts even on large hosts or an excessive operator override.
@@ -197,12 +198,10 @@ async fn scan_range(
                 past_upper = true;
                 break;
             }
-            let last_modified = obj.last_modified().map_or_else(SystemTime::now, |stamp| {
-                u64::try_from(stamp.secs()).map_or_else(
-                    |_| SystemTime::now(),
-                    |secs| UNIX_EPOCH + Duration::new(secs, stamp.subsec_nanos()),
-                )
-            });
+            let last_modified = obj
+                .last_modified()
+                .and_then(|stamp| origin_time(stamp.secs()))
+                .unwrap_or_else(SystemTime::now);
             rows.push((
                 key.to_owned(),
                 ObjEntry {

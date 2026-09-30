@@ -15,7 +15,8 @@ use crate::index::{
     AuthoritativeKeyState, BodyMatch, Completion, EntryFill, IndexedHead, KeyIndex, ObjEntry,
     ObjMeta, ScanConfig, apply_del, apply_observed_put, apply_put, compare_entry_body,
     complete_entry, fence_uncertain_key, head_object_from_index, list_objects_v2_from_index,
-    resolve_uncertain_key, standard_class, sync_bucket_into_with_config, uncertain_key_is_current,
+    origin_time, resolve_uncertain_key, standard_class, sync_bucket_into_with_config,
+    uncertain_key_is_current,
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync};
@@ -202,19 +203,15 @@ pub(super) fn observed_entry(observed: Option<&ObservedObject>) -> ObjEntry {
 }
 
 /// A faithful index entry from the authoritative HEAD used to resolve an ambiguous
-/// mutation. The origin timestamp is the entry's LWW clock; falling back to the
-/// observation time is conservative for origins that omit it.
+/// mutation. The origin timestamp, in the index's whole seconds, is the entry's LWW
+/// clock; falling back to the observation time is conservative for origins that omit it.
 fn authoritative_head_entry(
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
 ) -> ObjEntry {
     let last_modified = head
         .last_modified()
-        .map_or_else(SystemTime::now, |modified| {
-            u64::try_from(modified.secs()).map_or_else(
-                |_| SystemTime::now(),
-                |secs| SystemTime::UNIX_EPOCH + Duration::new(secs, modified.subsec_nanos()),
-            )
-        });
+        .and_then(|modified| origin_time(modified.secs()))
+        .unwrap_or_else(SystemTime::now);
     ObjEntry {
         size: head.content_length(),
         last_modified,
@@ -892,9 +889,9 @@ impl CachingProxy {
     /// *completed* in place — the response fills the fields a skeletal entry lacks and
     /// nothing else, so this observes rather than writes and cannot reorder against a
     /// concurrent write. A key that is not indexed at all is added as a read
-    /// observation, stamped with the origin's own mtime (the truest clock available for
-    /// something the origin just described) and advertised to nobody: peers learn real
-    /// writes from their writers.
+    /// observation, stamped with the origin's own mtime in the index's whole seconds (the
+    /// truest clock available for something the origin just described) and advertised to
+    /// nobody: peers learn real writes from their writers.
     pub(super) fn observe(&self, bucket: &str, key: &str, observed: &ObservedObject) {
         let fill = EntryFill {
             size: observed.size,
@@ -915,9 +912,10 @@ impl CachingProxy {
             last_modified: observed
                 .last_modified
                 .as_ref()
-                .map_or_else(SystemTime::now, |stamp| {
-                    SystemTime::from(time::OffsetDateTime::from(stamp.clone()))
-                }),
+                .and_then(|stamp| {
+                    origin_time(time::OffsetDateTime::from(stamp.clone()).unix_timestamp())
+                })
+                .unwrap_or_else(SystemTime::now),
             etag: observed.etag.clone(),
             storage_class: observed.storage_class.clone(),
             content_type: observed.content_type.clone(),
