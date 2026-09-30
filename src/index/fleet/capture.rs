@@ -1,11 +1,11 @@
 //! Exact C publication under the live index lock; large encoding runs off-lock.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use groupnet::consistency::volatile_recovery::bootstrap::admission::{AdmissionClass, Reservation};
-use groupnet::consistency::volatile_recovery::bootstrap::ports::{DonorCapture, JournalIngress};
-use groupnet::core::Time;
+use groupnet::consistency::volatile_recovery::bootstrap::ports::{
+    DonorCapture, JournalIngress, LogicalClock,
+};
 use groupnet::core::volatile_bootstrap::BootstrapMemberIdentity;
 use groupnet::core::volatile_bootstrap::journal::{
     CutAlignment, DonorJournal, Invalidation, NativeCut, align_cuts,
@@ -98,7 +98,7 @@ impl PendingFleetCapture {
                 .ok_or(ImageError::Incomplete)?;
             // The clock every local effect was journaled on, so finishing can never
             // land behind a write that arrived while the image was encoding.
-            let now = capture.now().ok_or(ImageError::Incomplete)?;
+            let now = capture.clock().now();
             self.ingress
                 .with_journal(|journal| journal.finish_capture(now, image.len(), private_size))
                 .map_err(|_| ImageError::Incomplete)?;
@@ -306,8 +306,7 @@ impl KeyIndex {
         members: Vec<BootstrapMemberIdentity>,
         universe: &[String],
         caps: ImageCaps,
-        now: Time,
-        started_at: Instant,
+        clock: LogicalClock,
     ) -> Result<PendingFleetCapture, ImageError> {
         if encoded.class() != AdmissionClass::Encoded
             || encoded.bytes() < caps.bytes
@@ -355,7 +354,7 @@ impl KeyIndex {
             });
         }
         journal
-            .begin_capture(now, caps.bytes, caps.decoded_bytes, members, cuts)
+            .begin_capture(clock.now(), caps.bytes, caps.decoded_bytes, members, cuts)
             .map_err(|_| ImageError::Incomplete)?;
         let ingress =
             JournalIngress::new(journal, suffix, changed).map_err(|_| ImageError::Capacity)?;
@@ -365,8 +364,7 @@ impl KeyIndex {
         live.capture = Some(IndexCapture::new(
             ingress.clone(),
             generation,
-            started_at,
-            now,
+            clock,
             config.max_event_bytes,
             caps.name_bytes,
         ));
@@ -517,6 +515,15 @@ mod tests {
     }
 
     fn pending(index: &Arc<KeyIndex>, budget: &ByteAdmission, serial: u64) -> PendingFleetCapture {
+        pending_on(index, budget, serial, LogicalClock::start())
+    }
+
+    fn pending_on(
+        index: &Arc<KeyIndex>,
+        budget: &ByteAdmission,
+        serial: u64,
+        clock: LogicalClock,
+    ) -> PendingFleetCapture {
         let config = config();
         let journal = DonorJournal::new(config, capture_id(serial)).unwrap();
         let suffix = budget
@@ -543,10 +550,44 @@ mod tests {
                     rows: 1,
                     name_bytes: 64,
                 },
-                Time(1),
-                Instant::now(),
+                clock,
             )
             .unwrap()
+    }
+
+    /// The worker ticks the capture on the session clock while the index
+    /// journals effects on it too. A write landing mid-millisecond must never
+    /// put the journal ahead of the worker's next tick, which would refuse it as
+    /// backward time and fail the capture.
+    #[test]
+    fn index_effects_and_worker_ticks_share_one_timeline() {
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        let budget = admission();
+        let clock = LogicalClock::start();
+        let mut pending = pending_on(&index, &budget, 1, clock);
+        let caps = ImageCaps {
+            bytes: 2_048,
+            decoded_bytes: 8_192,
+            buckets: 1,
+            rows: 1,
+            name_bytes: 64,
+        };
+        pending.encode(&["bucket".to_owned()], caps).unwrap();
+        let donor = pending.finish().unwrap();
+        for (n, key) in ["a", "b", "c"].into_iter().enumerate() {
+            std::thread::sleep(Duration::from_micros(300));
+            assert!(apply_observed_put(
+                &index,
+                "bucket",
+                key,
+                object(n as u64 + 2)
+            ));
+            donor
+                .tick(clock.now())
+                .expect("the worker is never behind the index's journal time");
+        }
+        assert!(donor.is_active());
     }
 
     #[test]

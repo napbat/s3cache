@@ -5,10 +5,9 @@
 //! authorize a delayed local LIST or HEAD callback.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use groupnet::consistency::volatile_recovery::bootstrap::ports::JournalIngress;
-use groupnet::core::Time;
+use groupnet::consistency::volatile_recovery::bootstrap::ports::{JournalIngress, LogicalClock};
 use groupnet::core::volatile_bootstrap::journal::{DeltaIdentity, Invalidation, NativeCut};
 
 use s3s::dto::{ETag, ObjectStorageClass};
@@ -30,14 +29,14 @@ pub(super) use delta::{IndexDelta, encode_delete, encode_delta, encode_put};
 pub(crate) use stage::FleetStage;
 
 /// Exact donor candidate attached to the live index's publication lock.
-/// Every final index mutation appends under that lock. The logical clock is
-/// sampled conservatively on each publication, so a paused worker cannot
-/// extend an expired candidate by leaving its prior Tick time unchanged.
+/// Every final index mutation appends under that lock, sampling the Groupnet
+/// session's own clock afresh each time: a paused worker cannot extend an
+/// expired candidate by leaving its prior Tick time unchanged, and no effect
+/// can land on a time the worker has not yet reached or already passed.
 pub(super) struct IndexCapture {
     ingress: JournalIngress,
     generation: u64,
-    started_at: Instant,
-    started_time: Time,
+    clock: LogicalClock,
     next_local: u64,
     max_event_bytes: usize,
     max_name_bytes: usize,
@@ -47,16 +46,14 @@ impl IndexCapture {
     pub(super) fn new(
         ingress: JournalIngress,
         generation: u64,
-        started_at: Instant,
-        started_time: Time,
+        clock: LogicalClock,
         max_event_bytes: usize,
         max_name_bytes: usize,
     ) -> Self {
         Self {
             ingress,
             generation,
-            started_at,
-            started_time,
+            clock,
             next_local: 0,
             max_event_bytes,
             max_name_bytes,
@@ -67,13 +64,9 @@ impl IndexCapture {
         self.ingress.same_candidate(other)
     }
 
-    fn now(&self) -> Option<Time> {
-        let elapsed_nanos = Instant::now().duration_since(self.started_at).as_nanos();
-        let elapsed_ms = elapsed_nanos.checked_add(999_999)?.checked_div(1_000_000)?;
-        self.started_time
-            .0
-            .checked_add(u64::try_from(elapsed_ms).ok()?)
-            .map(Time)
+    /// The journal's clock, for work that must finish on the same timeline.
+    pub(super) fn clock(&self) -> LogicalClock {
+        self.clock
     }
 
     pub(super) fn invalidate(&self, reason: Invalidation) {
@@ -82,10 +75,7 @@ impl IndexCapture {
     }
 
     fn append_bytes(&mut self, identity: DeltaIdentity, effect: Vec<u8>) {
-        let Some(now) = self.now() else {
-            self.invalidate(Invalidation::Expired);
-            return;
-        };
+        let now = self.clock.now();
         let _ = self
             .ingress
             .with_journal(|journal| journal.append(now, self.generation, identity, effect));

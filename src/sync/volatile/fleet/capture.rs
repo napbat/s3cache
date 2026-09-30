@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use groupnet::consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, ByteAdmission, Reservation,
 };
-use groupnet::consistency::volatile_recovery::bootstrap::ports::{DonorCapture, JournalIngress};
-use groupnet::core::Time;
+use groupnet::consistency::volatile_recovery::bootstrap::ports::{
+    DonorCapture, JournalIngress, LogicalClock,
+};
 use groupnet::core::volatile_bootstrap::journal::{CaptureId, DonorJournal, JournalConfig};
 use groupnet::core::volatile_bootstrap::{BootstrapMemberIdentity, BootstrapScope, ClaimIdentity};
 use tokio::sync::Notify;
@@ -111,7 +111,7 @@ impl PreparedCapture {
         index: &Arc<KeyIndex>,
         members: Vec<BootstrapMemberIdentity>,
         universe: &[String],
-        now: Time,
+        clock: LogicalClock,
         wake: Arc<Notify>,
     ) -> Result<PendingFleetCapture, AdapterError> {
         index
@@ -124,8 +124,7 @@ impl PreparedCapture {
                 members,
                 universe,
                 IMAGE_CAPS,
-                now,
-                Instant::now(),
+                clock,
             )
             .map_err(|_| AdapterError)
     }

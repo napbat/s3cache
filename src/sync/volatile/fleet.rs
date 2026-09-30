@@ -203,7 +203,7 @@ impl FleetStatePort {
                     &self.adapter.state,
                     request.members,
                     &self.universe,
-                    request.now,
+                    request.clock,
                     request.wake,
                 )
             })
