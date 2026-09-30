@@ -83,6 +83,7 @@ impl FleetStatePort {
                     encoded_bytes,
                     chunks,
                     image_cut,
+                    decoded_bytes,
                     capture::IMAGE_CAPS,
                     capture::JOURNAL_CONFIG.max_event_bytes,
                 )

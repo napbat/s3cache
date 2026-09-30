@@ -45,6 +45,9 @@ impl Drop for FleetListenerGuard {
     }
 }
 
+/// Claim policy inside one recovery. `donor_wait_ms` is a stall bound, not a scan
+/// budget: the local origin build and a follower's wait for that builder both
+/// restart it whenever the build commits a page, so any bucket size fits.
 fn claim_config(recovery: &PreparedRecovery) -> Option<BootstrapConfig> {
     let total_ms = recovery.config.total_ms.min(60_000);
     (total_ms >= 5_000).then_some(BootstrapConfig {
@@ -104,11 +107,14 @@ fn bulk_limits() -> BulkLimits {
     }
 }
 
+/// Capture and transfer reserve exactly what the measured image at C needs from
+/// this pool; its class limits are the image codec's hard ceilings, only a
+/// safety cap. One node is a donor or a follower within a recovery, never both.
 fn admission() -> Option<ByteAdmission> {
     ByteAdmission::new(AdmissionLimits {
-        max_total_bytes: 256 << 20,
-        max_encoded_bytes: 64 << 20,
-        max_decoded_bytes: 128 << 20,
+        max_total_bytes: (256 << 20) + (1 << 30) + (80 << 20),
+        max_encoded_bytes: capture::IMAGE_CAPS.bytes,
+        max_decoded_bytes: capture::IMAGE_CAPS.decoded_bytes,
         max_suffix_bytes: 32 << 20,
         max_native_overlap_bytes: 16 << 20,
         max_inflight_bytes: 32 << 20,

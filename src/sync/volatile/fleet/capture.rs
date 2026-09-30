@@ -20,13 +20,17 @@ use super::super::AdapterError;
 
 static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(1);
 
-/// One deliberately conservative finite image and suffix policy. A larger
-/// index declines peer transfer and continues guarded origin recovery.
+/// The image and suffix policy, sized for a real bucket. A production docres row
+/// encodes to about 135 bytes and is charged about 650 decoded bytes (measured:
+/// 800k rows, 108 MB encoded, 512 MiB charged, cloned in about 300 ms), so these
+/// caps (the codec's ceilings) offer an index of up to about 1.5M rows; the
+/// 798k-row production index fits with headroom. A larger index declines peer
+/// transfer and continues guarded origin recovery.
 pub(super) const IMAGE_CAPS: ImageCaps = ImageCaps {
-    bytes: 16 << 20,
-    decoded_bytes: 64 << 20,
+    bytes: 256 << 20,
+    decoded_bytes: 1 << 30,
     buckets: 256,
-    rows: 100_000,
+    rows: 2_000_000,
     name_bytes: 1_024,
 };
 
@@ -48,7 +52,9 @@ pub(super) const JOURNAL_CONFIG: JournalConfig = JournalConfig {
     max_batch_bytes: 128 << 10,
     max_inflight_bytes: 256 << 10,
     max_total_ms: 600_000,
-    max_follower_ms: 60_000,
+    // A 108 MB production image is about 1,700 sequential 64 KiB chunks; give a
+    // follower on a loaded node minutes, not one, before its reservation expires.
+    max_follower_ms: 300_000,
 };
 
 pub(super) fn next_id(
@@ -75,12 +81,11 @@ pub(super) fn next_id(
 pub(super) struct PreparedCapture {
     journal: DonorJournal,
     suffix: Reservation,
-    encoded: Reservation,
-    decoded: Reservation,
 }
 
-/// Reserve every image and journal owner before entering recovery Control or
-/// the index coordinator. A refusal cannot leave a partly attached candidate.
+/// Reserve the journal suffix before entering recovery Control or the index
+/// coordinator. The image itself is measured and reserved at C by `attach`;
+/// a refusal at either step cannot leave a partly attached candidate.
 pub(super) fn prepare(
     budget: &ByteAdmission,
     id: CaptureId,
@@ -89,26 +94,17 @@ pub(super) fn prepare(
     let suffix = budget
         .reserve(AdmissionClass::Suffix, suffix_bytes)
         .map_err(|_| AdapterError)?;
-    let encoded = budget
-        .reserve(AdmissionClass::Encoded, IMAGE_CAPS.bytes)
-        .map_err(|_| AdapterError)?;
-    let decoded = budget
-        .reserve(AdmissionClass::Decoded, IMAGE_CAPS.decoded_bytes)
-        .map_err(|_| AdapterError)?;
     let journal = DonorJournal::new(JOURNAL_CONFIG, id).map_err(|_| AdapterError)?;
-    Ok(PreparedCapture {
-        journal,
-        suffix,
-        encoded,
-        decoded,
-    })
+    Ok(PreparedCapture { journal, suffix })
 }
 
 impl PreparedCapture {
-    /// Attach C under one current Control-to-index publication callback.
+    /// Attach C under one current Control-to-index publication callback,
+    /// reserving exactly the image measured there from `budget`.
     pub(super) fn attach(
         self,
         index: &Arc<KeyIndex>,
+        budget: &ByteAdmission,
         members: Vec<BootstrapMemberIdentity>,
         universe: &[String],
         clock: LogicalClock,
@@ -118,8 +114,7 @@ impl PreparedCapture {
             .begin_fleet_capture(
                 self.journal,
                 self.suffix,
-                self.encoded,
-                self.decoded,
+                budget,
                 wake,
                 members,
                 universe,

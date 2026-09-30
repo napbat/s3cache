@@ -13,6 +13,7 @@ use super::{ImageCaps, ImageError, InstallRefusal, decode, delta::decode_delta};
 pub(crate) struct FleetStage {
     encoded: Vec<u8>,
     expected_bytes: usize,
+    decoded_bytes: usize,
     expected_chunks: usize,
     next_chunk: usize,
     caps: ImageCaps,
@@ -27,11 +28,14 @@ impl FleetStage {
         expected_bytes: usize,
         expected_chunks: usize,
         cut: JournalCursor,
+        decoded_bytes: usize,
         caps: ImageCaps,
         max_event_bytes: usize,
     ) -> Result<Self, ImageError> {
         if expected_bytes == 0
             || expected_bytes > caps.bytes
+            || decoded_bytes == 0
+            || decoded_bytes > caps.decoded_bytes
             || expected_chunks == 0
             || max_event_bytes == 0
         {
@@ -47,6 +51,7 @@ impl FleetStage {
         Ok(Self {
             encoded,
             expected_bytes,
+            decoded_bytes,
             expected_chunks,
             next_chunk: 0,
             caps,
@@ -76,7 +81,7 @@ impl FleetStage {
     }
 
     /// Verify the complete encoded image and decode a non-serving private
-    /// index under the caller's decoded-state reservation.
+    /// index under exactly the offered decoded-state reservation.
     pub(crate) fn verify(&mut self, commitment: [u8; 32]) -> Result<(), ImageError> {
         if self.index.is_some()
             || self.next_chunk != self.expected_chunks
@@ -87,7 +92,12 @@ impl FleetStage {
         if *blake3::hash(&self.encoded).as_bytes() != commitment {
             return Err(ImageError::Corrupt);
         }
-        let state = decode(&self.encoded, self.caps)?;
+        let reserved = ImageCaps {
+            bytes: self.expected_bytes,
+            decoded_bytes: self.decoded_bytes,
+            ..self.caps
+        };
+        let state = decode(&self.encoded, reserved)?;
         self.rows = state
             .buckets
             .values()
@@ -218,7 +228,7 @@ mod tests {
     use crate::index::{ObjEntry, apply_put};
 
     use super::*;
-    use crate::index::fleet::{IndexDelta, encode, encode_delta};
+    use crate::index::fleet::{IndexDelta, encode, encode_delta, measure_image};
 
     #[test]
     fn chunks_verify_then_older_delete_replays_without_resurrecting_or_erasing() {
@@ -244,7 +254,15 @@ mod tests {
                 meta: None,
             },
         ));
-        let bytes = encode(&source.inner.read().unwrap(), &["bucket".to_owned()], caps).unwrap();
+        let size =
+            measure_image(&source.inner.read().unwrap(), &["bucket".to_owned()], caps).unwrap();
+        let bytes = encode(
+            &source.inner.read().unwrap(),
+            &["bucket".to_owned()],
+            caps,
+            size,
+        )
+        .unwrap();
         let donor = ClaimIdentity {
             node: NodeId::from("donor"),
             incarnation: BootId(1),
@@ -270,7 +288,8 @@ mod tests {
             capture: capture.clone(),
             position: 0,
         };
-        let mut stage = FleetStage::new(bytes.len(), 2, c.clone(), caps, 256).unwrap();
+        let mut stage =
+            FleetStage::new(bytes.len(), 2, c.clone(), size.decoded_bytes, caps, 256).unwrap();
         let split = bytes.len() / 2;
         assert!(stage.store_chunk(1, &bytes[split..]).is_err());
         stage.store_chunk(0, &bytes[..split]).unwrap();

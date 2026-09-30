@@ -231,6 +231,7 @@ pub struct Origin {
     put_fault: Arc<AppliedPutFault>,
     list_pause: Arc<ResponsePause>,
     list_fault: Arc<AtomicBool>,
+    list_delay_ms: Arc<AtomicU64>,
     get_pause: Arc<ResponsePause>,
 }
 
@@ -323,6 +324,7 @@ impl Origin {
         let put_fault = Arc::new(AppliedPutFault::default());
         let list_pause = Arc::new(ResponsePause::default());
         let list_fault = Arc::new(AtomicBool::new(false));
+        let list_delay_ms = Arc::new(AtomicU64::new(0));
         let get_pause = Arc::new(ResponsePause::default());
         let counted = counting_proxy(
             minio,
@@ -330,6 +332,7 @@ impl Origin {
             Arc::clone(&put_fault),
             Arc::clone(&list_pause),
             Arc::clone(&list_fault),
+            Arc::clone(&list_delay_ms),
             Arc::clone(&get_pause),
         )
         .await;
@@ -342,6 +345,7 @@ impl Origin {
             put_fault,
             list_pause,
             list_fault,
+            list_delay_ms,
             get_pause,
         })
     }
@@ -364,6 +368,15 @@ impl Origin {
     /// Make every counted LIST fail until cleared, including recovery retries.
     pub fn fail_lists(&self, enabled: bool) {
         self.list_fault.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Delay every counted LIST by `delay` before it reaches `MinIO`, making an
+    /// origin scan as slow as a large production bucket's.
+    pub fn delay_lists(&self, delay: std::time::Duration) {
+        self.list_delay_ms.store(
+            u64::try_from(delay.as_millis()).expect("test LIST delay fits"),
+            Ordering::SeqCst,
+        );
     }
 
     /// Hold the next origin object GET response after `MinIO` returns it.
@@ -526,6 +539,7 @@ async fn counting_proxy(
     put_fault: Arc<AppliedPutFault>,
     list_pause: Arc<ResponsePause>,
     list_fault: Arc<AtomicBool>,
+    list_delay_ms: Arc<AtomicU64>,
     get_pause: Arc<ResponsePause>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -542,6 +556,7 @@ async fn counting_proxy(
             let put_fault = Arc::clone(&put_fault);
             let list_pause = Arc::clone(&list_pause);
             let list_fault = Arc::clone(&list_fault);
+            let list_delay_ms = Arc::clone(&list_delay_ms);
             let get_pause = Arc::clone(&get_pause);
             let conn = http
                 .serve_connection(
@@ -551,6 +566,7 @@ async fn counting_proxy(
                         let put_fault = Arc::clone(&put_fault);
                         let list_pause = Arc::clone(&list_pause);
                         let list_fault = Arc::clone(&list_fault);
+                        let list_delay_ms = Arc::clone(&list_delay_ms);
                         let get_pause = Arc::clone(&get_pause);
                         async move {
                             ops.record(req.method(), req.uri(), req.headers());
@@ -562,6 +578,7 @@ async fn counting_proxy(
                                 &put_fault,
                                 &list_pause,
                                 &list_fault,
+                                &list_delay_ms,
                                 &get_pause,
                             )
                             .await;
@@ -598,6 +615,7 @@ async fn forward(
     put_fault: &AppliedPutFault,
     list_pause: &ResponsePause,
     list_fault: &AtomicBool,
+    list_delay_ms: &AtomicU64,
     get_pause: &ResponsePause,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
     let faulted = put_fault.claim(&req);
@@ -617,6 +635,10 @@ async fn forward(
                 .boxed(),
             )
             .expect("an injected LIST failure is well-formed");
+    }
+    let list_delay = list_delay_ms.load(Ordering::SeqCst);
+    if req.method() == Method::GET && !on_key && list_delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(list_delay)).await;
     }
     match relay(upstream, req).await {
         Ok(resp) if faulted && resp.status().is_success() => {

@@ -201,6 +201,7 @@ impl FleetStatePort {
                 }
                 prepared.attach(
                     &self.adapter.state,
+                    admission,
                     request.members,
                     &self.universe,
                     request.clock,

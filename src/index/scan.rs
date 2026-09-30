@@ -227,6 +227,11 @@ async fn scan_range(
             anyhow::bail!("bucket sync superseded by a newer origin rebuild");
         };
         found += page_len;
+        // A committed page is progress: it renews the recovery operation's stall
+        // bound and episode budget, so a long scan is never restarted from zero.
+        if let Some(permit) = &permit {
+            permit.progress();
+        }
         if past_upper || !response.is_truncated().unwrap_or(false) {
             break;
         }

@@ -8,11 +8,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::{
-    Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, head, list, proxy_over, put,
-    wait_for_index, warm_proxy_over,
+    Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, head, list, proxy_over,
+    proxy_over_with_metrics, put, wait_for_index, warm_proxy_over,
 };
+use futures::StreamExt;
 use groupnet::consistency::volatile_recovery::{RecoveryConfig, RecoveryStage};
 use s3cache::cache::proxy::CachingProxy;
+use s3cache::index::ScanConfig;
 use s3cache::metrics::Metrics;
 use s3cache::sync::coherence::WriteSync;
 use s3cache::sync::fleet::config::FleetConfig;
@@ -956,5 +958,193 @@ async fn live_mutations_overlap_follower_bootstrap() {
         join_ready.as_millis(),
         both_current_ready.as_millis(),
         join_started.elapsed().as_millis()
+    );
+}
+
+/// Flat keys with one serial LIST chain: the scan is exactly `ceil(rows / 1000)`
+/// LIST pages, with no discovery requests, so a restarted scan is countable.
+const SERIAL_SCAN: ScanConfig = ScanConfig {
+    workers: 1,
+    discovery_budget: 0,
+};
+/// 12,345 rows are 13 LIST pages; at 1 s a page the scan takes about 13 s.
+const SLOW_ROWS: usize = 12_345;
+const SLOW_LIST: Duration = Duration::from_secs(1);
+const SLOW_READY_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Fixed bounds a slow scan must outlive: an operation that commits no page for
+/// 3 s fails, an episode without progress ends after 8 s, and the peer claim
+/// policy derived from it gives a builder a 4 s donor wait.
+fn stall_bounds() -> RecoveryConfig {
+    RecoveryConfig {
+        max_members: 16,
+        max_member_bytes: 128,
+        max_barrier_rounds: 4,
+        total_ms: 8_000,
+        attempt_ms: 3_000,
+        settle_ms: 3_000,
+        poll_ms: 50,
+    }
+}
+
+/// Seed `rows` flat keys straight into `MinIO`, concurrently and uncounted.
+async fn seed_rows(origin: &Origin, rows: usize) {
+    futures::stream::iter(0..rows)
+        .map(|n| async move { origin.seed(&format!("row-{n:07}"), b"x").await })
+        .buffer_unordered(64)
+        .collect::<()>()
+        .await;
+}
+
+fn indexed_rows(metrics: &Metrics) -> u64 {
+    counter(metrics, "index_objects")
+}
+
+/// One origin scan slower than the attempt bound, the episode budget and the
+/// donor wait completes in exactly one pass of LIST pages. Before progress
+/// reporting, each expired attempt restarted the scan from its first page and
+/// the node never became ready.
+#[tokio::test]
+async fn slow_origin_scan_outlives_attempt_and_episode_bounds_in_one_pass() {
+    let origin = Origin::start("fleet-slow-scan").await;
+    seed_rows(&origin, SLOW_ROWS).await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    origin.delay_lists(SLOW_LIST);
+    let metrics = Arc::new(Metrics::default());
+    let sync = gossip_node("slow-scan-a", free_udp_port(), &[]).await;
+    let node = proxy_over_with_metrics(&client, CAP, Some(sync), &metrics)
+        .with_index_scan(SERIAL_SCAN)
+        .with_recovery_config(stall_bounds())
+        .expect("finite slow-scan recovery bounds");
+    let before = Counts::take(&origin);
+    let started = Instant::now();
+    node.start_coherence(std::slice::from_ref(&bucket));
+    ready_by(&node, &bucket, Instant::now() + SLOW_READY_DEADLINE).await;
+    let elapsed = started.elapsed();
+    let cost = Counts::take(&origin).since(before);
+    assert!(
+        elapsed > Duration::from_millis(stall_bounds().total_ms),
+        "the scan must outlast the whole fixed episode budget: {elapsed:?}"
+    );
+    assert_eq!(
+        cost.list,
+        SLOW_ROWS.div_ceil(1000) as u64,
+        "exactly one pass of LIST pages: {cost:?}"
+    );
+    assert_eq!(cost.list, cost.successful_list);
+    assert_eq!(counter(&metrics, "recovery_origin_scans"), 1);
+    assert_eq!(indexed_rows(&metrics), SLOW_ROWS as u64);
+    cost.assert_no_writes();
+    println!(
+        "fleet_bootstrap slow_scan={cost:?} index_ready_ms={}",
+        elapsed.as_millis()
+    );
+}
+
+/// Two nodes start together against the same slow origin. The selected builder's
+/// scan outlives its donor wait and both episode budgets; the follower waits for
+/// it while it keeps committing pages, then installs its image. The whole fleet
+/// pays exactly one pass of LIST pages and both nodes index every row.
+#[tokio::test]
+async fn concurrent_start_follower_waits_for_a_slow_builder_and_lists_once() {
+    let origin = Origin::start("fleet-slow-builder").await;
+    seed_rows(&origin, SLOW_ROWS).await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    origin.delay_lists(SLOW_LIST);
+    let ports = [
+        ("fleet-slow-a", free_tcp_port()),
+        ("fleet-slow-b", free_tcp_port()),
+    ];
+    let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
+    let a_sync = gossip_node("fleet-slow-a", a_udp, &[("fleet-slow-b", b_udp)]).await;
+    let b_sync = gossip_node("fleet-slow-b", b_udp, &[("fleet-slow-a", a_udp)]).await;
+    let (a_metrics, b_metrics) = (Arc::new(Metrics::default()), Arc::new(Metrics::default()));
+    let a = proxy_over_with_metrics(&client, CAP, Some(Arc::clone(&a_sync)), &a_metrics)
+        .with_index_scan(SERIAL_SCAN)
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-slow-a", &ports))
+        .with_recovery_config(stall_bounds())
+        .expect("finite slow-builder recovery bounds");
+    let b = proxy_over_with_metrics(&client, CAP, Some(Arc::clone(&b_sync)), &b_metrics)
+        .with_index_scan(SERIAL_SCAN)
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-slow-b", &ports))
+        .with_recovery_config(stall_bounds())
+        .expect("finite slow-builder recovery bounds");
+    mutual_alive(&a_sync, "fleet-slow-a", &b_sync, "fleet-slow-b").await;
+    let before = Counts::take(&origin);
+    let started = Instant::now();
+    tokio::join!(
+        a.start_fleet_coherence(std::slice::from_ref(&bucket)),
+        b.start_fleet_coherence(std::slice::from_ref(&bucket)),
+    );
+    let ready = ready_all_by(&[&a, &b], &bucket, Instant::now() + SLOW_READY_DEADLINE).await;
+    let cost = Counts::take(&origin).since(before);
+    assert!(
+        started.elapsed() > Duration::from_millis(stall_bounds().total_ms),
+        "the builder's scan must outlast every fixed bound"
+    );
+    assert_eq!(
+        cost.list,
+        SLOW_ROWS.div_ceil(1000) as u64,
+        "the fleet made exactly one pass of LIST pages: {cost:?}"
+    );
+    assert_eq!(
+        counter(&a_metrics, "recovery_origin_scans") + counter(&b_metrics, "recovery_origin_scans"),
+        1,
+        "only the builder scanned the origin"
+    );
+    assert_eq!(indexed_rows(&a_metrics), SLOW_ROWS as u64);
+    assert_eq!(indexed_rows(&b_metrics), SLOW_ROWS as u64);
+    cost.assert_no_writes();
+    println!(
+        "fleet_bootstrap slow_builder={cost:?} both_ready_ms={}",
+        ready.as_millis()
+    );
+    assert!(origin.ops.writes().is_empty(), "no origin control writes");
+}
+
+/// 100,000 rows were the old image cap. A donor over it offers its whole
+/// measured image, and a joining node installs it without listing the origin.
+const LARGE_ROWS: usize = 100_000 + 1_234;
+
+#[tokio::test]
+async fn peer_bootstrap_transfers_an_index_above_the_old_row_cap() {
+    let origin = Origin::start("fleet-large-index").await;
+    seed_rows(&origin, LARGE_ROWS).await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    let ports = [
+        ("fleet-large-a", free_tcp_port()),
+        ("fleet-large-b", free_tcp_port()),
+    ];
+    let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
+    let a_sync = gossip_node("fleet-large-a", a_udp, &[("fleet-large-b", b_udp)]).await;
+    let a_metrics = Arc::new(Metrics::default());
+    let a = proxy_over_with_metrics(&client, CAP, Some(Arc::clone(&a_sync)), &a_metrics)
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-large-a", &ports));
+    a.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    ready_by(&a, &bucket, Instant::now() + SLOW_READY_DEADLINE).await;
+    assert_eq!(indexed_rows(&a_metrics), LARGE_ROWS as u64);
+
+    let before_join = Counts::take(&origin);
+    let b_sync = gossip_node("fleet-large-b", b_udp, &[("fleet-large-a", a_udp)]).await;
+    let b_metrics = Arc::new(Metrics::default());
+    let b = proxy_over_with_metrics(&client, CAP, Some(Arc::clone(&b_sync)), &b_metrics)
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-large-b", &ports));
+    mutual_alive(&a_sync, "fleet-large-a", &b_sync, "fleet-large-b").await;
+    b.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    let join_ready = ready_by(&b, &bucket, Instant::now() + SLOW_READY_DEADLINE).await;
+    let join_cost = Counts::take(&origin).since(before_join);
+    assert_eq!(
+        join_cost.list, 0,
+        "the joiner installed the peer image instead of listing: {join_cost:?}"
+    );
+    assert_eq!(counter(&b_metrics, "recovery_origin_scans"), 0);
+    assert_eq!(indexed_rows(&b_metrics), indexed_rows(&a_metrics));
+    join_cost.assert_no_writes();
+    println!(
+        "fleet_bootstrap large_join={join_cost:?} rows={LARGE_ROWS} index_ready_ms={}",
+        join_ready.as_millis()
     );
 }

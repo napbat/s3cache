@@ -264,9 +264,10 @@ mod tests {
             rows: 2,
             name_bytes: 64,
         };
-        let encoded =
-            super::super::encode(&stage.inner.read().unwrap(), &["bucket".to_owned()], caps)
-                .unwrap();
+        let staged = stage.inner.read().unwrap();
+        let universe = ["bucket".to_owned()];
+        let size = super::super::measure_image(&staged, &universe, caps).unwrap();
+        let encoded = super::super::encode(&staged, &universe, caps, size).unwrap();
         let restored = super::super::decode(&encoded, caps).unwrap();
         let bucket = &restored.buckets["bucket"];
         assert_eq!(

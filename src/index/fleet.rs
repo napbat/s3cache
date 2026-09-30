@@ -24,7 +24,7 @@ mod clone;
 mod delta;
 mod stage;
 pub(crate) use capture::{FleetDonorImage, InstallRefusal, PendingFleetCapture};
-pub(super) use clone::clone_state;
+pub(super) use clone::{clone_state, measure_image};
 pub(super) use delta::{IndexDelta, encode_delete, encode_delta, encode_put};
 pub(crate) use stage::FleetStage;
 
@@ -394,20 +394,133 @@ struct DecodeBudget {
     limit: usize,
 }
 
-// These are deliberately larger than the current standard-library map nodes.
 // The charge is a finite ownership bound for the private image, not a claim
 // about byte-exact allocator RSS or allocator bookkeeping outside the value.
+// Hash tables are charged well above the standard library's layout. A `BTreeMap`
+// node holds up to 11 entries and every non-root node at least 5, so one entry
+// owns at most 11/5 of an entry slot plus its share of the internal nodes' 12
+// edges: 3 slots and 64 bytes a row bound that with margin. (The previous 32
+// slots charged about 4.5 KiB per production row, so a 100k-row image already
+// needed 448 MiB and the real 798k-row index could never be offered.)
 const HASH_SLOTS_PER_BUCKET: usize = 4;
 const HASH_MIN_SLOTS: usize = 8;
-const TREE_SLOTS_PER_ROW: usize = 32;
+const TREE_SLOTS_PER_ROW: usize = 3;
+const TREE_BYTES_PER_ROW: usize = 64;
 
 fn map_entry_charge<T>(count: usize) -> Result<usize, ImageError> {
     count
         .checked_mul(TREE_SLOTS_PER_ROW)
         .and_then(|slots| slots.checked_mul(std::mem::size_of::<T>()))
-        .and_then(|bytes| bytes.checked_add(count.checked_mul(128)?))
+        .and_then(|bytes| bytes.checked_add(count.checked_mul(TREE_BYTES_PER_ROW)?))
         .ok_or(ImageError::Capacity)
 }
+
+/// Exact size of one image: the bytes [`encode`] writes for it, the charge
+/// [`decode`] takes for it, and its rows. Measured at C from the live index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageSize {
+    pub(crate) encoded_bytes: usize,
+    pub(crate) decoded_bytes: usize,
+    pub(crate) rows: usize,
+}
+
+// One accounting shared by the donor's measurement and the follower's decode,
+// so a follower decoding under the donor's measured charge cannot drift.
+const TIMESTAMP_BYTES: usize = 12;
+
+fn sum(parts: &[usize]) -> Result<usize, ImageError> {
+    parts
+        .iter()
+        .try_fold(0usize, |total, part| total.checked_add(*part))
+        .ok_or(ImageError::Capacity)
+}
+
+fn text_bytes(len: usize) -> Result<usize, ImageError> {
+    sum(&[4, len])
+}
+
+fn bucket_slots(count: usize) -> Result<usize, ImageError> {
+    count
+        .checked_mul(HASH_SLOTS_PER_BUCKET)
+        .and_then(|slots| slots.checked_add(HASH_MIN_SLOTS))
+        .ok_or(ImageError::Capacity)
+}
+
+/// Charge for the index value and its bucket table.
+fn state_charge(buckets: usize) -> Result<usize, ImageError> {
+    let table = bucket_slots(buckets)?
+        .checked_mul(std::mem::size_of::<(String, BucketState)>() + 16)
+        .ok_or(ImageError::Capacity)?;
+    sum(&[std::mem::size_of::<KeyIndexState>(), table])
+}
+
+fn bucket_charge(name: usize) -> Result<usize, ImageError> {
+    sum(&[name, std::mem::size_of::<String>()])
+}
+
+/// Charge for one live row; `etag` is the quoted wire text length.
+fn entry_charge(key: usize, etag: Option<usize>, class: usize) -> Result<usize, ImageError> {
+    let etag = match etag {
+        Some(len) => len
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ETag>()))
+            .ok_or(ImageError::Capacity)?,
+        None => 0,
+    };
+    sum(&[
+        key,
+        map_entry_charge::<(String, ObjEntry)>(1)?,
+        etag,
+        class,
+        std::mem::size_of::<ObjectStorageClass>(),
+    ])
+}
+
+fn gone_charge(key: usize) -> Result<usize, ImageError> {
+    sum(&[key, map_entry_charge::<(String, SystemTime)>(1)?])
+}
+
+fn etag_wire(value: &ETag) -> (&'static str, &str) {
+    match value {
+        ETag::Strong(raw) => ("\"", raw.as_str()),
+        ETag::Weak(raw) => ("W/\"", raw.as_str()),
+    }
+}
+
+/// Length of the quoted `ETag` text on the wire (`"x"` or `W/"x"`).
+fn etag_text_len(value: &ETag) -> Result<usize, ImageError> {
+    let (prefix, raw) = etag_wire(value);
+    sum(&[prefix.len(), raw.len(), 1])
+}
+
+/// Encoded bytes of one live row as [`write_entry`] writes it.
+fn entry_bytes(key: usize, entry: &ObjEntry) -> Result<usize, ImageError> {
+    let size = if entry.size.is_some() { 1 + 8 } else { 1 };
+    let etag = match &entry.etag {
+        Some(etag) => 1 + text_bytes(etag_text_len(etag)?)?,
+        None => 1,
+    };
+    sum(&[
+        text_bytes(key)?,
+        size,
+        TIMESTAMP_BYTES,
+        etag,
+        text_bytes(entry.storage_class.as_str().len())?,
+    ])
+}
+
+/// Encoded bytes of one tombstone.
+fn gone_bytes(key: usize) -> Result<usize, ImageError> {
+    sum(&[text_bytes(key)?, TIMESTAMP_BYTES])
+}
+
+/// Encoded bytes of one bucket header (name and both row counts).
+fn bucket_bytes(name: usize) -> Result<usize, ImageError> {
+    sum(&[text_bytes(name)?, 4, 4])
+}
+
+/// Encoded bytes of the image header (version and bucket count).
+const HEADER_BYTES: usize = 1 + 4;
 
 impl DecodeBudget {
     fn new(limit: usize) -> Result<Self, ImageError> {
@@ -449,15 +562,8 @@ fn read_timestamp(reader: &mut Reader<'_>) -> Result<SystemTime, ImageError> {
 }
 
 fn write_etag(writer: &mut Writer, value: &ETag, cap: usize) -> Result<(), ImageError> {
-    let (prefix, raw) = match value {
-        ETag::Strong(raw) => ("\"", raw.as_str()),
-        ETag::Weak(raw) => ("W/\"", raw.as_str()),
-    };
-    let len = prefix
-        .len()
-        .checked_add(raw.len())
-        .and_then(|len| len.checked_add(1))
-        .ok_or(ImageError::Capacity)?;
+    let (prefix, raw) = etag_wire(value);
+    let len = etag_text_len(value)?;
     if len > cap {
         return Err(ImageError::Capacity);
     }
@@ -493,17 +599,21 @@ fn write_entry(
 }
 
 /// Encode a complete exact bucket universe from an admitted private C clone,
-/// off the live index lock, with at least `caps.bytes` of encoded admission.
+/// off the live index lock, into exactly the `size` measured for it at C.
 pub(super) fn encode(
     index: &KeyIndexState,
     universe: &[String],
     caps: ImageCaps,
+    size: ImageSize,
 ) -> Result<Vec<u8>, ImageError> {
     let caps = caps.validate()?;
     if universe.len() > caps.buckets || index.buckets.len() != universe.len() {
         return Err(ImageError::Incomplete);
     }
-    let mut writer = Writer::new(caps.bytes)?;
+    if size.encoded_bytes > caps.bytes {
+        return Err(ImageError::Capacity);
+    }
+    let mut writer = Writer::new(size.encoded_bytes)?;
     writer.u8(VERSION)?;
     writer.u32(universe.len())?;
     let mut rows = 0usize;
@@ -545,6 +655,9 @@ pub(super) fn encode(
             timestamp(&mut writer, *deleted_at)?;
         }
     }
+    if writer.bytes.len() != size.encoded_bytes {
+        return Err(ImageError::Corrupt);
+    }
     Ok(writer.bytes)
 }
 
@@ -554,8 +667,6 @@ fn read_entry<'a>(
     name_bytes: usize,
 ) -> Result<(&'a str, ObjEntry), ImageError> {
     let key = reader.text(name_bytes)?;
-    budget.take(key.len())?;
-    budget.take(map_entry_charge::<(String, ObjEntry)>(1)?)?;
     let size = match reader.u8()? {
         0 => None,
         1 => {
@@ -570,20 +681,14 @@ fn read_entry<'a>(
     let last_modified = read_timestamp(reader)?;
     let etag = match reader.u8()? {
         0 => None,
-        1 => {
-            let raw = reader.text(name_bytes)?;
-            budget.take(
-                raw.len()
-                    .checked_mul(2)
-                    .and_then(|n| n.checked_add(std::mem::size_of::<ETag>()))
-                    .ok_or(ImageError::Capacity)?,
-            )?;
-            Some(raw.parse().map_err(|_| ImageError::Corrupt)?)
-        }
+        1 => Some(reader.text(name_bytes)?),
         _ => return Err(ImageError::Corrupt),
     };
     let class = reader.text(name_bytes)?;
-    budget.take(class.len() + std::mem::size_of::<ObjectStorageClass>())?;
+    budget.take(entry_charge(key.len(), etag.map(str::len), class.len())?)?;
+    let etag = etag
+        .map(|raw| raw.parse().map_err(|_| ImageError::Corrupt))
+        .transpose()?;
     Ok((
         key,
         ObjEntry {
@@ -614,16 +719,7 @@ pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, Ima
         return Err(ImageError::Capacity);
     }
     let mut budget = DecodeBudget::new(caps.decoded_bytes)?;
-    budget.take(std::mem::size_of::<KeyIndexState>())?;
-    let bucket_slots = count
-        .checked_mul(HASH_SLOTS_PER_BUCKET)
-        .and_then(|slots| slots.checked_add(HASH_MIN_SLOTS))
-        .ok_or(ImageError::Capacity)?;
-    budget.take(
-        bucket_slots
-            .checked_mul(std::mem::size_of::<(String, BucketState)>() + 16)
-            .ok_or(ImageError::Capacity)?,
-    )?;
+    budget.take(state_charge(count)?)?;
     let mut buckets = HashMap::new();
     buckets
         .try_reserve(count)
@@ -637,7 +733,7 @@ pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, Ima
             return Err(ImageError::Corrupt);
         }
         previous_bucket = Some(name);
-        budget.take(name.len() + std::mem::size_of::<String>())?;
+        budget.take(bucket_charge(name.len())?)?;
         let key_count = reader.u32()?;
         rows = rows.checked_add(key_count).ok_or(ImageError::Capacity)?;
         if rows > caps.rows {
@@ -668,8 +764,7 @@ pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, Ima
                 return Err(ImageError::Corrupt);
             }
             previous_gone = Some(key);
-            budget.take(key.len())?;
-            budget.take(map_entry_charge::<(String, SystemTime)>(1)?)?;
+            budget.take(gone_charge(key.len())?)?;
             let deleted_at = read_timestamp(&mut reader)?;
             if keys
                 .get(key)
@@ -705,6 +800,15 @@ pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, Ima
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measure then encode, as a donor does at C.
+    fn encode(
+        index: &KeyIndexState,
+        universe: &[String],
+        caps: ImageCaps,
+    ) -> Result<Vec<u8>, ImageError> {
+        super::encode(index, universe, caps, measure_image(index, universe, caps)?)
+    }
 
     fn caps() -> ImageCaps {
         ImageCaps {

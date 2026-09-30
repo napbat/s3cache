@@ -1,46 +1,31 @@
 //! Bounded private C-state clone under the live index publication lock.
 
 use std::collections::{BTreeMap, HashMap};
-use std::mem::size_of;
 
 use crate::index::{BucketState, IndexStats, KeyIndexState, ObjEntry};
 
 use super::{
-    DecodeBudget, HASH_MIN_SLOTS, HASH_SLOTS_PER_BUCKET, ImageCaps, ImageError, map_entry_charge,
+    DecodeBudget, HEADER_BYTES, ImageCaps, ImageError, ImageSize, bucket_bytes, bucket_charge,
+    bucket_slots, entry_bytes, entry_charge, etag_text_len, gone_bytes, gone_charge, state_charge,
+    sum,
 };
 
-/// Copy only index fields transferable to a peer. The caller has already
-/// reserved the full decoded candidate budget and holds the publication lock
-/// from C/journal attachment through this bounded copy. Encoding and hashing
-/// of the returned private value can then run off-lock on a blocking worker.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one bounded preflight and private clone share the same publication cut"
-)]
-pub(crate) fn clone_state(
+/// Measure the exact image of the transferable index fields under the live
+/// publication lock, before any row is allocated: the bytes `encode` writes,
+/// the charge `decode` takes, and the rows. Refuses anything incomplete,
+/// malformed, or above `caps` so no admission is taken for it.
+pub(crate) fn measure_image(
     index: &KeyIndexState,
     universe: &[String],
     caps: ImageCaps,
-) -> Result<KeyIndexState, ImageError> {
+) -> Result<ImageSize, ImageError> {
     let caps = caps.validate()?;
     if universe.len() > caps.buckets || index.buckets.len() != universe.len() {
         return Err(ImageError::Incomplete);
     }
     let mut budget = DecodeBudget::new(caps.decoded_bytes)?;
-    budget.take(size_of::<KeyIndexState>())?;
-    let bucket_slots = universe
-        .len()
-        .checked_mul(HASH_SLOTS_PER_BUCKET)
-        .and_then(|count| count.checked_add(HASH_MIN_SLOTS))
-        .ok_or(ImageError::Capacity)?;
-    budget.take(
-        bucket_slots
-            .checked_mul(size_of::<(String, BucketState)>() + 16)
-            .ok_or(ImageError::Capacity)?,
-    )?;
-
-    // Price the entire private clone before allocating any row. The bounds
-    // include conservative map-node headroom but are not byte-exact RSS.
+    budget.take(state_charge(universe.len())?)?;
+    let mut encoded = HEADER_BYTES;
     let mut rows = 0usize;
     let mut previous = None::<&str>;
     for name in universe {
@@ -58,7 +43,8 @@ pub(crate) fn clone_state(
         {
             return Err(ImageError::Incomplete);
         }
-        budget.take(name.len() + size_of::<String>())?;
+        budget.take(bucket_charge(name.len())?)?;
+        encoded = sum(&[encoded, bucket_bytes(name.len())?])?;
         rows = rows
             .checked_add(bucket.keys.len())
             .and_then(|count| count.checked_add(bucket.gone.len()))
@@ -70,27 +56,19 @@ pub(crate) fn clone_state(
             if key.is_empty() || key.len() > caps.name_bytes {
                 return Err(ImageError::Capacity);
             }
-            budget.take(key.len())?;
-            budget.take(map_entry_charge::<(String, ObjEntry)>(1)?)?;
             let class = entry.storage_class.as_str();
             if class.is_empty() || class.len() > caps.name_bytes {
                 return Err(ImageError::Capacity);
             }
-            budget.take(class.len() + size_of::<s3s::dto::ObjectStorageClass>())?;
-            if let Some(etag) = &entry.etag {
-                let len = etag.value().len();
-                if len.saturating_add(4) > caps.name_bytes {
-                    return Err(ImageError::Capacity);
-                }
-                budget.take(
-                    len.checked_mul(2)
-                        .and_then(|bytes| bytes.checked_add(size_of::<s3s::dto::ETag>()))
-                        .ok_or(ImageError::Capacity)?,
-                )?;
+            let etag = entry.etag.as_ref().map(etag_text_len).transpose()?;
+            if etag.is_some_and(|len| len > caps.name_bytes) {
+                return Err(ImageError::Capacity);
             }
             if entry.size.is_some_and(|size| size < 0) {
                 return Err(ImageError::Corrupt);
             }
+            budget.take(entry_charge(key.len(), etag, class.len())?)?;
+            encoded = sum(&[encoded, entry_bytes(key.len(), entry)?])?;
         }
         for (key, deleted_at) in &bucket.gone {
             if key.is_empty() || key.len() > caps.name_bytes {
@@ -103,21 +81,38 @@ pub(crate) fn clone_state(
             {
                 return Err(ImageError::Corrupt);
             }
-            budget.take(key.len())?;
-            budget.take(map_entry_charge::<(String, std::time::SystemTime)>(1)?)?;
+            budget.take(gone_charge(key.len())?)?;
+            encoded = sum(&[encoded, gone_bytes(key.len())?])?;
         }
     }
+    if encoded > caps.bytes {
+        return Err(ImageError::Capacity);
+    }
+    Ok(ImageSize {
+        encoded_bytes: encoded,
+        decoded_bytes: budget.used,
+        rows,
+    })
+}
 
+/// Copy only index fields transferable to a peer. The caller has measured
+/// this exact state with [`measure_image`], reserved that size, and holds the
+/// publication lock from C/journal attachment through this bounded copy.
+/// Encoding and hashing of the returned private value can then run off-lock.
+pub(crate) fn clone_state(
+    index: &KeyIndexState,
+    universe: &[String],
+) -> Result<KeyIndexState, ImageError> {
     let mut buckets = HashMap::new();
     buckets
         .try_reserve(universe.len())
         .map_err(|_| ImageError::Capacity)?;
-    if buckets.capacity() > bucket_slots {
+    if buckets.capacity() > bucket_slots(universe.len())? {
         return Err(ImageError::Capacity);
     }
     let mut total = IndexStats::default();
     for name in universe {
-        let source = &index.buckets[name];
+        let source = index.buckets.get(name).ok_or(ImageError::Incomplete)?;
         let mut keys = BTreeMap::new();
         let mut stats = IndexStats::default();
         for (key, entry) in &source.keys {
@@ -156,58 +151,159 @@ pub(crate) fn clone_state(
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use s3s::dto::ObjectStorageClass;
+    use s3s::dto::{ETag, ObjectStorageClass};
 
+    use super::super::{decode, encode};
     use super::*;
 
-    #[test]
-    fn private_clone_is_skeletal_and_rejects_uncertainty_before_allocation() {
-        let caps = ImageCaps {
+    fn caps() -> ImageCaps {
+        ImageCaps {
             bytes: 4096,
-            decoded_bytes: 8192,
-            buckets: 1,
-            rows: 2,
+            decoded_bytes: 16_384,
+            buckets: 2,
+            rows: 8,
             name_bytes: 64,
-        };
+        }
+    }
+
+    fn entry(etag: Option<ETag>, size: Option<i64>) -> ObjEntry {
+        ObjEntry {
+            size,
+            last_modified: UNIX_EPOCH + Duration::from_secs(5),
+            etag,
+            storage_class: ObjectStorageClass::from("STANDARD".to_owned()),
+            content_type: Some("text/plain".to_owned()),
+            meta: None,
+        }
+    }
+
+    /// Two buckets with a strong, a weak, and no `ETag`, plus tombstones.
+    fn mixed() -> (KeyIndexState, Vec<String>) {
         let mut source = KeyIndexState::default();
-        let mut bucket = BucketState {
+        let mut first = BucketState {
             synced: true,
             ..BucketState::default()
         };
-        bucket.keys.insert(
-            "key".to_owned(),
-            ObjEntry {
-                size: Some(5),
-                last_modified: UNIX_EPOCH + Duration::from_secs(2),
-                etag: None,
-                storage_class: ObjectStorageClass::from("STANDARD".to_owned()),
-                content_type: Some("text/plain".to_owned()),
-                meta: None,
-            },
+        first.keys.insert(
+            "strong".to_owned(),
+            entry(Some(ETag::Strong("abc".to_owned())), Some(3)),
         );
-        source.buckets.insert("bucket".to_owned(), bucket);
-        let universe = vec!["bucket".to_owned()];
-        let cloned = clone_state(&source, &universe, caps).unwrap();
-        assert!(cloned.buckets["bucket"].keys["key"].content_type.is_none());
-        assert_eq!(cloned.buckets["bucket"].sync_generation, 0);
-        let encoded = super::super::encode(&cloned, &universe, caps).unwrap();
-        assert!(super::super::decode(&encoded, caps).is_ok());
+        first.keys.insert(
+            "weak".to_owned(),
+            entry(Some(ETag::Weak("defgh".to_owned())), None),
+        );
+        first
+            .gone
+            .insert("dead".to_owned(), UNIX_EPOCH + Duration::from_secs(9));
+        let mut second = BucketState {
+            synced: true,
+            ..BucketState::default()
+        };
+        second.keys.insert("plain".to_owned(), entry(None, Some(0)));
+        second
+            .gone
+            .insert("gone-key".to_owned(), UNIX_EPOCH + Duration::from_secs(1));
+        source.buckets.insert("alpha".to_owned(), first);
+        source.buckets.insert("beta".to_owned(), second);
+        (source, vec!["alpha".to_owned(), "beta".to_owned()])
+    }
+
+    #[test]
+    fn private_clone_is_skeletal_and_rejects_uncertainty_before_allocation() {
+        let (mut source, universe) = mixed();
+        let size = measure_image(&source, &universe, caps()).unwrap();
+        let cloned = clone_state(&source, &universe).unwrap();
+        assert!(
+            cloned.buckets["alpha"].keys["strong"]
+                .content_type
+                .is_none()
+        );
+        assert_eq!(cloned.buckets["alpha"].sync_generation, 0);
+        assert_eq!(measure_image(&cloned, &universe, caps()), Ok(size));
 
         source
             .buckets
-            .get_mut("bucket")
+            .get_mut("alpha")
             .unwrap()
             .uncertain_keys
-            .insert("key".to_owned(), 1);
+            .insert("strong".to_owned(), 1);
         assert!(matches!(
-            clone_state(&source, &universe, caps),
+            measure_image(&source, &universe, caps()),
             Err(ImageError::Incomplete)
         ));
-        let mut too_small = caps;
-        too_small.decoded_bytes = 1;
-        assert!(matches!(
-            clone_state(&cloned, &universe, too_small),
-            Err(ImageError::Capacity)
-        ));
+    }
+
+    /// The donor reserves and offers the measured size; a follower reserves
+    /// and decodes under exactly that. Any drift between the measurement and
+    /// the codec would refuse every real transfer or under-reserve it.
+    #[test]
+    fn measured_size_is_exactly_what_encode_writes_and_decode_charges() {
+        let (source, universe) = mixed();
+        let size = measure_image(&source, &universe, caps()).unwrap();
+        assert_eq!(size.rows, 5);
+        let cloned = clone_state(&source, &universe).unwrap();
+        let bytes = encode(&cloned, &universe, caps(), size).unwrap();
+        assert_eq!(bytes.len(), size.encoded_bytes);
+
+        let exact = ImageCaps {
+            bytes: size.encoded_bytes,
+            decoded_bytes: size.decoded_bytes,
+            ..caps()
+        };
+        let decoded = decode(&bytes, exact).unwrap();
+        assert_eq!(
+            decoded.buckets["alpha"].keys["weak"].etag,
+            Some(ETag::Weak("defgh".to_owned()))
+        );
+        let short = ImageCaps {
+            decoded_bytes: size.decoded_bytes - 1,
+            ..exact
+        };
+        assert_eq!(decode(&bytes, short).err(), Some(ImageError::Capacity));
+
+        let mut undersized = size;
+        undersized.encoded_bytes -= 1;
+        assert_eq!(
+            encode(&cloned, &universe, caps(), undersized).err(),
+            Some(ImageError::Capacity)
+        );
+        let mut oversized = size;
+        oversized.encoded_bytes += 1;
+        assert_eq!(
+            encode(&cloned, &universe, caps(), oversized).err(),
+            Some(ImageError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn measurement_refuses_an_image_above_any_ceiling() {
+        let (source, universe) = mixed();
+        let size = measure_image(&source, &universe, caps()).unwrap();
+        for limited in [
+            ImageCaps {
+                rows: size.rows - 1,
+                ..caps()
+            },
+            ImageCaps {
+                bytes: size.encoded_bytes - 1,
+                ..caps()
+            },
+            ImageCaps {
+                decoded_bytes: size.decoded_bytes - 1,
+                ..caps()
+            },
+        ] {
+            assert_eq!(
+                measure_image(&source, &universe, limited),
+                Err(ImageError::Capacity)
+            );
+        }
+        let at_ceiling = ImageCaps {
+            bytes: size.encoded_bytes,
+            decoded_bytes: size.decoded_bytes,
+            rows: size.rows,
+            ..caps()
+        };
+        assert_eq!(measure_image(&source, &universe, at_ceiling), Ok(size));
     }
 }

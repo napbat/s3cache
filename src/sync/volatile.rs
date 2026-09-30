@@ -128,6 +128,11 @@ impl WriteSync {
             max_members: 256,
             max_member_bytes: 256,
             max_barrier_rounds: 4,
+            // Neither bound has to fit a bucket's scan time. Every committed LIST page
+            // reports progress, which restarts both, so a scan that keeps committing
+            // pages runs to completion in one pass. `attempt_ms` is how long a scan may
+            // go without committing a page before it is retried; `total_ms` is how long
+            // an episode may go without progress before it ends in `OriginOnly`.
             total_ms: 600_000_u64.max(settle_ms.saturating_mul(2)),
             attempt_ms: 60_000,
             settle_ms,

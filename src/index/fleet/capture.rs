@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use groupnet::consistency::volatile_recovery::bootstrap::admission::{AdmissionClass, Reservation};
+use groupnet::consistency::volatile_recovery::bootstrap::admission::{
+    AdmissionClass, ByteAdmission, Reservation,
+};
 use groupnet::consistency::volatile_recovery::bootstrap::ports::{
     DonorCapture, JournalIngress, LogicalClock,
 };
@@ -14,7 +16,7 @@ use tokio::sync::Notify;
 
 use crate::index::{KeyIndex, KeyIndexState};
 
-use super::{ImageCaps, ImageError, IndexCapture, clone_state, encode};
+use super::{ImageCaps, ImageError, ImageSize, IndexCapture, clone_state, encode, measure_image};
 
 /// Exact pending C clone and all admission owners. Move this whole value into
 /// blocking encoding work; cancellation leaves the charge and ingress alive
@@ -23,6 +25,7 @@ pub(crate) struct PendingFleetCapture {
     index: Option<Arc<KeyIndex>>,
     ingress: JournalIngress,
     private: KeyIndexState,
+    size: ImageSize,
     encoded_image: Option<Vec<u8>>,
     commitment: Option<[u8; 32]>,
     encoded: Option<Reservation>,
@@ -62,7 +65,8 @@ impl PendingFleetCapture {
             .with_journal(|journal| journal.image_members() == observed)
     }
 
-    /// Encode away from the live publication lock, retaining both image permits.
+    /// Encode away from the live publication lock into exactly the size
+    /// measured at C, retaining both image permits.
     pub(crate) fn encode(
         &mut self,
         universe: &[String],
@@ -71,7 +75,7 @@ impl PendingFleetCapture {
         if self.encoded_image.is_some() {
             return Err(ImageError::Corrupt);
         }
-        let image = encode(&self.private, universe, caps)?;
+        let image = encode(&self.private, universe, caps, self.size)?;
         self.commitment = Some(*blake3::hash(&image).as_bytes());
         self.encoded_image = Some(image);
         Ok(())
@@ -289,39 +293,43 @@ impl KeyIndex {
 
     /// Capture exactly the state and native cuts at C. The caller must invoke
     /// this inside a current recovery publication guard (Control -> `KeyIndex`),
-    /// with encoded, decoded and suffix reservations acquired beforehand.
-    /// A later source signal cannot pass the guard until this bounded clone
-    /// and ingress attachment finish. No network or origin I/O runs here.
+    /// with the suffix reservation acquired beforehand. Under the write lock
+    /// this measures the exact image at C and reserves exactly its encoded and
+    /// decoded size from `admission` before cloning any row or attaching the
+    /// ingress; a refusal attaches nothing. A later source signal cannot pass
+    /// the guard until this bounded clone and ingress attachment finish. No
+    /// network or origin I/O runs here.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one atomic C capture owns the journal, three charges, roster, and index cut"
+        reason = "one atomic C capture owns the journal, its charges, roster, and index cut"
     )]
     pub(crate) fn begin_fleet_capture(
         self: &Arc<Self>,
         mut journal: DonorJournal,
         suffix: Reservation,
-        encoded: Reservation,
-        decoded: Reservation,
+        admission: &ByteAdmission,
         changed: Arc<Notify>,
         members: Vec<BootstrapMemberIdentity>,
         universe: &[String],
         caps: ImageCaps,
         clock: LogicalClock,
     ) -> Result<PendingFleetCapture, ImageError> {
-        if encoded.class() != AdmissionClass::Encoded
-            || encoded.bytes() < caps.bytes
-            || decoded.class() != AdmissionClass::Decoded
-            || decoded.bytes() < caps.decoded_bytes
-            || suffix.class() != AdmissionClass::Suffix
-        {
+        if suffix.class() != AdmissionClass::Suffix {
             return Err(ImageError::Capacity);
         }
         let config = journal.config();
         let generation = journal.id().recovery_generation;
         let mut live = self.inner.write().map_err(|_| ImageError::Corrupt)?;
-        // clone_state validates exact configured+indexed bucket coverage,
-        // complete sync, no uncertainty, and decoded admission before copies.
-        let private = clone_state(&live, universe, caps)?;
+        // measure_image validates exact configured+indexed bucket coverage,
+        // complete sync, no uncertainty, and the ceilings before any copy.
+        let size = measure_image(&live, universe, caps)?;
+        let encoded = admission
+            .reserve(AdmissionClass::Encoded, size.encoded_bytes)
+            .map_err(|_| ImageError::Capacity)?;
+        let decoded = admission
+            .reserve(AdmissionClass::Decoded, size.decoded_bytes)
+            .map_err(|_| ImageError::Capacity)?;
+        let private = clone_state(&live, universe)?;
         let mut cuts = Vec::new();
         if live.native_cuts.len() > config.max_cuts {
             return Err(ImageError::Capacity);
@@ -354,7 +362,13 @@ impl KeyIndex {
             });
         }
         journal
-            .begin_capture(clock.now(), caps.bytes, caps.decoded_bytes, members, cuts)
+            .begin_capture(
+                clock.now(),
+                size.encoded_bytes,
+                size.decoded_bytes,
+                members,
+                cuts,
+            )
             .map_err(|_| ImageError::Incomplete)?;
         let ingress =
             JournalIngress::new(journal, suffix, changed).map_err(|_| ImageError::Capacity)?;
@@ -372,6 +386,7 @@ impl KeyIndex {
             index: Some(Arc::clone(self)),
             ingress,
             private,
+            size,
             encoded_image: None,
             commitment: None,
             encoded: Some(encoded),
@@ -532,14 +547,11 @@ mod tests {
                 DonorJournal::storage_bound(config).unwrap(),
             )
             .unwrap();
-        let encoded = budget.reserve(AdmissionClass::Encoded, 2_048).unwrap();
-        let decoded = budget.reserve(AdmissionClass::Decoded, 8_192).unwrap();
         index
             .begin_fleet_capture(
                 journal,
                 suffix,
-                encoded,
-                decoded,
+                budget,
                 Arc::new(Notify::new()),
                 vec![member()],
                 &["bucket".to_owned()],
@@ -553,6 +565,140 @@ mod tests {
                 clock,
             )
             .unwrap()
+    }
+
+    /// Measure then clone, as the capture does under the write lock.
+    fn clone_state(
+        index: &KeyIndexState,
+        universe: &[String],
+        caps: ImageCaps,
+    ) -> Result<KeyIndexState, ImageError> {
+        measure_image(index, universe, caps)?;
+        super::clone_state(index, universe)
+    }
+
+    #[test]
+    fn capture_reserves_exactly_the_image_measured_at_c() {
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        assert!(apply_observed_put(&index, "bucket", "cached", object(2)));
+        let caps = ImageCaps {
+            bytes: 2_048,
+            decoded_bytes: 8_192,
+            buckets: 1,
+            rows: 1,
+            name_bytes: 64,
+        };
+        let universe = ["bucket".to_owned()];
+        let size = measure_image(&index.inner.read().unwrap(), &universe, caps).unwrap();
+        let budget = admission();
+        let mut pending = pending(&index, &budget, 1);
+        assert_eq!(pending.size, size);
+        assert_eq!(
+            pending.encoded.as_ref().map(Reservation::bytes),
+            Some(size.encoded_bytes)
+        );
+        assert_eq!(
+            pending.decoded.as_ref().map(Reservation::bytes),
+            Some(size.decoded_bytes)
+        );
+        pending.encode(&universe, caps).unwrap();
+        let donor = pending.finish().unwrap();
+        assert_eq!(donor.image().as_bytes().len(), size.encoded_bytes);
+        assert_eq!(
+            donor
+                .ingress()
+                .with_journal(|journal| journal.image_charge())
+                .map(|charge| (charge.encoded_bytes, charge.decoded_bytes)),
+            Some((size.encoded_bytes, size.decoded_bytes))
+        );
+    }
+
+    #[test]
+    fn index_over_a_ceiling_reserves_and_attaches_nothing() {
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        assert!(apply_observed_put(&index, "bucket", "a", object(2)));
+        assert!(apply_observed_put(&index, "bucket", "b", object(3)));
+        let budget = admission();
+        let config = config();
+        let suffix_bytes = DonorJournal::storage_bound(config).unwrap();
+        let fits = ImageCaps {
+            bytes: 2_048,
+            decoded_bytes: 8_192,
+            buckets: 1,
+            rows: 2,
+            name_bytes: 64,
+        };
+        let universe = ["bucket".to_owned()];
+        let size = measure_image(&index.inner.read().unwrap(), &universe, fits).unwrap();
+        for caps in [
+            ImageCaps { rows: 1, ..fits },
+            ImageCaps {
+                bytes: size.encoded_bytes - 1,
+                ..fits
+            },
+            ImageCaps {
+                decoded_bytes: size.decoded_bytes - 1,
+                ..fits
+            },
+        ] {
+            let journal = DonorJournal::new(config, capture_id(1)).unwrap();
+            let suffix = budget
+                .reserve(AdmissionClass::Suffix, suffix_bytes)
+                .unwrap();
+            let refused = index.begin_fleet_capture(
+                journal,
+                suffix,
+                &budget,
+                Arc::new(Notify::new()),
+                vec![member()],
+                &universe,
+                caps,
+                LogicalClock::start(),
+            );
+            assert!(matches!(refused, Err(ImageError::Capacity)));
+            assert!(index.inner.read().unwrap().capture.is_none());
+            assert_eq!(budget.usage().0, 0);
+        }
+    }
+
+    #[test]
+    fn refused_image_reservation_attaches_nothing() {
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        let budget = admission();
+        let config = config();
+        let journal = DonorJournal::new(config, capture_id(1)).unwrap();
+        let suffix = budget
+            .reserve(
+                AdmissionClass::Suffix,
+                DonorJournal::storage_bound(config).unwrap(),
+            )
+            .unwrap();
+        let held = budget.reserve(AdmissionClass::Decoded, 65_536).unwrap();
+        let before = budget.usage().0;
+        let refused = index.begin_fleet_capture(
+            journal,
+            suffix,
+            &budget,
+            Arc::new(Notify::new()),
+            vec![member()],
+            &["bucket".to_owned()],
+            ImageCaps {
+                bytes: 2_048,
+                decoded_bytes: 8_192,
+                buckets: 1,
+                rows: 1,
+                name_bytes: 64,
+            },
+            LogicalClock::start(),
+        );
+        assert!(matches!(refused, Err(ImageError::Capacity)));
+        assert!(index.inner.read().unwrap().capture.is_none());
+        assert!(budget.usage().0 < before, "the suffix is returned too");
+        drop(held);
+        assert_eq!(budget.usage().0, 0);
     }
 
     /// The worker ticks the capture on the session clock while the index

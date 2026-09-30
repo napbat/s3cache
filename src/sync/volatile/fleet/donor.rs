@@ -87,11 +87,14 @@ impl BootstrapStatePort for FleetStatePort {
         let permit = admission
             .reserve(AdmissionClass::Inflight, charge)
             .map_err(|_| AdapterError)?;
+        // The decoded charge finished at C is the measured image charge the
+        // follower must reserve and decode under.
         let offer = capture.ingress().with_journal(|journal| {
+            let decoded_bytes = journal.image_charge()?.decoded_bytes;
             let id = journal.id().clone();
             let members = journal.image_members().to_vec();
             let cuts = journal.image_cuts().to_vec();
-            TransferOffer {
+            Some(TransferOffer {
                 image_cut: JournalCursor {
                     capture: id.clone(),
                     position: 0,
@@ -99,13 +102,14 @@ impl BootstrapStatePort for FleetStatePort {
                 capture: id,
                 schema: crate::index::fleet::IMAGE_SCHEMA,
                 encoded_bytes: bytes,
-                decoded_bytes: capture::IMAGE_CAPS.decoded_bytes,
+                decoded_bytes,
                 chunks,
                 commitment: capture.image().commitment(),
                 members,
                 cuts,
-            }
+            })
         });
+        let offer = offer.ok_or(AdapterError)?;
         let variable = offer
             .capture
             .scope
