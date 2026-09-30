@@ -282,6 +282,12 @@ counters! {
     /// Includes initial bootstrap, explicit gap recovery, and a full lapse
     /// fallback; retries are counted separately as additional attempts.
     recovery_origin_scans => recovery_origin_scan,
+    /// A Groupnet recovery generation began one Ready recapture: a guarded clone
+    /// and encode of this node's completed index for peers, a few hundred ms of
+    /// index lock and CPU at production size. Retries are paced, so sustained
+    /// movement means the donor image keeps failing, and peers joining meanwhile
+    /// scan the origin.
+    recovery_ready_recaptures => recovery_ready_recapture,
     /// Record a cache-served read routed to the origin because this node held no licence
     /// to serve it locally: no valid coherence lease (`strong` — booting, warming up,
     /// lapsed, awaiting a resync affirmation, or a granter gone silent), or a membership

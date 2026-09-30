@@ -27,6 +27,7 @@ use groupnet::transport::tcp::TcpBulkTransport;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::metrics::Metrics;
 use crate::sync::coherence::WriteSync;
 use crate::sync::fleet::fresh_boot;
 
@@ -50,9 +51,15 @@ impl Drop for FleetListenerGuard {
 
 /// Logs each peer-bootstrap decision at info: whether this node waits for a
 /// peer's image, why it stopped waiting (which may cost an origin scan), and
-/// whether its own finished image was offered to peers.
-#[derive(Debug)]
-struct DecisionLog;
+/// whether its own finished image was offered to peers. Each Ready recapture
+/// started is also counted.
+struct DecisionLog(Arc<Metrics>);
+
+impl std::fmt::Debug for DecisionLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecisionLog")
+    }
+}
 
 impl BootstrapObserver for DecisionLog {
     fn decided(&self, decision: &BootstrapDecision) {
@@ -69,6 +76,7 @@ impl BootstrapObserver for DecisionLog {
                 "fleet bootstrap stopped waiting for a peer's image"
             ),
             BootstrapDecision::RecaptureStarted { donor } => {
+                self.0.recovery_ready_recapture();
                 tracing::info!(attempt = donor.attempt, "fleet Ready recapture started");
             }
             BootstrapDecision::RecaptureDeclined { reason } => {
@@ -273,7 +281,8 @@ pub(in crate::sync::volatile) async fn open_recovery(
         "bulk listener",
         BootstrapBulkListener::new(plane, sender, budget, limits).ok(),
     )?;
-    let bootstrap = Box::new(child.with_observer(Arc::new(DecisionLog)));
+    let bootstrap =
+        Box::new(child.with_observer(Arc::new(DecisionLog(Arc::clone(&prepared.adapter.metrics)))));
     let handle = if let Some(rearm) = prepared.rearm {
         RecoveryHandle::open_with_bootstrap_and_rearm(
             Arc::clone(&prepared.adapter),

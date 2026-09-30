@@ -468,7 +468,7 @@ completed from a forwarded answer — see below), the warm tier (`warm_hit` / `w
 `warm_mapped_entries`, `warm_disk_bytes`, `warm_disk_budget_bytes`, `warm_evictions`, and
 `warm_evicted_bytes`), and the
 gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`,
-`recovery_origin_scans`, `unhealthy_bypasses`).
+`recovery_origin_scans`, `recovery_ready_recaptures`, `unhealthy_bypasses`).
 
 Those are the coherence tier's, and the split between lease lapses and timeouts is the one
 worth wiring an alert around: **`write_lease_lapses` is the guarantee working** — a peer
@@ -492,3 +492,8 @@ decision. A body in an unsynced bucket is invalidated without incrementing
 `recovery_origin_scans` counts one attempt each time this node starts the full
 origin-index arm, including cold boot, gaps, and any lapse whose feed/lease proof
 could not retain its index. The origin LIST counter prices the actual request cost.
+`recovery_ready_recaptures` counts each Ready recapture a node starts: a guarded
+clone and encode of its whole index for peers, a few hundred ms of index lock and CPU
+at production size. Expect one after a node's own scan, and one after each lease lapse
+or membership change. Groupnet paces failed attempts, so sustained movement means the
+donor image keeps failing, and pods joining meanwhile scan the origin.

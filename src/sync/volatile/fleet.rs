@@ -11,7 +11,7 @@ use groupnet::consistency::volatile_recovery::bootstrap::ports::{
     ParticipationSnapshot, ReadyCaptureRequest,
 };
 use groupnet::core::volatile_bootstrap::{
-    BootstrapMemberIdentity, BootstrapOperation, BootstrapScope,
+    BootstrapMemberIdentity, BootstrapOperation, BootstrapScope, same_membership,
 };
 
 use crate::index::fleet::FleetDonorImage;
@@ -41,7 +41,11 @@ pub(super) struct FleetStatePort {
 
 impl FleetStatePort {
     /// Native TTL is sampled inside the actor, so age it through callback
-    /// transit with the same upward rounding used by Groupnet's worker.
+    /// transit with the same upward rounding used by Groupnet's worker. The
+    /// cut must bind the same membership as `expected`: the same members with
+    /// the same presence. A member's SWIM status or incarnation may differ,
+    /// as it does whenever the load of a capture makes a peer suspect a node
+    /// that then refutes.
     fn fresh_roster(
         snapshot: &ParticipationSnapshot,
         expected: &[BootstrapMemberIdentity],
@@ -58,7 +62,7 @@ impl FleetStatePort {
         else {
             return false;
         };
-        snapshot.roster == expected
+        same_membership(&snapshot.roster, expected)
             && snapshot.participants.iter().all(|p| p.remaining_ms > age)
             && snapshot
                 .roster
@@ -160,7 +164,7 @@ impl FleetStatePort {
             result.is_ok_and(|snapshot| {
                 self.listener_alive()
                     && Self::fresh_roster(snapshot.get(), &snapshot.get().roster)
-                    && capture::exact_roster(pending, &snapshot.get().roster)
+                    && capture::same_roster(pending, &snapshot.get().roster)
             })
         })
     }
@@ -193,9 +197,16 @@ impl FleetStatePort {
         let prepared = capture::prepare(admission, id)?;
         // Measuring and cloning C hold the Ready guard's publication fence and
         // the index write lock for as long as the bucket makes the clone
-        // (about 300 ms at 800k rows in release). The blocking pool runs that
-        // same critical section without stalling a runtime worker. A dropped
-        // waiter detaches it, and Drop of its result unlinks C again.
+        // (about 300 ms at 800k rows in release): C must be one atomic cut
+        // with the journal ingress it attaches. The blocking pool runs the
+        // copy, but a runtime task that needs the fence or the index meanwhile
+        // (a recovery signal, a local read or write) waits for it, so a
+        // one-worker node pauses for the clone, long enough for a peer to
+        // suspect it. That is why the image's roster binds each member's
+        // presence, not its SWIM status or incarnation, and why Groupnet
+        // paces failed recaptures: the pause costs a bounded few clones per
+        // claim window. A dropped waiter detaches the copy, and Drop of its
+        // result unlinks C again.
         let guard = request.guard.clone();
         let index = Arc::clone(&self.adapter.state);
         let budget = admission.clone();
@@ -279,7 +290,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn final_install_rejects_roster_change_or_ttl_expiry_after_valid_barrier() {
+    fn final_install_rejects_membership_change_or_ttl_expiry_after_valid_barrier() {
         let presence = PresenceIdentity {
             node: NodeId::from("donor"),
             boot: BootId(1),
@@ -312,10 +323,25 @@ mod tests {
             std::slice::from_ref(&member)
         ));
 
-        let mut changed = barrier.clone();
-        changed.roster[0].member_incarnation += 1;
+        // The donor refuted a suspicion since: the same process, still bound.
+        let mut refuted = barrier.clone();
+        refuted.roster[0].member_incarnation += 1;
+        refuted.participants[0].member.member_incarnation += 1;
+        assert!(FleetStatePort::fresh_roster(
+            &refuted,
+            std::slice::from_ref(&member)
+        ));
+
+        // The donor restarted since: a new boot is a different member.
+        let mut restarted = barrier.clone();
+        for identity in [
+            &mut restarted.roster[0],
+            &mut restarted.participants[0].member,
+        ] {
+            identity.presence.as_mut().unwrap().boot = BootId(4);
+        }
         assert!(!FleetStatePort::fresh_roster(
-            &changed,
+            &restarted,
             std::slice::from_ref(&member)
         ));
 

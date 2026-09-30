@@ -1106,13 +1106,21 @@ async fn concurrent_start_follower_waits_for_a_slow_builder_and_lists_once() {
     assert!(origin.ops.writes().is_empty(), "no origin control writes");
 }
 
-/// A production bucket lists at about 1.5 pages a second: 793k rows took 8.5
-/// minutes. 300 pages at 650 ms keep the builder's scan over three minutes,
-/// past the unshrunk production bounds it must outlive: the 60 s claim
-/// episode, the 30 s donor wait and the 60 s recovery attempt.
-const PACED_ROWS: usize = 300_000;
-const PACED_PAGE: Duration = Duration::from_millis(650);
+/// The production index: 800 pages of 1,000 rows. At 250 ms a page the
+/// builder's scan runs over three minutes, past the unshrunk production
+/// bounds it must outlive: the 60 s claim episode, the 30 s donor wait and the
+/// 60 s recovery attempt. (Production lists about 1.5 pages a second, 793k rows
+/// in 8.5 minutes; the bounds restart on every page either way.) Its Ready
+/// recapture then clones and encodes a production-sized image.
+const PACED_ROWS: usize = 800_000;
+const PACED_PAGE: Duration = Duration::from_millis(250);
 const PACED_READY_DEADLINE: Duration = Duration::from_mins(10);
+/// How long the loaded pair runs on after both serve locally.
+const PACED_SETTLE: Duration = Duration::from_secs(15);
+/// Ready recaptures the load may fail and Groupnet retry, after its backoff,
+/// beyond the one after the scan and one per lease lapse. No member joins or
+/// leaves, so SWIM churn alone must never add more.
+const PACED_RETRIES: u64 = 1;
 
 /// When one node first counted an origin scan and first served locally,
 /// from the pair's common start.
@@ -1189,10 +1197,12 @@ async fn pod_node(
 }
 
 /// Record each node's first origin scan and first local service until both
-/// serve locally or the deadline passes. Once a builder scans, stall the
-/// pods in turn, the follower first, per `[follower pause, builder pause,
-/// period]` in ms. Returns whether both finished, the milestones, and the
-/// number of stalls.
+/// serve locally or the deadline passes, then keep watching for `settle`.
+/// Once a builder scans, stall the pods in turn, the follower first, per
+/// `[follower pause, builder pause, period]` in ms, until the watch ends: the
+/// load outlasts the scan, through the builder's Ready recapture and the
+/// follower's transfer, as on the production pair. Returns whether both
+/// finished, the milestones, and the number of stalls.
 async fn watch_paced_pair(
     pods: &[Pod; 2],
     nodes: [&CachingProxy; 2],
@@ -1200,10 +1210,12 @@ async fn watch_paced_pair(
     bucket: &str,
     started: Instant,
     stalls: [u64; 3],
+    settle: Duration,
 ) -> (bool, [Milestones; 2], usize) {
     let mut seen = [Milestones::default(); 2];
     let mut next_stall = None;
     let mut stalled = 0_usize;
+    let mut settled = None;
     let finished = tokio::time::timeout(PACED_READY_DEADLINE, async {
         loop {
             for (index, node) in nodes.iter().enumerate() {
@@ -1216,12 +1228,12 @@ async fn watch_paced_pair(
                     seen[index].ready = Some(started.elapsed());
                 }
             }
-            if seen.iter().all(|node| node.ready.is_some()) {
+            if seen.iter().all(|node| node.ready.is_some())
+                && Instant::now() >= *settled.get_or_insert(Instant::now() + settle)
+            {
                 return;
             }
-            if let Some(builder) = seen.iter().position(|node| node.scanned.is_some())
-                && seen[builder].ready.is_none()
-            {
+            if let Some(builder) = seen.iter().position(|node| node.scanned.is_some()) {
                 let due =
                     *next_stall.get_or_insert(Instant::now() + Duration::from_millis(stalls[2]));
                 if Instant::now() >= due {
@@ -1246,11 +1258,27 @@ async fn watch_paced_pair(
     (finished, seen, stalled)
 }
 
+/// Start fleet coherence on each node inside its own pod.
+async fn start_pods(pods: &[Pod; 2], nodes: [&CachingProxy; 2], bucket: &str) {
+    let starts = [(&pods[0], nodes[0]), (&pods[1], nodes[1])].map(|(pod, node)| {
+        let (node, bucket) = (node.clone(), bucket.to_owned());
+        pod.handle().spawn(async move {
+            node.start_fleet_coherence(std::slice::from_ref(&bucket))
+                .await;
+        })
+    });
+    for start in starts {
+        start.await.expect("fleet coherence started");
+    }
+}
+
 /// Two nodes restart together with the binary's own recovery and claim
 /// configuration, strong consistency and the default 2 s lease, against a
-/// production-paced origin. The builder's scan outlasts every fixed bound;
-/// the follower waits for all of it, then installs the builder's Ready
-/// capture. The pair pays exactly one pass of LIST pages.
+/// production-paced origin, and stay loaded throughout. The builder's scan
+/// outlasts every fixed bound; the follower waits for all of it, then
+/// installs the builder's Ready capture. The pair pays exactly one pass of
+/// LIST pages, and the builder recaptures its image a bounded number of
+/// times, not once per membership refutation the load causes.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
     let _ = tracing_subscriber::fmt()
@@ -1261,7 +1289,8 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
         .with_test_writer()
         .try_init();
     // Load as on the production node: after the scan starts, one pod's only
-    // worker is held for 1.5 s every 5 s, alternating follower and builder.
+    // worker is held for 1.5 s every 5 s, alternating follower and builder,
+    // until the follower has installed and the pair has run on for a while.
     // That is past the 1 s observation bound and long enough for the
     // membership layer to suspect the held pod, but inside the 2 s lease
     // and the 3 s claim TTL. [follower pause, builder pause, period] in ms.
@@ -1298,24 +1327,33 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
     mutual_alive(&a_sync, "fleet-paced-a", &b_sync, "fleet-paced-b").await;
     let before = Counts::take(&origin);
     let started = Instant::now();
-    let starts = [(&pods[0], &a), (&pods[1], &b)].map(|(pod, node)| {
-        let (node, bucket) = (node.clone(), bucket.clone());
-        pod.handle().spawn(async move {
-            node.start_fleet_coherence(std::slice::from_ref(&bucket))
-                .await;
-        })
-    });
-    for start in starts {
-        start.await.expect("fleet coherence started");
-    }
-    let (finished, seen, stalled) =
-        watch_paced_pair(&pods, [&a, &b], &metrics, &bucket, started, stalls).await;
+    start_pods(&pods, [&a, &b], &bucket).await;
+    let (finished, seen, stalled) = watch_paced_pair(
+        &pods,
+        [&a, &b],
+        &metrics,
+        &bucket,
+        started,
+        stalls,
+        PACED_SETTLE,
+    )
+    .await;
     let cost = Counts::take(&origin).since(before);
-    let scans = metrics
-        .each_ref()
-        .map(|metrics| counter(metrics, "recovery_origin_scans"));
+    let count = |name| metrics.each_ref().map(|metrics| counter(metrics, name));
+    let (scans, recaptures) = (
+        count("recovery_origin_scans"),
+        count("recovery_ready_recaptures"),
+    );
     let rows = metrics.each_ref().map(|metrics| indexed_rows(metrics));
-    let report = format!("seen={seen:?} scans={scans:?} rows={rows:?} stalls={stalled} {cost:?}");
+    let lapses = [&a, &b].map(|node| {
+        node.recovery_status()
+            .map_or(0, |status| status.state.covered_lapses)
+    });
+    let report = format!(
+        "seen={seen:?} scans={scans:?} recaptures={recaptures:?} lapses={lapses:?} \
+         rows={rows:?} stalls={stalled} {cost:?}"
+    );
+    println!("fleet_bootstrap paced_builder {report}");
     assert!(finished, "both nodes serve locally in time: {report}");
     assert_eq!(
         scans.iter().sum::<u64>(),
@@ -1324,6 +1362,13 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
     );
     let builder = usize::from(scans[1] == 1);
     let follower = 1 - builder;
+    // One recapture after the scan, one after each lease lapse the load
+    // causes, and at most one paced retry if the load fails an attempt; not
+    // one per suspicion and refutation.
+    assert!(
+        recaptures[builder] <= lapses[builder] + 1 + PACED_RETRIES && recaptures[follower] == 0,
+        "the builder's Ready recapture is paced, not retried on every refutation: {report}"
+    );
     let built = seen[builder].ready.expect("the builder served locally");
     assert!(
         built > Duration::from_mins(3),
@@ -1344,7 +1389,6 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
         "the follower installed the builder's Ready capture: {report}"
     );
     cost.assert_no_writes();
-    println!("fleet_bootstrap paced_builder {report}");
 }
 
 /// The production index has about 798,000 rows, eight times the old 100,000-row

@@ -8,10 +8,10 @@ use groupnet::consistency::volatile_recovery::bootstrap::admission::{
 use groupnet::consistency::volatile_recovery::bootstrap::ports::{
     DonorCapture, JournalIngress, LogicalClock,
 };
-use groupnet::core::volatile_bootstrap::BootstrapMemberIdentity;
 use groupnet::core::volatile_bootstrap::journal::{
     CutAlignment, DonorJournal, Invalidation, NativeCut, align_cuts,
 };
+use groupnet::core::volatile_bootstrap::{BootstrapMemberIdentity, same_membership};
 use tokio::sync::Notify;
 
 use crate::index::{KeyIndex, KeyIndexState};
@@ -58,11 +58,13 @@ impl Drop for FleetDonorImage {
 }
 
 impl PendingFleetCapture {
-    /// Compare the fresh source cut with the exact C roster before a guarded
-    /// finish. This borrows the already charged journal copy.
-    pub(crate) fn image_members_equal(&self, observed: &[BootstrapMemberIdentity]) -> bool {
+    /// Whether the fresh source cut binds the same membership as the C
+    /// roster, before a guarded finish: the same members with the same
+    /// presence, whatever their SWIM status or incarnation. This borrows the
+    /// already charged journal copy.
+    pub(crate) fn same_membership_as_image(&self, observed: &[BootstrapMemberIdentity]) -> bool {
         self.ingress
-            .with_journal(|journal| journal.image_members() == observed)
+            .with_journal(|journal| same_membership(journal.image_members(), observed))
     }
 
     /// The image's size, measured at C.

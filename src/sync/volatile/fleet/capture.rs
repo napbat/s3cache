@@ -148,11 +148,11 @@ pub(super) fn finish(
     pending.finish().map_err(|_| AdapterError)
 }
 
-pub(super) fn exact_roster(
+pub(super) fn same_roster(
     pending: &PendingFleetCapture,
     observed: &[BootstrapMemberIdentity],
 ) -> bool {
-    pending.image_members_equal(observed)
+    pending.same_membership_as_image(observed)
 }
 
 pub(super) fn still_attached(index: &KeyIndex, capture: &DonorCapture<FleetDonorImage>) -> bool {
