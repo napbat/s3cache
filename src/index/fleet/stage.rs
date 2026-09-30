@@ -196,20 +196,23 @@ impl FleetStage {
         self.reserved_at.elapsed()
     }
 
-    /// Pre-check that the live index sits exactly at the barrier `cuts` with
-    /// version-identical rows, so the guarded install would not lose a live
-    /// effect. [`Self::install_into`] repeats the check under the write lock.
+    /// Pre-check that the live index sits exactly at the barrier `cuts` and
+    /// that the guarded install would not lose a live effect.
+    /// [`Self::install_into`] repeats the check under the write lock.
     pub(crate) fn check_coverage(
         &self,
         live: &KeyIndex,
         cuts: &[NativeCut],
         universe: &[String],
     ) -> Result<(), InstallRefusal> {
-        let index = self.index.as_ref().ok_or(InstallRefusal::Incompatible)?;
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(InstallRefusal::unavailable)?;
         let candidate = index
             .inner
             .read()
-            .map_err(|_| InstallRefusal::Incompatible)?;
+            .map_err(|_| InstallRefusal::unavailable())?;
         live.fleet_install_check(&candidate, cuts, universe, self.caps.rows)
     }
 

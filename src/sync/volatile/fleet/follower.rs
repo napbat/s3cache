@@ -159,8 +159,11 @@ impl FleetStatePort {
                                 .hold(TransferEvent::NativePending { op }),
                         ));
                     }
-                    Err(InstallRefusal::Incompatible) => {
-                        tracing::debug!("fleet peer image declined: live index incompatible");
+                    Err(InstallRefusal::Incompatible(why)) => {
+                        tracing::info!(
+                            refusal = %why,
+                            "fleet peer image declined: live index incompatible"
+                        );
                         return Err(AdapterError);
                     }
                 }
@@ -241,8 +244,11 @@ impl FleetStatePort {
                                 .hold(TransferEvent::NativePending { op }),
                         ));
                     }
-                    Err(InstallRefusal::Incompatible) => {
-                        tracing::debug!("fleet peer image declined: live index incompatible");
+                    Err(InstallRefusal::Incompatible(why)) => {
+                        tracing::info!(
+                            refusal = %why,
+                            "fleet peer image declined at install: live index incompatible"
+                        );
                         return Err(AdapterError);
                     }
                 }

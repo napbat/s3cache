@@ -21,10 +21,12 @@ const MAX_NATIVE_ID_BYTES: usize = 256;
 
 mod capture;
 mod delta;
+mod install;
 mod snapshot;
 mod stage;
-pub(crate) use capture::{FleetDonorImage, InstallRefusal, PendingFleetCapture};
+pub(crate) use capture::{FleetDonorImage, PendingFleetCapture};
 pub(super) use delta::{IndexDelta, encode_delete, encode_delta, encode_put};
+pub(crate) use install::InstallRefusal;
 pub(super) use snapshot::{measure_image, snapshot_state, tallied_size};
 pub(crate) use stage::FleetStage;
 
