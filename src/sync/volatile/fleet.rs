@@ -253,15 +253,16 @@ impl FleetStatePort {
             })
             .ok_or(AdapterError)
             .flatten();
-        match &captured {
-            Ok(_) => tracing::info!(
+        if captured.is_ok() {
+            tracing::info!(
                 rows = size.rows,
                 encoded_bytes = size.encoded_bytes,
                 decoded_charge = size.decoded_bytes,
                 capture_ms = started.elapsed().as_millis(),
                 "fleet donor image captured"
-            ),
-            Err(_) => tracing::debug!("fleet Ready recapture declined at its guarded finish"),
+            );
+        } else {
+            tracing::debug!("fleet Ready recapture declined at its guarded finish");
         }
         captured
     }

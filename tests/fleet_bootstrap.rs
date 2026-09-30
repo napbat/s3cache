@@ -1113,7 +1113,7 @@ async fn concurrent_start_follower_waits_for_a_slow_builder_and_lists_once() {
 /// production path: the donor's measured capture at C, the bulk transfer, and
 /// the joiner's guarded install.
 const PRODUCTION_ROWS: usize = 800_000;
-const PRODUCTION_READY_DEADLINE: Duration = Duration::from_secs(300);
+const PRODUCTION_READY_DEADLINE: Duration = Duration::from_mins(5);
 
 /// One page of `bucket` after `start_after`, as `(key, unquoted ETag, size)`,
 /// through the joiner.
