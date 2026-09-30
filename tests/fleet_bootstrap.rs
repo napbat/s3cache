@@ -1149,7 +1149,12 @@ async fn local_page(
 /// origin, then answers a page from deep in the keyspace exactly as one
 /// bounded origin LIST does. `RUST_LOG` overrides the fleet's info logs,
 /// which record the image's encoded bytes and the transfer time.
-#[tokio::test]
+///
+/// Both nodes share one multi-threaded runtime, as the binary runs. The
+/// capture at C holds the recovery fence for its whole clone, and each node's
+/// lease watcher reads that fence's state; on one thread a debug-build clone
+/// of this size would stall both nodes' gossip for over a second.
+#[tokio::test(flavor = "multi_thread")]
 async fn peer_bootstrap_transfers_a_production_scale_index() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

@@ -191,32 +191,46 @@ impl FleetStatePort {
             request.recovery_generation,
         )?;
         let prepared = capture::prepare(admission, id)?;
-        let pending = request
-            .guard
-            .capture(|generation| {
-                if generation != request.recovery_generation
-                    || !sync.mode_allows_local()
-                    || !self.listener_alive()
-                {
-                    return Err(AdapterError);
-                }
-                prepared.attach(
-                    &self.adapter.state,
-                    admission,
-                    request.members,
-                    &self.universe,
-                    request.clock,
-                    request.wake,
-                )
-            })
-            .ok_or(AdapterError)
-            .flatten()
-            .inspect_err(|_| {
-                tracing::debug!(
-                    "fleet Ready recapture declined at C: stale guard, local reads \
-                     closed, or the measured image is over a ceiling or admission"
-                );
-            })?;
+        // Measuring and cloning C hold the Ready guard's publication fence and
+        // the index write lock for as long as the bucket makes the clone
+        // (about 300 ms at 800k rows in release). The blocking pool runs that
+        // same critical section without stalling a runtime worker. A dropped
+        // waiter detaches it, and Drop of its result unlinks C again.
+        let guard = request.guard.clone();
+        let index = Arc::clone(&self.adapter.state);
+        let budget = admission.clone();
+        let universe = self.universe.clone();
+        let listener = Arc::clone(&self.listener_alive);
+        let local = Arc::clone(&sync);
+        let (generation, members, clock, wake) = (
+            request.recovery_generation,
+            request.members,
+            request.clock,
+            request.wake,
+        );
+        let pending = tokio::task::spawn_blocking(move || {
+            guard
+                .capture(|current| {
+                    if current != generation
+                        || !local.mode_allows_local()
+                        || !listener.load(Ordering::Acquire)
+                    {
+                        return Err(AdapterError);
+                    }
+                    prepared.attach(&index, &budget, members, &universe, clock, wake)
+                })
+                .ok_or(AdapterError)
+                .flatten()
+        })
+        .await
+        .map_err(|_| AdapterError)
+        .flatten()
+        .inspect_err(|_| {
+            tracing::debug!(
+                "fleet Ready recapture declined at C: stale guard, local reads \
+                 closed, or the measured image is over a ceiling or admission"
+            );
+        })?;
         let size = pending.size();
         let pending = capture::encode(pending, self.universe.clone()).await?;
         if !self
