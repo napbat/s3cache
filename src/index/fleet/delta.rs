@@ -255,9 +255,11 @@ mod tests {
             "older delete cannot remove live row"
         );
 
+        // The decode charge counts platform type sizes (a Linux `SystemTime` is twice
+        // Windows'), and this test is about replay order, not the budget.
         let caps = super::super::ImageCaps {
             bytes: 1024,
-            decoded_bytes: 8192,
+            decoded_bytes: 65_536,
             buckets: 1,
             rows: 2,
             name_bytes: 64,
