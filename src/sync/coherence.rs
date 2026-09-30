@@ -7,6 +7,7 @@ use groupnet::consistency::{
     AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, LeaseConfig, LeaseView, Leases,
     PeerWrite, PeerWrites, RenewalId, WriteFeed, WriteToken, advertised_head, applied_by_selected,
 };
+#[cfg(feature = "fleet")]
 use groupnet::core::volatile_bootstrap::journal::NativeCut;
 use groupnet::core::{NodeId, Status};
 use groupnet::runtime::{Group, Node};
@@ -14,10 +15,11 @@ use groupnet::transport::udp::UdpTransport;
 use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
-use crate::index::{
-    KeyIndex, ObjEntry, apply_del_native, apply_own_del, apply_own_put, apply_put_native,
-    standard_class,
-};
+use crate::index::{KeyIndex, ObjEntry, OwnPosition, apply_own_del, apply_own_put, standard_class};
+#[cfg(not(feature = "fleet"))]
+use crate::index::{apply_del, apply_put};
+#[cfg(feature = "fleet")]
+use crate::index::{apply_del_native, apply_put_native};
 use crate::metrics::Metrics;
 use crate::sync::volatile::CacheRecoveryAdapter;
 use crate::sync::wire::{
@@ -33,11 +35,14 @@ pub(super) const FEED_CAPACITY: usize = 4096;
 
 fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: IndexEvent) {
     let ts = from_micros(event.ts_us);
+    #[cfg(feature = "fleet")]
     let cut = NativeCut {
         writer: peer.as_str().as_bytes().to_vec(),
         epoch: token.epoch,
         sequence: token.seq,
     };
+    #[cfg(not(feature = "fleet"))]
+    let _ = (peer, token);
     match event.op {
         IndexOp::Put {
             size,
@@ -55,10 +60,16 @@ fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: I
                 content_type,
                 meta: None,
             };
+            #[cfg(feature = "fleet")]
             apply_put_native(state, &event.bucket, &event.key, entry, cut);
+            #[cfg(not(feature = "fleet"))]
+            apply_put(state, &event.bucket, &event.key, entry);
         }
         IndexOp::Del => {
+            #[cfg(feature = "fleet")]
             apply_del_native(state, &event.bucket, &event.key, ts, cut);
+            #[cfg(not(feature = "fleet"))]
+            apply_del(state, &event.bucket, &event.key, ts);
         }
     }
 }
@@ -364,8 +375,9 @@ pub struct WriteSync {
     /// `strong` mode, and a lock-free borrow plus one compare per request.
     lease_view: Option<LeaseView>,
     recovery: OnceLock<RecoveryHandle<CacheRecoveryAdapter>>,
-    /// The peer-bootstrap TCP listener lives with this exact recovery handle; a
+    /// The opt-in TCP listener lives with this exact recovery handle; a
     /// dropped node cannot keep accepting requests for a retired claim.
+    #[cfg(feature = "fleet")]
     pub(crate) fleet_listener: OnceLock<crate::sync::volatile::fleet::FleetListenerGuard>,
     /// The deadline the coherence wait gets: one lease duration (the longest a
     /// silent holder's lapse can take) plus [`WRITE_WAIT_SLACK`].
@@ -420,6 +432,7 @@ impl WriteSync {
             leases,
             lease_view: lease_view.clone(),
             recovery: OnceLock::new(),
+            #[cfg(feature = "fleet")]
             fleet_listener: OnceLock::new(),
             write_wait: lease.duration + WRITE_WAIT_SLACK,
             _node: node,
@@ -646,13 +659,21 @@ impl WriteSync {
 
     /// This node's feed writer at its last assigned position (zero before its first
     /// write). Called under the index lock, so it is exactly the write just assigned.
-    fn own_position(&self) -> NativeCut {
+    #[cfg(feature = "fleet")]
+    fn own_position(&self) -> OwnPosition {
         NativeCut {
             writer: self.me.as_str().as_bytes().to_vec(),
             epoch: self.feed.epoch(),
             sequence: self.feed.last_token().map_or(0, |token| token.seq),
         }
     }
+
+    #[cfg(not(feature = "fleet"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "one call shape with the fleet build, whose position reads this feed"
+    )]
+    fn own_position(&self) -> OwnPosition {}
 
     async fn advertised(
         &self,
@@ -879,6 +900,7 @@ impl WriteSync {
         let _ = self.view.set(view);
         // Declare this node's feed writer before any capture can start, at
         // its current position (zero for a feed with no writes yet).
+        #[cfg(feature = "fleet")]
         state.register_native_writer(&self.own_position());
         if let Some(leases) = &self.leases {
             let weak = Arc::downgrade(self);

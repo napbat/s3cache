@@ -10,8 +10,8 @@ const MAX_ADDRESS_BYTES: usize = 512;
 const MAX_BUCKETS: usize = 4_096;
 const MAX_SCOPE_BYTES: usize = 8_192;
 
-/// TCP listener and complete peer book for peer index bootstrap. A process
-/// without one runs ordinary UDP coherence on guarded origin recovery.
+/// TCP listener and complete peer book for explicitly enabled fleet
+/// bootstrap. Ordinary UDP coherence does not construct one.
 #[derive(Clone, Debug)]
 pub struct FleetConfig {
     pub(crate) bind: SocketAddr,
@@ -22,7 +22,7 @@ pub struct FleetConfig {
     pub(crate) peers: Vec<(String, String)>,
 }
 
-/// Why a supplied peer book declines peer transfer. The caller keeps
+/// Why an opt-in fleet configuration declines peer transfer. The caller keeps
 /// ordinary guarded origin recovery available.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FleetConfigError {
@@ -36,8 +36,8 @@ pub enum FleetConfigError {
 }
 
 impl FleetConfig {
-    /// Validate the deployment's peer book. Missing all four values leaves
-    /// peer bootstrap unconfigured; a partial configuration fails visibly.
+    /// Validate an explicit opt-in configuration. Missing all four values
+    /// leaves fleet mode disabled; a partial configuration fails visibly.
     ///
     /// # Errors
     /// Rejects a missing, duplicate, oversized, or incompatible peer book or

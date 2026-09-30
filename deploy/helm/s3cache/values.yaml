@@ -81,12 +81,12 @@ gossip:
   # lengthens the freeze a single unresponsive pod costs every reader. Empty = 2000.
   leaseMs: ""
 
-# Peer index bootstrap: whenever upstream.buckets is set, a joining pod copies a
-# ready peer's verified index over this TCP port instead of listing the origin,
-# and falls back to one guarded origin scan only when no peer can supply one.
-# originId names the origin account the index belongs to; every ordinal shares
-# it. Empty = "<namespace>/<release>", right for one StatefulSet per origin.
+# Peer index bootstrap is compiled into the standard image but remains off at
+# runtime unless explicitly enabled. Every ordinal needs the same nonsecret
+# origin account/endpoint identity and exact configured bucket inventory.
+# The headless service publishes each pod's TCP endpoint before readiness.
 fleet:
+  enabled: false
   port: 7950
   originId: ""
 

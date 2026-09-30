@@ -40,6 +40,7 @@ pub mod coherence;
 pub mod config;
 /// Durable, scoped control-source slots; not yet connected to serving or writes.
 pub mod control;
+#[cfg(feature = "fleet")]
 pub mod fleet;
 pub(crate) mod volatile;
 pub(crate) mod wire;

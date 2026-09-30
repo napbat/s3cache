@@ -385,6 +385,7 @@ pub struct CachingProxy {
     index_scan: ScanConfig,
     recovery_config: Option<groupnet::consistency::volatile_recovery::RecoveryConfig>,
     recovery_rearm: Option<groupnet::consistency::volatile_recovery::RecoveryRearm>,
+    #[cfg(feature = "fleet")]
     fleet: Option<crate::sync::fleet::config::FleetConfig>,
     #[cfg(test)]
     pub(super) read_return_pause: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
@@ -428,6 +429,7 @@ impl CachingProxy {
             index_scan: ScanConfig::default(),
             recovery_config: None,
             recovery_rearm: None,
+            #[cfg(feature = "fleet")]
             fleet: None,
             #[cfg(test)]
             read_return_pause: Arc::new(std::sync::Mutex::new(None)),
@@ -479,6 +481,7 @@ impl CachingProxy {
 
     /// Opt in to a bounded peer index bootstrap without changing the default
     /// guarded origin recovery path.
+    #[cfg(feature = "fleet")]
     #[must_use]
     pub fn with_fleet_config(mut self, config: crate::sync::fleet::config::FleetConfig) -> Self {
         self.fleet = Some(config);
@@ -499,6 +502,7 @@ impl CachingProxy {
     /// Bind the optional TCP data plane before the recovery worker and native
     /// feed applier start. A failed bind opens ordinary guarded origin
     /// recovery, leaving no peer-ready claim or origin control object.
+    #[cfg(feature = "fleet")]
     pub async fn start_fleet_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
         sync.open_fleet_recovery(self.recovery_inputs(buckets))
@@ -516,6 +520,7 @@ impl CachingProxy {
             metrics: self.metrics.clone(),
             config: self.recovery_config,
             rearm: self.recovery_rearm,
+            #[cfg(feature = "fleet")]
             fleet: self.fleet.clone(),
         }
     }

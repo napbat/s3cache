@@ -22,12 +22,14 @@ use std::time::{Duration, SystemTime};
 
 use crate::list_token;
 use crate::tier::CachedObject;
+#[cfg(feature = "fleet")]
 use groupnet::core::volatile_bootstrap::journal::{DeltaIdentity, NativeCut};
 use s3s::dto::{
     CommonPrefix, ETag, HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output, Metadata,
     Object, ObjectStorageClass, Timestamp,
 };
 
+#[cfg(feature = "fleet")]
 pub(crate) mod fleet;
 mod scan;
 pub use scan::ScanConfig;
@@ -224,7 +226,9 @@ impl IndexStats {
 struct KeyIndexState {
     buckets: HashMap<String, BucketState>,
     stats: IndexStats,
+    #[cfg(feature = "fleet")]
     capture: Option<fleet::IndexCapture>,
+    #[cfg(feature = "fleet")]
     native_cuts: BTreeMap<Vec<u8>, (u64, u64)>,
 }
 
@@ -259,6 +263,7 @@ impl KeyIndex {
     /// Remove a bucket and its complete contribution to the aggregate gauges.
     pub(crate) fn remove_bucket(&self, bucket: &str) {
         let mut index = self.inner.write().unwrap();
+        #[cfg(feature = "fleet")]
         if index.buckets.contains_key(bucket) {
             index.invalidate_capture_for_rebuild();
         }
@@ -344,6 +349,33 @@ enum PutAuthority {
     Observation,
 }
 
+/// Journal identity of one index effect; there is no journal without `fleet`.
+#[cfg(feature = "fleet")]
+type EffectIdentity = DeltaIdentity;
+#[cfg(not(feature = "fleet"))]
+type EffectIdentity = ();
+
+/// This node's feed position for one own write: a native cut of its own
+/// writer when fleet journaling is built, otherwise nothing to record.
+#[cfg(feature = "fleet")]
+pub(crate) type OwnPosition = NativeCut;
+#[cfg(not(feature = "fleet"))]
+pub(crate) type OwnPosition = ();
+
+#[cfg(feature = "fleet")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shares the optional identity shape with the non-fleet build"
+)]
+fn own_identity(position: OwnPosition) -> Option<EffectIdentity> {
+    Some(DeltaIdentity::Native(position))
+}
+
+#[cfg(not(feature = "fleet"))]
+fn own_identity((): OwnPosition) -> Option<EffectIdentity> {
+    None
+}
+
 /// Applies a definitive put (a local write or a peer's feed event) by per-key
 /// last-writer-wins: a strictly newer entry or an
 /// equal-or-newer tombstone rejects it; ties between puts fall to
@@ -374,7 +406,7 @@ pub(crate) fn apply_own_put<R>(
     bucket: &str,
     key: &str,
     entry: ObjEntry,
-    assign: impl FnOnce() -> (R, NativeCut),
+    assign: impl FnOnce() -> (R, OwnPosition),
 ) -> (bool, R) {
     let mut assigned = None;
     let changed = apply_put_with_authority(
@@ -386,7 +418,7 @@ pub(crate) fn apply_own_put<R>(
         || {
             let (value, position) = assign();
             assigned = Some(value);
-            Some(DeltaIdentity::Native(position))
+            own_identity(position)
         },
     );
     (
@@ -397,6 +429,7 @@ pub(crate) fn apply_own_put<R>(
 
 /// Apply a native feed put and advance its exact writer cut under the same
 /// index publication lock, including a Noop for a rejected older event.
+#[cfg(feature = "fleet")]
 pub(crate) fn apply_put_native(
     state: &KeyIndex,
     bucket: &str,
@@ -433,16 +466,20 @@ fn apply_put_with_authority(
     key: &str,
     entry: ObjEntry,
     authority: PutAuthority,
-    identity: impl FnOnce() -> Option<DeltaIdentity>,
+    identity: impl FnOnce() -> Option<EffectIdentity>,
 ) -> bool {
     let ts = entry.last_modified;
     let mut index = state.inner.write().unwrap();
     let identity = identity();
+    #[cfg(not(feature = "fleet"))]
+    let _ = identity;
+    #[cfg(feature = "fleet")]
     if let Some(DeltaIdentity::Native(cut)) = &identity
         && !index.note_native_cut(cut)
     {
         return false;
     }
+    #[cfg(feature = "fleet")]
     if !index.buckets.contains_key(bucket) {
         // The donor's complete whole-index universe was fixed at C. A new
         // bucket cannot be made present by appending one key delta to it.
@@ -451,6 +488,7 @@ fn apply_put_with_authority(
     let KeyIndexState {
         buckets,
         stats,
+        #[cfg(feature = "fleet")]
         capture,
         ..
     } = &mut *index;
@@ -459,18 +497,21 @@ fn apply_put_with_authority(
     let first_rebuild_mutation =
         definitive && b.rebuild_generation.is_some() && !b.rebuild_touched.contains(key);
     if !first_rebuild_mutation && b.gone.get(key).is_some_and(|dead| *dead >= ts) {
+        #[cfg(feature = "fleet")]
         if let (Some(capture), Some(identity)) = (capture.as_mut(), identity) {
             capture.record_native_noop(identity);
         }
         return false; // deletes win ties: never resurrect
     }
     if !first_rebuild_mutation && b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
+        #[cfg(feature = "fleet")]
         if let (Some(capture), Some(identity)) = (capture.as_mut(), identity) {
             capture.record_native_noop(identity);
         }
         return false; // a newer put is already indexed
     }
     if !definitive && b.rebuild_touched.contains(key) {
+        #[cfg(feature = "fleet")]
         if let (Some(capture), Some(identity)) = (capture.as_mut(), identity) {
             capture.record_native_noop(identity);
         }
@@ -492,6 +533,7 @@ fn apply_put_with_authority(
             b.rebuild_touched.insert(key.to_owned());
         }
     }
+    #[cfg(feature = "fleet")]
     if let Some(capture) = capture.as_mut()
         && let Some(entry) = b.keys.get(key)
     {
@@ -505,6 +547,7 @@ fn apply_put_with_authority(
 /// is never reused by a later fence.
 pub(crate) fn fence_uncertain_key(state: &KeyIndex, bucket: &str, key: &str) -> u64 {
     let mut index = state.inner.write().unwrap();
+    #[cfg(feature = "fleet")]
     index.invalidate_capture_for_rebuild();
     let bucket = index.buckets.entry(bucket.to_owned()).or_default();
     let token = bucket
@@ -594,6 +637,7 @@ pub(crate) fn resolve_uncertain_key(
 /// newer definitive mutation can resolve them. Returns the new rebuild generation.
 pub(crate) fn begin_bucket_resync(state: &KeyIndex, bucket: &str) -> u64 {
     let mut index = state.inner.write().unwrap();
+    #[cfg(feature = "fleet")]
     index.invalidate_capture_for_rebuild();
     let KeyIndexState { buckets, stats, .. } = &mut *index;
     let previous = buckets.remove(bucket).unwrap_or_default();
@@ -656,13 +700,13 @@ pub(crate) fn apply_own_del<R>(
     bucket: &str,
     key: &str,
     ts: SystemTime,
-    assign: impl FnOnce() -> (R, NativeCut),
+    assign: impl FnOnce() -> (R, OwnPosition),
 ) -> (bool, R) {
     let mut assigned = None;
     let removed = apply_del_with_identity(state, bucket, key, ts, || {
         let (value, position) = assign();
         assigned = Some(value);
-        Some(DeltaIdentity::Native(position))
+        own_identity(position)
     });
     (
         removed,
@@ -670,6 +714,7 @@ pub(crate) fn apply_own_del<R>(
     )
 }
 
+#[cfg(feature = "fleet")]
 pub(crate) fn apply_del_native(
     state: &KeyIndex,
     bucket: &str,
@@ -685,21 +730,26 @@ fn apply_del_with_identity(
     bucket: &str,
     key: &str,
     ts: SystemTime,
-    identity: impl FnOnce() -> Option<DeltaIdentity>,
+    identity: impl FnOnce() -> Option<EffectIdentity>,
 ) -> bool {
     let mut index = state.inner.write().unwrap();
     let identity = identity();
+    #[cfg(not(feature = "fleet"))]
+    let _ = identity;
+    #[cfg(feature = "fleet")]
     if let Some(DeltaIdentity::Native(cut)) = &identity
         && !index.note_native_cut(cut)
     {
         return false;
     }
+    #[cfg(feature = "fleet")]
     if !index.buckets.contains_key(bucket) {
         index.invalidate_capture_for_rebuild();
     }
     let KeyIndexState {
         buckets,
         stats,
+        #[cfg(feature = "fleet")]
         capture,
         ..
     } = &mut *index;
@@ -709,6 +759,7 @@ fn apply_del_with_identity(
     if b.gone.len() > TOMBSTONE_PRUNE_LEN
         && let Some(cutoff) = ts.checked_sub(TOMBSTONE_TTL)
     {
+        #[cfg(feature = "fleet")]
         if let Some(capture) = capture.as_ref() {
             capture.invalidate(groupnet::core::volatile_bootstrap::journal::Invalidation::Rebuild);
         }
@@ -720,6 +771,7 @@ fn apply_del_with_identity(
         *dead = ts;
     }
     if !first_rebuild_mutation && b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
+        #[cfg(feature = "fleet")]
         if let Some(capture) = capture.as_mut() {
             if b.gone.get(key).copied() != prior_tombstone {
                 capture.record_delete(identity, bucket, key, *b.gone.get(key).unwrap());
@@ -730,6 +782,7 @@ fn apply_del_with_identity(
         return false; // the key was rewritten after this delete
     }
     if newer_tombstone {
+        #[cfg(feature = "fleet")]
         if let Some(capture) = capture.as_mut() {
             if b.gone.get(key).copied() != prior_tombstone {
                 capture.record_delete(identity, bucket, key, *b.gone.get(key).unwrap());
@@ -754,6 +807,7 @@ fn apply_del_with_identity(
     } else {
         false
     };
+    #[cfg(feature = "fleet")]
     if let Some(capture) = capture.as_mut() {
         let changed = removed || b.gone.get(key).copied() != prior_tombstone;
         if changed {
@@ -762,6 +816,8 @@ fn apply_del_with_identity(
             capture.record_native_noop(identity);
         }
     }
+    #[cfg(not(feature = "fleet"))]
+    let _ = prior_tombstone;
     removed
 }
 
@@ -775,11 +831,13 @@ pub(crate) fn complete_entry(
     key: &str,
     fill: EntryFill,
 ) -> Completion {
+    #[cfg(feature = "fleet")]
     let bucket_name = bucket;
     let mut index = state.inner.write().unwrap();
     let KeyIndexState {
         buckets,
         stats,
+        #[cfg(feature = "fleet")]
         capture,
         ..
     } = &mut *index;
@@ -810,6 +868,7 @@ pub(crate) fn complete_entry(
     if filled {
         let current = IndexStats::for_entry(entry);
         account_replacement(bucket, stats, previous, current);
+        #[cfg(feature = "fleet")]
         if let Some(capture) = capture.as_mut()
             && let Some(entry) = bucket.keys.get(key)
         {
@@ -992,6 +1051,7 @@ fn sync_listing_into_generation(
     rows: impl IntoIterator<Item = (String, ObjEntry)>,
 ) -> Option<usize> {
     let mut index = state.inner.write().unwrap();
+    #[cfg(feature = "fleet")]
     index.invalidate_capture_for_rebuild();
     let KeyIndexState { buckets, stats, .. } = &mut *index;
     let b = buckets.entry(bucket.to_owned()).or_default();
