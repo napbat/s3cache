@@ -1106,6 +1106,247 @@ async fn concurrent_start_follower_waits_for_a_slow_builder_and_lists_once() {
     assert!(origin.ops.writes().is_empty(), "no origin control writes");
 }
 
+/// A production bucket lists at about 1.5 pages a second: 793k rows took 8.5
+/// minutes. 300 pages at 650 ms keep the builder's scan over three minutes,
+/// past the unshrunk production bounds it must outlive: the 60 s claim
+/// episode, the 30 s donor wait and the 60 s recovery attempt.
+const PACED_ROWS: usize = 300_000;
+const PACED_PAGE: Duration = Duration::from_millis(650);
+const PACED_READY_DEADLINE: Duration = Duration::from_mins(10);
+
+/// When one node first counted an origin scan and first served locally,
+/// from the pair's common start.
+#[derive(Clone, Copy, Debug, Default)]
+struct Milestones {
+    scanned: Option<Duration>,
+    ready: Option<Duration>,
+}
+
+/// One node on a runtime of its own with one worker thread, as the binary's
+/// `#[tokio::main]` runs in a pod limited to one CPU.
+struct Pod(Option<tokio::runtime::Runtime>);
+
+impl Pod {
+    fn new(name: &str) -> Self {
+        Self(Some(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name(name)
+                .enable_all()
+                .build()
+                .expect("pod runtime"),
+        ))
+    }
+
+    fn handle(&self) -> tokio::runtime::Handle {
+        self.0.as_ref().expect("live pod runtime").handle().clone()
+    }
+
+    /// Hold the pod's only worker for `pause`: its timers, gossip and
+    /// bootstrap worker all run late, as on a throttled, overloaded node.
+    fn stall(&self, pause: Duration) {
+        drop(
+            self.handle()
+                .spawn(async move { std::thread::sleep(pause) }),
+        );
+    }
+}
+
+impl Drop for Pod {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// Build one fleet node on `pod`, so every task it spawns runs there.
+async fn pod_node(
+    pod: &Pod,
+    origin: &Arc<Origin>,
+    (name, udp): (&str, u16),
+    (peer, peer_udp): (&str, u16),
+    ports: [(&'static str, u16); 2],
+    metrics: &Arc<Metrics>,
+) -> (Arc<WriteSync>, CachingProxy) {
+    let (origin, metrics) = (Arc::clone(origin), Arc::clone(metrics));
+    let (name, peer) = (name.to_owned(), peer.to_owned());
+    pod.handle()
+        .spawn(async move {
+            let sync = gossip_node(&name, udp, &[(peer.as_str(), peer_udp)]).await;
+            let proxy = proxy_over_with_metrics(
+                &origin.counted_client(),
+                CAP,
+                Some(Arc::clone(&sync)),
+                &metrics,
+            )
+            .with_index_scan(SERIAL_SCAN)
+            .with_fleet_config(fleet_config(&origin, origin.bucket(), &name, &ports));
+            (sync, proxy)
+        })
+        .await
+        .expect("pod node construction")
+}
+
+/// Record each node's first origin scan and first local service until both
+/// serve locally or the deadline passes. Once a builder scans, stall the
+/// pods in turn, the follower first, per `[follower pause, builder pause,
+/// period]` in ms. Returns whether both finished, the milestones, and the
+/// number of stalls.
+async fn watch_paced_pair(
+    pods: &[Pod; 2],
+    nodes: [&CachingProxy; 2],
+    metrics: &[Arc<Metrics>; 2],
+    bucket: &str,
+    started: Instant,
+    stalls: [u64; 3],
+) -> (bool, [Milestones; 2], usize) {
+    let mut seen = [Milestones::default(); 2];
+    let mut next_stall = None;
+    let mut stalled = 0_usize;
+    let finished = tokio::time::timeout(PACED_READY_DEADLINE, async {
+        loop {
+            for (index, node) in nodes.iter().enumerate() {
+                if seen[index].scanned.is_none()
+                    && counter(&metrics[index], "recovery_origin_scans") > 0
+                {
+                    seen[index].scanned = Some(started.elapsed());
+                }
+                if seen[index].ready.is_none() && serves_locally(node, bucket) {
+                    seen[index].ready = Some(started.elapsed());
+                }
+            }
+            if seen.iter().all(|node| node.ready.is_some()) {
+                return;
+            }
+            if let Some(builder) = seen.iter().position(|node| node.scanned.is_some())
+                && seen[builder].ready.is_none()
+            {
+                let due =
+                    *next_stall.get_or_insert(Instant::now() + Duration::from_millis(stalls[2]));
+                if Instant::now() >= due {
+                    // Alternate: the follower, then the builder.
+                    let (pod, pause) = if stalled.is_multiple_of(2) {
+                        (&pods[1 - builder], stalls[0])
+                    } else {
+                        (&pods[builder], stalls[1])
+                    };
+                    if pause > 0 {
+                        pod.stall(Duration::from_millis(pause));
+                    }
+                    stalled += 1;
+                    next_stall = Some(due + Duration::from_millis(stalls[2] / 2));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok();
+    (finished, seen, stalled)
+}
+
+/// Two nodes restart together with the binary's own recovery and claim
+/// configuration, strong consistency and the default 2 s lease, against a
+/// production-paced origin. The builder's scan outlasts every fixed bound;
+/// the follower waits for all of it, then installs the builder's Ready
+/// capture. The pair pays exactly one pass of LIST pages.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "s3cache::sync::volatile=info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+    // Load as on the production node: after the scan starts, one pod's only
+    // worker is held for 1.5 s every 5 s, alternating follower and builder.
+    // That is past the 1 s observation bound and long enough for the
+    // membership layer to suspect the held pod, but inside the 2 s lease
+    // and the 3 s claim TTL. [follower pause, builder pause, period] in ms.
+    let stalls: [u64; 3] = [1_500, 1_500, 10_000];
+    let origin = Origin::start("fleet-paced-builder").await;
+    origin.serve_synthetic_listing(PACED_ROWS);
+    origin.delay_lists(PACED_PAGE);
+    let bucket = origin.bucket().to_owned();
+    let ports = [
+        ("fleet-paced-a", free_tcp_port()),
+        ("fleet-paced-b", free_tcp_port()),
+    ];
+    let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
+    let pods = [Pod::new("fleet-paced-a"), Pod::new("fleet-paced-b")];
+    let metrics = [Arc::new(Metrics::default()), Arc::new(Metrics::default())];
+    let (a_sync, a) = pod_node(
+        &pods[0],
+        &origin,
+        ("fleet-paced-a", a_udp),
+        ("fleet-paced-b", b_udp),
+        ports,
+        &metrics[0],
+    )
+    .await;
+    let (b_sync, b) = pod_node(
+        &pods[1],
+        &origin,
+        ("fleet-paced-b", b_udp),
+        ("fleet-paced-a", a_udp),
+        ports,
+        &metrics[1],
+    )
+    .await;
+    mutual_alive(&a_sync, "fleet-paced-a", &b_sync, "fleet-paced-b").await;
+    let before = Counts::take(&origin);
+    let started = Instant::now();
+    let starts = [(&pods[0], &a), (&pods[1], &b)].map(|(pod, node)| {
+        let (node, bucket) = (node.clone(), bucket.clone());
+        pod.handle().spawn(async move {
+            node.start_fleet_coherence(std::slice::from_ref(&bucket))
+                .await;
+        })
+    });
+    for start in starts {
+        start.await.expect("fleet coherence started");
+    }
+    let (finished, seen, stalled) =
+        watch_paced_pair(&pods, [&a, &b], &metrics, &bucket, started, stalls).await;
+    let cost = Counts::take(&origin).since(before);
+    let scans = metrics
+        .each_ref()
+        .map(|metrics| counter(metrics, "recovery_origin_scans"));
+    let rows = metrics.each_ref().map(|metrics| indexed_rows(metrics));
+    let report = format!("seen={seen:?} scans={scans:?} rows={rows:?} stalls={stalled} {cost:?}");
+    assert!(finished, "both nodes serve locally in time: {report}");
+    assert_eq!(
+        scans.iter().sum::<u64>(),
+        1,
+        "exactly one origin scan across the pair: {report}"
+    );
+    let builder = usize::from(scans[1] == 1);
+    let follower = 1 - builder;
+    let built = seen[builder].ready.expect("the builder served locally");
+    assert!(
+        built > Duration::from_mins(3),
+        "the builder's scan outlasts three minutes and every fixed bound: {report}"
+    );
+    assert!(
+        seen[follower].ready.expect("the follower served locally") >= built,
+        "the follower waited for the whole scan: {report}"
+    );
+    assert_eq!(
+        cost.list,
+        PACED_ROWS.div_ceil(1000) as u64,
+        "one pass of LIST pages; the follower installed with none: {report}"
+    );
+    assert_eq!(cost.list, cost.successful_list);
+    assert_eq!(
+        rows, [PACED_ROWS as u64; 2],
+        "the follower installed the builder's Ready capture: {report}"
+    );
+    cost.assert_no_writes();
+    println!("fleet_bootstrap paced_builder {report}");
+}
+
 /// The production index has about 798,000 rows, eight times the old 100,000-row
 /// image cap. `MinIO` cannot be seeded with that many objects in test time, so
 /// the counting forwarder answers the donor's LIST pages from a synthetic

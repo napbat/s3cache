@@ -181,7 +181,7 @@ impl FleetStatePort {
                 )
                 .await
         {
-            tracing::debug!("fleet Ready recapture declined: source roster changed");
+            tracing::info!("fleet Ready recapture declined: source roster changed");
             return Err(AdapterError);
         }
         let started = Instant::now();
@@ -226,7 +226,7 @@ impl FleetStatePort {
         .map_err(|_| AdapterError)
         .flatten()
         .inspect_err(|_| {
-            tracing::debug!(
+            tracing::info!(
                 "fleet Ready recapture declined at C: stale guard, local reads \
                  closed, or the measured image is over a ceiling or admission"
             );
@@ -237,7 +237,7 @@ impl FleetStatePort {
             .source_matches_pending(request.operation, &pending, admission, request.deadline)
             .await
         {
-            tracing::debug!("fleet Ready recapture declined: roster changed while encoding");
+            tracing::info!("fleet Ready recapture declined: roster changed while encoding");
             return Err(AdapterError);
         }
         let captured = request
@@ -262,7 +262,7 @@ impl FleetStatePort {
                 "fleet donor image captured"
             );
         } else {
-            tracing::debug!("fleet Ready recapture declined at its guarded finish");
+            tracing::info!("fleet Ready recapture declined at its guarded finish");
         }
         captured
     }

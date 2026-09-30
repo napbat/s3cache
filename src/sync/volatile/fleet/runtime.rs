@@ -13,6 +13,9 @@ use groupnet::consistency::volatile_recovery::bootstrap::bulk_wire::{
 };
 use groupnet::consistency::volatile_recovery::bootstrap::native_claims::NativeClaimSource;
 use groupnet::consistency::volatile_recovery::bootstrap::ports::BootstrapCapabilities;
+use groupnet::consistency::volatile_recovery::bootstrap::report::{
+    BootstrapDecision, BootstrapObserver,
+};
 use groupnet::consistency::volatile_recovery::bootstrap::session::{
     BootstrapRuntimeConfig, BootstrapSession,
 };
@@ -42,6 +45,36 @@ impl Drop for FleetListenerGuard {
     fn drop(&mut self) {
         self.shutdown.send_replace(true);
         self.task.abort();
+    }
+}
+
+/// Logs each peer-bootstrap decision at info: whether this node waits for a
+/// peer's image, why it stopped waiting (which may cost an origin scan), and
+/// whether its own finished image was offered to peers.
+#[derive(Debug)]
+struct DecisionLog;
+
+impl BootstrapObserver for DecisionLog {
+    fn decided(&self, decision: &BootstrapDecision) {
+        match decision {
+            BootstrapDecision::Following { builder } => tracing::info!(
+                builder = %builder.node,
+                attempt = builder.attempt,
+                "fleet bootstrap following a peer's build"
+            ),
+            BootstrapDecision::Released { builder, reason } => tracing::info!(
+                builder = %builder.node,
+                attempt = builder.attempt,
+                ?reason,
+                "fleet bootstrap stopped waiting for a peer's image"
+            ),
+            BootstrapDecision::RecaptureStarted { donor } => {
+                tracing::info!(attempt = donor.attempt, "fleet Ready recapture started");
+            }
+            BootstrapDecision::RecaptureDeclined { reason } => {
+                tracing::info!(?reason, "fleet Ready recapture declined");
+            }
+        }
     }
 }
 
@@ -240,7 +273,7 @@ pub(in crate::sync::volatile) async fn open_recovery(
         "bulk listener",
         BootstrapBulkListener::new(plane, sender, budget, limits).ok(),
     )?;
-    let bootstrap = Box::new(child);
+    let bootstrap = Box::new(child.with_observer(Arc::new(DecisionLog)));
     let handle = if let Some(rearm) = prepared.rearm {
         RecoveryHandle::open_with_bootstrap_and_rearm(
             Arc::clone(&prepared.adapter),
