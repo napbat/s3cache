@@ -21,7 +21,7 @@ blake3 = "1.8.5"
 bytes = { version = "1", features = ["serde"] }
 futures = "0.3"
 getrandom = "0.4"
-groupnet = { git = "https://github.com/napbat/groupnet", rev = "0378b33629181df4a4cdc50570a1abdb51afaa3d", features = ["consistency-leases", "consistency-volatile-recovery", "consistency-volatile-bootstrap-bulk", "tcp", "udp"] }
+groupnet = { git = "https://github.com/napbat/groupnet", rev = "69f9b5d525c395951b62406e4d0e980a920fd0ae", features = ["consistency-leases", "consistency-volatile-recovery", "consistency-volatile-bootstrap-bulk", "tcp", "udp"] }
 http = "1"
 http-body-util = "0.1"
 # Already under hyper-util/s3s; direct so the metrics endpoint can build its own responses.

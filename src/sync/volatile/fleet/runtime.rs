@@ -50,9 +50,10 @@ impl Drop for FleetListenerGuard {
 }
 
 /// Logs each peer-bootstrap decision at info: whether this node waits for a
-/// peer's image, why it stopped waiting (which may cost an origin scan), and
-/// whether its own finished image was offered to peers. Each Ready recapture
-/// started is also counted.
+/// peer's image, why it stopped waiting (which may cost an origin scan, and
+/// includes an aborted transfer from a Ready donor), why the session ended
+/// without an image, and whether its own finished image was offered to peers.
+/// Each Ready recapture started is also counted.
 struct DecisionLog(Arc<Metrics>);
 
 impl std::fmt::Debug for DecisionLog {
@@ -81,6 +82,9 @@ impl BootstrapObserver for DecisionLog {
             }
             BootstrapDecision::RecaptureDeclined { reason } => {
                 tracing::info!(?reason, "fleet Ready recapture declined");
+            }
+            BootstrapDecision::Declined { reason } => {
+                tracing::info!(?reason, "fleet bootstrap declined; recovering from origin");
             }
         }
     }

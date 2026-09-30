@@ -9,8 +9,8 @@ use groupnet::consistency::{
     CAP_LEASE, FrontierView, WriteToken, checked_advertised_head,
     volatile_recovery::{
         AdapterError, BoxRecoveryFuture, Mark, Peer, PeerObservation, PublicationPermit,
-        RecoveryAdapter, RecoveryConfig, RecoveryHandle, RecoveryMode, RecoveryOperation,
-        RecoveryRearm,
+        RecoveryAdapter, RecoveryConfig, RecoveryFallback, RecoveryHandle, RecoveryMode,
+        RecoveryOperation, RecoveryRearm, RecoveryStage,
     },
 };
 use groupnet::core::{NodeId, Status};
@@ -240,6 +240,10 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
         if let Some(sync) = self.sync.upgrade() {
             sync.require_lease_resync();
         }
+    }
+
+    fn fell_back(&self, from: RecoveryStage, reason: RecoveryFallback) {
+        tracing::info!(?from, ?reason, "recovery fell back");
     }
 
     fn invalidate(

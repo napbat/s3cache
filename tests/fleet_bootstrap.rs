@@ -109,15 +109,30 @@ fn fleet_config(origin: &Origin, bucket: &str, name: &str, ports: &[(&str, u16)]
         .iter()
         .find_map(|(peer, port)| (*peer == name).then_some(*port))
         .expect("node in the complete fleet address book");
-    let address = format!("127.0.0.1:{port}");
-    let book = ports
+    fleet_config_bound(origin, bucket, name, port, ports)
+}
+
+/// `name` listens on `bind` but peers dial it at its `book` address, which a
+/// test relay may own.
+fn fleet_config_bound(
+    origin: &Origin,
+    bucket: &str,
+    name: &str,
+    bind: u16,
+    book: &[(&str, u16)],
+) -> FleetConfig {
+    let advertise = book
+        .iter()
+        .find_map(|(peer, port)| (*peer == name).then(|| format!("127.0.0.1:{port}")))
+        .expect("node in the complete fleet address book");
+    let book = book
         .iter()
         .map(|(peer, port)| format!("{peer}=127.0.0.1:{port}"))
         .collect::<Vec<_>>()
         .join(",");
     FleetConfig::parse(
-        Some(address.clone()),
-        Some(address),
+        Some(format!("127.0.0.1:{bind}")),
+        Some(advertise),
         Some(book),
         Some("minio-fleet-cost-fixture".to_owned()),
         origin.counted_endpoint(),
@@ -1123,6 +1138,20 @@ const PACED_SETTLE: Duration = Duration::from_secs(15);
 /// alone must never add more.
 const PACED_RETRIES: u64 = 1;
 
+/// Load as on the production node, as `[follower pause, builder pause,
+/// period]` in ms: after the scan starts, one pod's only worker is held for
+/// 1.5 s at each stall, alternating follower and builder, until the follower
+/// has installed and the pair has run on for a while. That is past the 1 s
+/// observation bound and long enough for the membership layer to suspect the
+/// held pod, but inside the 2 s lease and the 3 s claim TTL.
+const PRODUCTION_LOAD: [u64; 3] = [1_500, 1_500, 10_000];
+
+/// Lighter load for a transfer paced past the donor wait: each hold stays
+/// well inside the 2 s lease. A 1.5 s hold on the builder lapses its lease
+/// now and then, and each lapse retires the Ready capture a minute-long
+/// transfer reads; this test prices the transfer's own bounds, not recapture.
+const TRANSFER_LOAD: [u64; 3] = [500, 500, 10_000];
+
 /// When one node first counted an origin scan and first served locally,
 /// from the pair's common start.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1169,14 +1198,17 @@ impl Drop for Pod {
     }
 }
 
-/// Build one fleet node on `pod`, so every task it spawns runs there.
+/// Build one fleet node on `pod`, so every task it spawns runs there. It
+/// listens for bulk transfers on `bind`; peers dial it at its `book` address.
+/// `None` keeps the binary's own recovery configuration.
 async fn pod_node(
     pod: &Pod,
     origin: &Arc<Origin>,
-    (name, udp): (&str, u16),
+    (name, udp, bind): (&str, u16, u16),
     (peer, peer_udp): (&str, u16),
-    ports: [(&'static str, u16); 2],
+    book: [(&'static str, u16); 2],
     metrics: &Arc<Metrics>,
+    recovery: Option<RecoveryConfig>,
 ) -> (Arc<WriteSync>, CachingProxy) {
     let (origin, metrics) = (Arc::clone(origin), Arc::clone(metrics));
     let (name, peer) = (name.to_owned(), peer.to_owned());
@@ -1190,7 +1222,19 @@ async fn pod_node(
                 &metrics,
             )
             .with_index_scan(SERIAL_SCAN)
-            .with_fleet_config(fleet_config(&origin, origin.bucket(), &name, &ports));
+            .with_fleet_config(fleet_config_bound(
+                &origin,
+                origin.bucket(),
+                &name,
+                bind,
+                &book,
+            ));
+            let proxy = match recovery {
+                Some(config) => proxy
+                    .with_recovery_config(config)
+                    .expect("finite paced recovery bounds"),
+                None => proxy,
+            };
             (sync, proxy)
         })
         .await
@@ -1282,6 +1326,127 @@ async fn start_pods(pods: &[Pod; 2], nodes: [&CachingProxy; 2], bucket: &str) {
 /// times, not once per membership refutation the load causes.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
+    paced_concurrent_start(
+        "fleet-paced-builder",
+        ["fleet-paced-a", "fleet-paced-b"],
+        PACED_ROWS,
+        None,
+        None,
+        PRODUCTION_LOAD,
+        Duration::from_mins(3),
+    )
+    .await;
+}
+
+/// The recovery episode budget the builder's scan outlasts below: a tenth of
+/// production's 600 s, with the attempt bound halved to fit it. The claim
+/// policy derived from it is production's own: a 60 s claim episode and a
+/// 30 s donor wait.
+fn short_episode() -> RecoveryConfig {
+    RecoveryConfig {
+        max_members: 256,
+        max_member_bytes: 256,
+        max_barrier_rounds: 4,
+        total_ms: 60_000,
+        attempt_ms: 30_000,
+        settle_ms: 3_000,
+        poll_ms: 100,
+    }
+}
+
+/// Production's claim `donor_wait_ms`, the bound the paced transfer outlives.
+const DONOR_WAIT: Duration = Duration::from_secs(30);
+
+/// 400 production-paced pages: the builder's scan runs over 100 s, past the
+/// follower's whole 60 s recovery episode.
+const OUTLASTING_ROWS: usize = 400_000;
+
+/// The rate at which a relay forwards a donor's bulk bytes to the follower:
+/// the 400k-row image, about 54 MB, takes over 50 s, past the 30 s donor
+/// wait, while each 64 KiB chunk still arrives well inside every
+/// per-request bound.
+const PACED_TRANSFER_BYTES_PER_SEC: u64 = 1 << 20;
+
+/// The production failures: a follower's recovery episode ended at its fixed
+/// budget while the builder it followed was still scanning; and the
+/// follower's transfer of the builder's Ready image, bounded once by the 30 s
+/// donor wait, aborted on a loaded pod, so it scanned the origin itself and
+/// never installed the image. Each builder page and each transfer advance
+/// must renew the follower's bounds.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_start_follower_outwaits_its_recovery_budget_for_a_paced_builder() {
+    paced_concurrent_start(
+        "fleet-paced-episode",
+        ["fleet-episode-a", "fleet-episode-b"],
+        OUTLASTING_ROWS,
+        Some(short_episode()),
+        Some(PACED_TRANSFER_BYTES_PER_SEC),
+        TRANSFER_LOAD,
+        Duration::from_millis(short_episode().total_ms),
+    )
+    .await;
+}
+
+/// Listen on a fresh port and forward each connection to `target`, passing
+/// the dialer's bytes at once and the target's back at `rate` bytes a
+/// second: a follower dialing a donor through it receives the donor's bulk
+/// chunks paced, as over a congested link. Returns the relay's port.
+async fn paced_relay(target: u16, rate: u64) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("relay port");
+    let port = listener.local_addr().expect("bound relay").port();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await
+                else {
+                    return;
+                };
+                let _ = inbound.set_nodelay(true);
+                let _ = outbound.set_nodelay(true);
+                let (mut from_dialer, mut to_dialer) = inbound.into_split();
+                let (mut from_target, mut to_target) = outbound.into_split();
+                let upstream = tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut from_dialer, &mut to_target).await;
+                    let _ = to_target.shutdown().await;
+                });
+                let mut buf = vec![0_u8; 16 << 10];
+                while let Ok(read) = from_target.read(&mut buf).await {
+                    if read == 0 || to_dialer.write_all(&buf[..read]).await.is_err() {
+                        break;
+                    }
+                    let bytes = u64::try_from(read).expect("relay read fits u64");
+                    tokio::time::sleep(Duration::from_nanos(bytes * 1_000_000_000 / rate)).await;
+                }
+                let _ = to_dialer.shutdown().await;
+                upstream.abort();
+            });
+        }
+    });
+    port
+}
+
+/// Each node's bulk address in the fleet book: its own listener, or with
+/// `rate` a paced relay in front of it.
+async fn bulk_book(
+    names: [&'static str; 2],
+    binds: [u16; 2],
+    rate: Option<u64>,
+) -> [(&'static str, u16); 2] {
+    match rate {
+        Some(rate) => [
+            (names[0], paced_relay(binds[0], rate).await),
+            (names[1], paced_relay(binds[1], rate).await),
+        ],
+        None => [(names[0], binds[0]), (names[1], binds[1])],
+    }
+}
+
+/// Print the fleet's info decisions, including transfer aborts and
+/// fallbacks, into the test output.
+fn trace_decisions() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1289,43 +1454,54 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
         )
         .with_test_writer()
         .try_init();
-    // Load as on the production node: after the scan starts, one pod's only
-    // worker is held for 1.5 s every 5 s, alternating follower and builder,
-    // until the follower has installed and the pair has run on for a while.
-    // That is past the 1 s observation bound and long enough for the
-    // membership layer to suspect the held pod, but inside the 2 s lease
-    // and the 3 s claim TTL. [follower pause, builder pause, period] in ms.
-    let stalls: [u64; 3] = [1_500, 1_500, 10_000];
-    let origin = Origin::start("fleet-paced-builder").await;
-    origin.serve_synthetic_listing(PACED_ROWS);
+}
+
+/// Run one loaded, production-paced concurrent start of the pair `names`
+/// over `rows` synthetic rows and assert that only the builder listed, that
+/// its scan outlasted `min_build`, and that the follower installed its image.
+/// With `transfer_rate`, peers reach each node's bulk listener through a
+/// relay forwarding at that many bytes a second, and the follower's install
+/// must come more than the donor wait after the builder's.
+async fn paced_concurrent_start(
+    label: &str,
+    names: [&'static str; 2],
+    rows: usize,
+    recovery: Option<RecoveryConfig>,
+    transfer_rate: Option<u64>,
+    stalls: [u64; 3],
+    min_build: Duration,
+) {
+    trace_decisions();
+    let origin = Origin::start(label).await;
+    origin.serve_synthetic_listing(rows);
     origin.delay_lists(PACED_PAGE);
     let bucket = origin.bucket().to_owned();
-    let ports = [
-        ("fleet-paced-a", free_tcp_port()),
-        ("fleet-paced-b", free_tcp_port()),
-    ];
+    let binds = [free_tcp_port(), free_tcp_port()];
+    let ports = bulk_book(names, binds, transfer_rate).await;
     let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
-    let pods = [Pod::new("fleet-paced-a"), Pod::new("fleet-paced-b")];
+    let pods = [Pod::new(names[0]), Pod::new(names[1])];
     let metrics = [Arc::new(Metrics::default()), Arc::new(Metrics::default())];
     let (a_sync, a) = pod_node(
         &pods[0],
         &origin,
-        ("fleet-paced-a", a_udp),
-        ("fleet-paced-b", b_udp),
+        (names[0], a_udp, binds[0]),
+        (names[1], b_udp),
         ports,
         &metrics[0],
+        recovery,
     )
     .await;
     let (b_sync, b) = pod_node(
         &pods[1],
         &origin,
-        ("fleet-paced-b", b_udp),
-        ("fleet-paced-a", a_udp),
+        (names[1], b_udp, binds[1]),
+        (names[0], a_udp),
         ports,
         &metrics[1],
+        recovery,
     )
     .await;
-    mutual_alive(&a_sync, "fleet-paced-a", &b_sync, "fleet-paced-b").await;
+    mutual_alive(&a_sync, names[0], &b_sync, names[1]).await;
     let before = Counts::take(&origin);
     let started = Instant::now();
     start_pods(&pods, [&a, &b], &bucket).await;
@@ -1345,16 +1521,16 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
         count("recovery_origin_scans"),
         count("recovery_ready_recaptures"),
     );
-    let rows = metrics.each_ref().map(|metrics| indexed_rows(metrics));
+    let indexed = metrics.each_ref().map(|metrics| indexed_rows(metrics));
     let lapses = [&a, &b].map(|node| {
         node.recovery_status()
             .map_or(0, |status| status.state.covered_lapses)
     });
     let report = format!(
         "seen={seen:?} scans={scans:?} recaptures={recaptures:?} lapses={lapses:?} \
-         rows={rows:?} stalls={stalled} {cost:?}"
+         rows={indexed:?} stalls={stalled} {cost:?}"
     );
-    println!("fleet_bootstrap paced_builder {report}");
+    println!("fleet_bootstrap {label} {report}");
     assert!(finished, "both nodes serve locally in time: {report}");
     assert_eq!(
         scans.iter().sum::<u64>(),
@@ -1374,21 +1550,26 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
     );
     let built = seen[builder].ready.expect("the builder served locally");
     assert!(
-        built > Duration::from_mins(3),
-        "the builder's scan outlasts three minutes and every fixed bound: {report}"
+        built > min_build,
+        "the builder's scan outlasts {min_build:?} and every fixed bound: {report}"
+    );
+    let installed = seen[follower].ready.expect("the follower served locally");
+    assert!(
+        installed >= built,
+        "the follower waited for the whole scan: {report}"
     );
     assert!(
-        seen[follower].ready.expect("the follower served locally") >= built,
-        "the follower waited for the whole scan: {report}"
+        transfer_rate.is_none() || installed.saturating_sub(built) > DONOR_WAIT,
+        "the follower's paced transfer outlived the {DONOR_WAIT:?} donor wait: {report}"
     );
     assert_eq!(
         cost.list,
-        PACED_ROWS.div_ceil(1000) as u64,
+        rows.div_ceil(1000) as u64,
         "one pass of LIST pages; the follower installed with none: {report}"
     );
     assert_eq!(cost.list, cost.successful_list);
     assert_eq!(
-        rows, [PACED_ROWS as u64; 2],
+        indexed, [rows as u64; 2],
         "the follower installed the builder's Ready capture: {report}"
     );
     cost.assert_no_writes();
