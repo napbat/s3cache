@@ -7,6 +7,7 @@
 //! and runs the server.
 
 pub mod cache;
+pub(crate) mod codec;
 pub mod config;
 pub mod index;
 pub(crate) mod list_token;

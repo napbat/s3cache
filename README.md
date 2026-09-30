@@ -70,8 +70,9 @@ hot (in-memory, small)  ->  warm (node-local disk, large, optional)  ->  cold (S
   and comes up warm instead of stampeding the origin. Entries are retained by LRU.
   Bodies are served as `memmap2`-backed `Bytes`; only the small metadata header is
   decoded onto the heap, so mapped pages remain kernel-evictable and warm-hit memory
-  is bounded by I/O/page-cache pressure rather than the disk-cache size. Existing
-  all-bincode cache files remain readable and age out normally. Size warm larger than
+  is bounded by I/O/page-cache pressure rather than the disk-cache size. Cache files
+  written by earlier releases (bincode, either layout) remain readable and age out
+  normally; new entries use a postcard header. Size warm larger than
   hot to help. All disk ops are best-effort: an I/O error is a miss, never a
   data-plane failure.
 - **cold** — the S3 origin.

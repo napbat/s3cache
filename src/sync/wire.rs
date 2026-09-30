@@ -3,6 +3,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use s3s::dto::ETag;
 use serde::{Deserialize, Serialize};
 
+use crate::codec;
+
 /// Splits `writer:epoch:seq` from the right, so writer names may contain
 /// colons. `None` for anything else.
 pub(super) fn parse_token(value: &str) -> Option<(&str, u64, u64)> {
@@ -11,9 +13,11 @@ pub(super) fn parse_token(value: &str) -> Option<(&str, u64, u64)> {
     Some((writer, epoch.parse().ok()?, seq.parse().ok()?))
 }
 
-/// Prefix identifying the current event envelope. Bytes without it are not this
-/// protocol and are rejected rather than interpreted as another shape.
-pub(super) const WIRE_MAGIC: u8 = 0xFF;
+/// Prefix identifying the current event envelope: a postcard `IndexEvent`. Bytes
+/// without it are not this protocol and are rejected rather than interpreted as
+/// another shape. Peers upgrade together, so the retired bincode envelope (`0xFF`)
+/// is not read: mixed-version fleets are unsupported, as for every peer protocol.
+pub(super) const WIRE_MAGIC: u8 = 0xFE;
 
 /// What one durable write did, as advertised to peers.
 #[derive(Serialize, Deserialize)]
@@ -50,12 +54,12 @@ pub(crate) struct IndexEvent {
     pub(crate) ts_us: u64,
 }
 
-pub(super) fn to_micros(ts: SystemTime) -> u64 {
+pub(crate) fn to_micros(ts: SystemTime) -> u64 {
     ts.duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-pub(super) fn from_micros(us: u64) -> SystemTime {
+pub(crate) fn from_micros(us: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_micros(us)
 }
 
@@ -80,7 +84,7 @@ pub(super) fn etag_to_wire(tag: &ETag) -> String {
 
 pub(super) fn encode_event(event: &IndexEvent) -> Vec<u8> {
     let mut out = vec![WIRE_MAGIC];
-    match bincode::serialize(event) {
+    match codec::to_vec(event) {
         Ok(body) => out.extend_from_slice(&body),
         Err(_) => return Vec::new(),
     }
@@ -90,7 +94,7 @@ pub(super) fn encode_event(event: &IndexEvent) -> Vec<u8> {
 /// Decode the current event envelope. Unprefixed or malformed bytes are rejected.
 pub(super) fn decode_event(bytes: &[u8]) -> Option<IndexEvent> {
     match bytes.split_first() {
-        Some((&WIRE_MAGIC, body)) => bincode::deserialize(body).ok(),
+        Some((&WIRE_MAGIC, body)) => codec::from_slice(body).ok(),
         _ => None,
     }
 }

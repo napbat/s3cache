@@ -10,14 +10,16 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bincode::Options as _;
 use s3s::dto::{ListObjectsV2Input, ListObjectsV2Output};
 use serde::{Deserialize, Serialize};
 
+use crate::codec;
+
 const OWNED_NAMESPACE: &str = "s3cache:list-token:";
 const V1_PREFIX: &str = "s3cache:list-token:v1:";
+const V2_PREFIX: &str = "s3cache:list-token:v2:";
 const CHECKSUM_BYTES: usize = 16;
-const MAX_PAYLOAD_BYTES: u64 = 16 * 1024;
+const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Payload {
@@ -66,14 +68,19 @@ pub(crate) fn classify(input: &ListObjectsV2Input) -> Result<Continuation, Token
     if !token.starts_with(OWNED_NAMESPACE) {
         return Ok(Continuation::Origin);
     }
-    let encoded = token.strip_prefix(V1_PREFIX).ok_or(TokenError::Malformed)?;
+    // Replicas still minting the first layout during an upgrade keep their clients
+    // paging: a v1 token carries the same payload in bincode 1.
+    let (encoded, legacy) = match token.strip_prefix(V2_PREFIX) {
+        Some(encoded) => (encoded, false),
+        None => (
+            token.strip_prefix(V1_PREFIX).ok_or(TokenError::Malformed)?,
+            true,
+        ),
+    };
     let framed = URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| TokenError::Malformed)?;
-    if framed.len() <= CHECKSUM_BYTES
-        || u64::try_from(framed.len()).unwrap_or(u64::MAX)
-            > MAX_PAYLOAD_BYTES + CHECKSUM_BYTES as u64
-    {
+    if framed.len() <= CHECKSUM_BYTES || framed.len() > MAX_PAYLOAD_BYTES + CHECKSUM_BYTES {
         return Err(TokenError::Malformed);
     }
     let payload_len = framed.len() - CHECKSUM_BYTES;
@@ -82,12 +89,11 @@ pub(crate) fn classify(input: &ListObjectsV2Input) -> Result<Continuation, Token
     if checksum != &digest.as_bytes()[..CHECKSUM_BYTES] {
         return Err(TokenError::Malformed);
     }
-    let decoded: Payload = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_PAYLOAD_BYTES)
-        .reject_trailing_bytes()
-        .deserialize(payload)
-        .map_err(|_| TokenError::Malformed)?;
+    let decoded: Payload = if legacy {
+        codec::legacy::from_slice(payload).map_err(|_| TokenError::Malformed)?
+    } else {
+        codec::from_slice(payload).map_err(|_| TokenError::Malformed)?
+    };
     if decoded.bucket != input.bucket
         || decoded.prefix != input.prefix
         || decoded.delimiter != input.delimiter
@@ -108,15 +114,13 @@ pub(crate) fn encode(input: &ListObjectsV2Input, cursor: &str) -> String {
         delimiter: input.delimiter.clone(),
         cursor: cursor.to_owned(),
     };
-    let bytes = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .serialize(&payload)
+    let bytes = codec::to_vec(&payload)
         .expect("serializing a LIST cursor made only of strings cannot fail");
     let digest = blake3::hash(&bytes);
     let mut framed = Vec::with_capacity(bytes.len() + CHECKSUM_BYTES);
     framed.extend_from_slice(&bytes);
     framed.extend_from_slice(&digest.as_bytes()[..CHECKSUM_BYTES]);
-    format!("{V1_PREFIX}{}", URL_SAFE_NO_PAD.encode(framed))
+    format!("{V2_PREFIX}{}", URL_SAFE_NO_PAD.encode(framed))
 }
 
 /// The client-visible fields hidden while an owned cursor is translated to an origin
@@ -196,8 +200,31 @@ mod tests {
         request.continuation_token = Some("s3cache:list-token:v1:not_base64!".to_owned());
         assert_eq!(classify(&request), Err(TokenError::Malformed));
 
-        request.continuation_token = Some("s3cache:list-token:v2:anything".to_owned());
+        request.continuation_token = Some("s3cache:list-token:v3:anything".to_owned());
         assert_eq!(classify(&request), Err(TokenError::Malformed));
+    }
+
+    /// A token a replica minted before the codec change still resumes its listing.
+    #[test]
+    fn first_layout_token_still_resumes() {
+        use base64::Engine as _;
+
+        let payload = bincode::serialize(&("b", Some("p/"), None::<&str>, "p/last")).unwrap();
+        let mut framed = payload.clone();
+        framed.extend_from_slice(&blake3::hash(&payload).as_bytes()[..super::CHECKSUM_BYTES]);
+        let token = format!(
+            "s3cache:list-token:v1:{}",
+            super::URL_SAFE_NO_PAD.encode(framed)
+        );
+        let mut request = input("b", Some("p/"), None);
+        request.continuation_token = Some(token.clone());
+        assert_eq!(
+            classify(&request),
+            Ok(Continuation::Local {
+                token,
+                cursor: "p/last".to_owned(),
+            })
+        );
     }
 
     #[test]

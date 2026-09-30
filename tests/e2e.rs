@@ -89,7 +89,7 @@ async fn indexed_continuation_token_survives_an_origin_routed_next_page() {
     let token = first
         .next_continuation_token
         .expect("the indexed page is truncated");
-    assert!(token.starts_with("s3cache:list-token:v1:"));
+    assert!(token.starts_with("s3cache:list-token:v2:"));
 
     let second = indexed_b
         .list_objects_v2(request(ListObjectsV2Input {

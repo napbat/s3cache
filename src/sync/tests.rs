@@ -12,8 +12,8 @@ use s3s::dto::GetObjectOutput;
 use crate::index::{KeyIndex, ObjEntry, standard_class};
 use crate::metrics::Metrics;
 use crate::sync::coherence::{
-    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, WriteSync, WriteWait, recovery_generation_permits,
-    waits_on, waits_on_unleased,
+    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, WriteReceipt, WriteSync, WriteWait,
+    recovery_generation_permits, waits_on, waits_on_unleased,
 };
 use crate::sync::config::{parse_lease_ms, parse_seeds};
 use crate::sync::wire::{
@@ -29,6 +29,13 @@ const TEST_LEASE: Duration = Duration::from_millis(300);
 
 fn test_lease() -> LeaseConfig {
     LeaseConfig::for_duration(TEST_LEASE)
+}
+
+/// Index `entry` as this writer's own put into a scratch index and advertise it.
+async fn own_put(sync: &WriteSync, key: &str, entry: ObjEntry, metrics: &Metrics) -> WriteReceipt {
+    sync.index_put(&KeyIndex::default(), "bkt", key, entry, metrics)
+        .1
+        .await
 }
 
 #[test]
@@ -338,10 +345,11 @@ fn event_codec_round_trips_and_rejects_garbage() {
         Some(&WIRE_MAGIC),
         "the sender prefixes the current event format"
     );
-    let unprefixed = bincode::serialize(&event).expect("the event shape serializes");
+    let mut retired = vec![0xFF];
+    retired.extend(bincode::serialize(&event).expect("the event shape serializes"));
     assert!(
-        decode_event(&unprefixed).is_none(),
-        "the decoder rejects bytes outside the current envelope"
+        decode_event(&retired).is_none(),
+        "the decoder rejects the retired bincode envelope"
     );
     let back = decode_event(&encoded).expect("round trip");
     let IndexOp::Put {
@@ -391,9 +399,7 @@ async fn peer_events_fold_into_index_and_invalidate() {
     let ckey = ("bkt".to_owned(), "obj".to_owned());
     cache.insert(ckey.clone(), cached(b"stale")).await;
 
-    sync_a
-        .publish_put("bkt", "obj", &written(42), &metrics)
-        .await;
+    own_put(&sync_a, "obj", written(42), &metrics).await;
     eventually(
         || indexed_size(&state, "bkt", "obj") == Some(42),
         "put reaches the peer index",
@@ -423,7 +429,13 @@ async fn peer_events_fold_into_index_and_invalidate() {
     assert!(invalidated, "put invalidates the peer's body copy");
 
     sync_a
-        .publish_del("bkt", "obj", SystemTime::now(), &metrics)
+        .index_del(
+            &KeyIndex::default(),
+            "bkt",
+            "obj",
+            SystemTime::now(),
+            &metrics,
+        )
         .await;
     eventually(
         || indexed_size(&state, "bkt", "obj").is_none(),
@@ -442,9 +454,7 @@ async fn await_fresh_reflects_the_publishers_head() {
     let (sync_a, sync_b, state, _cache) = wired_pair(&net);
     let metrics = Metrics::default();
 
-    sync_a
-        .publish_put("bkt", "fresh", &written(7), &metrics)
-        .await;
+    own_put(&sync_a, "fresh", written(7), &metrics).await;
     // Wait until the peer has applied the write, then barrier: a caught-up
     // node must pass promptly, and a passed barrier implies the applied
     // index reflects every head the barrier saw.
@@ -468,9 +478,7 @@ async fn write_tokens_upgrade_reads_to_strict() {
     let (sync_a, sync_b, state, _cache) = wired_pair(&net);
     let metrics = Metrics::default();
 
-    let receipt = sync_a
-        .publish_put("bkt", "tok", &written(1), &metrics)
-        .await;
+    let receipt = own_put(&sync_a, "tok", written(1), &metrics).await;
     assert!(
         sync_a
             .reached_token(&receipt.header, Duration::from_millis(50))
@@ -537,9 +545,7 @@ async fn in_strong_acks_an_unacked_write_is_counted_and_not_retired() {
     )
     .await;
 
-    let receipt = sync_b
-        .publish_put("bkt", "unacked", &written(1), &metrics)
-        .await;
+    let receipt = own_put(&sync_b, "unacked", written(1), &metrics).await;
     sync_b
         .ack_write(
             receipt.token,
@@ -583,9 +589,7 @@ async fn a_leased_write_resolves_on_acks_and_the_peer_already_has_it() {
     .await;
 
     let started = Instant::now();
-    let receipt = sync_a
-        .publish_put("bkt", "fast", &written(9), &metrics)
-        .await;
+    let receipt = own_put(&sync_a, "fast", written(9), &metrics).await;
     let outcome = sync_a
         .wait_cluster_applied(receipt.token, Duration::from_secs(5))
         .await;
@@ -636,9 +640,7 @@ async fn a_dropped_peers_lease_lapses_and_the_write_completes_inside_one_duratio
     drop(sync_b);
 
     let started = Instant::now();
-    let receipt = sync_a
-        .publish_put("bkt", "lapsed", &written(1), &metrics)
-        .await;
+    let receipt = own_put(&sync_a, "lapsed", written(1), &metrics).await;
     sync_a
         .ack_write(
             receipt.token,
@@ -666,9 +668,7 @@ async fn a_dropped_peers_lease_lapses_and_the_write_completes_inside_one_duratio
     // And the cost is not recurring: the lapsed holder has left the wait set, so the
     // next write is back on the fast path.
     let started = Instant::now();
-    let receipt = sync_a
-        .publish_put("bkt", "after", &written(2), &metrics)
-        .await;
+    let receipt = own_put(&sync_a, "after", written(2), &metrics).await;
     assert!(matches!(
         sync_a
             .wait_cluster_applied(receipt.token, Duration::from_secs(5))

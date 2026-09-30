@@ -81,6 +81,15 @@ gossip:
   # lengthens the freeze a single unresponsive pod costs every reader. Empty = 2000.
   leaseMs: ""
 
+# Peer index bootstrap is compiled into the standard image but remains off at
+# runtime unless explicitly enabled. Every ordinal needs the same nonsecret
+# origin account/endpoint identity and exact configured bucket inventory.
+# The headless service publishes each pod's TCP endpoint before readiness.
+fleet:
+  enabled: false
+  port: 7950
+  originId: ""
+
 # Metrics (GET /metrics), listener readiness (GET /ready), and initial index
 # completion (GET /index-ready). Cold pods can forward requests to the origin.
 # Disabling this listener uses TCP readiness.

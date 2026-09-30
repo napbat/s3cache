@@ -96,6 +96,9 @@ pub struct Ops {
     list: AtomicU64,
     get: AtomicU64,
     head: AtomicU64,
+    successful_list: AtomicU64,
+    successful_get: AtomicU64,
+    successful_head: AtomicU64,
     put: AtomicU64,
     delete: AtomicU64,
     copy: AtomicU64,
@@ -128,7 +131,19 @@ macro_rules! op_readers {
         }
     };
 }
-op_readers!(list, get, head, put, delete, copy, conditional_copy, other);
+op_readers!(
+    list,
+    get,
+    head,
+    successful_list,
+    successful_get,
+    successful_head,
+    put,
+    delete,
+    copy,
+    conditional_copy,
+    other
+);
 
 impl Ops {
     /// Every origin mutation, including bucket-level POSTs and multipart requests.
@@ -180,6 +195,23 @@ impl Ops {
             _ => &self.other,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_success(&self, method: &Method, uri: &Uri, status: StatusCode) {
+        if !status.is_success() {
+            return;
+        }
+        let path = uri.path().trim_start_matches('/');
+        let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
+        let counter = match (method, on_key) {
+            (&Method::GET, false) => Some(&self.successful_list),
+            (&Method::GET, true) => Some(&self.successful_get),
+            (&Method::HEAD, true) => Some(&self.successful_head),
+            _ => None,
+        };
+        if let Some(counter) = counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -361,6 +393,12 @@ impl Origin {
         client_for(&self.counted_endpoint)
     }
 
+    /// Exact endpoint used by the counted client and fleet scope binding.
+    #[must_use]
+    pub fn counted_endpoint(&self) -> &str {
+        &self.counted_endpoint
+    }
+
     /// The origin as a **plain `s3s` route** — the reference leg of a differential row.
     ///
     /// It is the same `s3s_aws::Proxy` translation the cache itself uses for passthrough,
@@ -370,7 +408,7 @@ impl Origin {
     /// judge the proxy leg.
     #[must_use]
     pub fn direct_route(&self) -> s3s_aws::Proxy {
-        s3s_aws::Proxy::from(self.direct.clone())
+        s3s_aws::Proxy::builder(self.direct.clone()).build()
     }
 
     /// Create another bucket in this origin — for tests that need a second keyspace
@@ -516,17 +554,19 @@ async fn counting_proxy(
                         let get_pause = Arc::clone(&get_pause);
                         async move {
                             ops.record(req.method(), req.uri(), req.headers());
-                            Ok::<_, std::convert::Infallible>(
-                                forward(
-                                    upstream,
-                                    req,
-                                    &put_fault,
-                                    &list_pause,
-                                    &list_fault,
-                                    &get_pause,
-                                )
-                                .await,
+                            let method = req.method().clone();
+                            let uri = req.uri().clone();
+                            let response = forward(
+                                upstream,
+                                req,
+                                &put_fault,
+                                &list_pause,
+                                &list_fault,
+                                &get_pause,
                             )
+                            .await;
+                            ops.record_success(&method, &uri, response.status());
+                            Ok::<_, std::convert::Infallible>(response)
                         }
                     }),
                 )
@@ -674,7 +714,7 @@ pub fn proxy_over_with_metrics(
     metrics: &Arc<Metrics>,
 ) -> CachingProxy {
     CachingProxy::new(
-        s3s_aws::Proxy::from(client.clone()),
+        s3s_aws::Proxy::builder(client.clone()).build(),
         client.clone(),
         CacheConfig {
             cache_bytes: HOT_BYTES,
@@ -747,7 +787,7 @@ pub fn warm_proxy_over(
     let warm = open_warm(dir.path(), WARM_BYTES, max_obj_bytes, Arc::clone(metrics))
         .expect("the warm tier opens");
     CachingProxy::new(
-        s3s_aws::Proxy::from(client.clone()),
+        s3s_aws::Proxy::builder(client.clone()).build(),
         client.clone(),
         CacheConfig {
             cache_bytes: HOT_BYTES,

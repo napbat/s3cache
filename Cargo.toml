@@ -14,24 +14,28 @@ async-trait = "0.1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 aws-sdk-s3 = "1"
-base64 = "0.22"
-bincode = "1"
+base64 = "0.23"
+# Final release, kept only to build legacy-format test fixtures (see `codec::legacy`).
+bincode = "1.3.3"
 blake3 = "1.8.5"
 bytes = { version = "1", features = ["serde"] }
 futures = "0.3"
-groupnet = { git = "https://github.com/napbat/groupnet", rev = "6d374d872209afd78afe11b037c5ba1dcc613c3f", features = ["consistency-leases", "consistency-volatile-recovery", "udp"] }
+getrandom = "0.4"
+groupnet = { git = "https://github.com/napbat/groupnet", rev = "269ebc5a384c389214e30070242499a8a84589ef", features = ["consistency-leases", "consistency-volatile-recovery", "udp"] }
 http = "1"
 http-body-util = "0.1"
 # Already under hyper-util/s3s; direct so the metrics endpoint can build its own responses.
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
-rlimit = "0.10"
-s3s = "0.14.0"
-s3s-aws = "0.14.0"
+# The serde codec for s3cache's own formats; `use-std` without the default `heapless`.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+rlimit = "0.11"
+s3s = "0.17"
+s3s-aws = "0.17"
 serde = { version = "1.0.228", features = ["derive"] }
 # A real S3 origin (MinIO) for the end-to-end tests — conditional writes, ETags and
 # error codes are the upstream's semantics, so the tests put the real thing behind us.
-testcontainers = { version = "0.27.3", features = ["http_wait"] }
+testcontainers = { version = "0.28", features = ["http_wait"] }
 tierstore = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-mmap = { git = "https://github.com/napbat/tierstore", branch = "main" }
 tierstore-moka = { git = "https://github.com/napbat/tierstore", branch = "main" }
@@ -53,6 +57,9 @@ edition.workspace = true
 description.workspace = true
 license.workspace = true
 
+[features]
+fleet = ["dep:getrandom", "groupnet/consistency-volatile-bootstrap-bulk", "groupnet/tcp"]
+
 [lints]
 workspace = true
 
@@ -63,15 +70,16 @@ aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-s3.workspace = true
 base64.workspace = true
-bincode.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
+getrandom = { workspace = true, optional = true }
 groupnet.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+postcard.workspace = true
 rlimit.workspace = true
 s3s.workspace = true
 s3s-aws.workspace = true
@@ -88,6 +96,9 @@ tracing-subscriber.workspace = true
 opt-level = 2
 
 [dev-dependencies]
+# Real bincode 1 bytes: the fixtures that prove `codec::legacy` still reads what
+# earlier releases stored. Never a runtime dependency.
+bincode.workspace = true
 testcontainers.workspace = true
 # The tests' counting forwarder needs hyper's client half; the binary only ever serves.
 hyper = { workspace = true, features = ["client"] }

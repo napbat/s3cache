@@ -31,7 +31,13 @@ macro_rules! take_overrides {
             content_encoding: input.response_content_encoding.take(),
             content_language: input.response_content_language.take(),
             cache_control: input.response_cache_control.take(),
-            expires: input.response_expires.take(),
+            expires: input.response_expires.take().and_then(|expires| {
+                let mut header = Vec::new();
+                expires
+                    .format(s3s::dto::TimestampFormat::HttpDate, &mut header)
+                    .ok()?;
+                String::from_utf8(header).ok()
+            }),
         }
     }};
 }

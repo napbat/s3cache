@@ -151,7 +151,7 @@ async fn two_node_strong_idle_origin_requests() {
     let client = origin.counted_client();
     let build_node = |sync, metrics: &Arc<Metrics>| {
         CachingProxy::new(
-            s3s_aws::Proxy::from(client.clone()),
+            s3s_aws::Proxy::builder(client.clone()).build(),
             client.clone(),
             CacheConfig {
                 cache_bytes: HOT_BYTES,

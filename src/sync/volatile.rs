@@ -21,6 +21,9 @@ use crate::metrics::Metrics;
 use crate::sync::coherence::{Consistency, DEFAULT_LEASE_MS, WriteSync};
 use crate::tier::LocalCache;
 
+#[cfg(feature = "fleet")]
+pub(super) mod fleet;
+
 /// The first consumer of the optional reusable volatile-recovery runtime.
 /// It reads only existing Groupnet gossip and the S3 origin; no control object
 /// or journal is created in the origin bucket.
@@ -50,12 +53,40 @@ pub(crate) struct RecoveryInputs {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) config: Option<RecoveryConfig>,
     pub(crate) rearm: Option<RecoveryRearm>,
+    #[cfg(feature = "fleet")]
+    pub(crate) fleet: Option<crate::sync::fleet::config::FleetConfig>,
 }
 
 impl WriteSync {
     /// Start one Groupnet-owned cold scan and all later volatile-feed recovery.
     /// The session is local correlation only, never a claimed durable cursor.
     pub(crate) fn open_recovery(self: &Arc<Self>, inputs: RecoveryInputs) {
+        let prepared = self.prepare_recovery(inputs);
+        #[cfg(feature = "fleet")]
+        if prepared.fleet.is_some() {
+            tracing::warn!(
+                "fleet configured but synchronous coherence startup uses guarded origin recovery; call start_fleet_coherence for peer bootstrap"
+            );
+        }
+        let recovery = prepared.open_origin();
+        self.install_recovery(recovery);
+    }
+
+    #[cfg(feature = "fleet")]
+    pub(crate) async fn open_fleet_recovery(self: &Arc<Self>, inputs: RecoveryInputs) {
+        let prepared = self.prepare_recovery(inputs);
+        if let Some((recovery, listener)) = fleet::open_recovery(self, &prepared).await {
+            self.install_recovery(recovery);
+            self.fleet_listener
+                .set(listener)
+                .expect("fleet listener already installed");
+        } else {
+            tracing::warn!("fleet bootstrap unavailable; opening guarded origin recovery");
+            self.install_recovery(prepared.open_origin());
+        }
+    }
+
+    fn prepare_recovery(self: &Arc<Self>, inputs: RecoveryInputs) -> PreparedRecovery {
         let RecoveryInputs {
             client,
             state,
@@ -65,6 +96,8 @@ impl WriteSync {
             metrics,
             config,
             rearm,
+            #[cfg(feature = "fleet")]
+            fleet,
         } = inputs;
         assert!(
             buckets.len() <= MAX_RECOVERY_BUCKETS,
@@ -106,13 +139,49 @@ impl WriteSync {
             poll_ms: 100,
         });
         let session = NEXT_SESSION.fetch_add(1, Ordering::AcqRel);
-        let recovery = if let Some(policy) = rearm {
-            RecoveryHandle::open_with_rearm(adapter, config, mode, self.me.clone(), session, policy)
-        } else {
-            RecoveryHandle::open(adapter, config, mode, self.me.clone(), session)
+        PreparedRecovery {
+            adapter,
+            config,
+            mode,
+            session,
+            rearm,
+            #[cfg(feature = "fleet")]
+            fleet,
         }
-        .expect("valid recovery configuration and Tokio runtime");
-        self.install_recovery(recovery);
+    }
+}
+
+struct PreparedRecovery {
+    adapter: Arc<CacheRecoveryAdapter>,
+    config: RecoveryConfig,
+    mode: RecoveryMode,
+    session: u64,
+    rearm: Option<RecoveryRearm>,
+    #[cfg(feature = "fleet")]
+    fleet: Option<crate::sync::fleet::config::FleetConfig>,
+}
+
+impl PreparedRecovery {
+    fn open_origin(&self) -> RecoveryHandle<CacheRecoveryAdapter> {
+        if let Some(policy) = self.rearm {
+            RecoveryHandle::open_with_rearm(
+                Arc::clone(&self.adapter),
+                self.config,
+                self.mode,
+                self.adapter.me.clone(),
+                self.session,
+                policy,
+            )
+        } else {
+            RecoveryHandle::open(
+                Arc::clone(&self.adapter),
+                self.config,
+                self.mode,
+                self.adapter.me.clone(),
+                self.session,
+            )
+        }
+        .expect("valid recovery configuration and Tokio runtime")
     }
 }
 

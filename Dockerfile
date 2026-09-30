@@ -7,7 +7,7 @@ COPY src ./src
 COPY benches ./benches
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked && cp target/release/s3cache /usr/local/bin/s3cache
+    cargo build --release --locked --features fleet && cp target/release/s3cache /usr/local/bin/s3cache
 
 FROM debian:bookworm-slim
 RUN apt-get update \

@@ -139,7 +139,9 @@ impl<S: SlotStore> Journal<S> {
                     .await?
                     .ok_or(JournalError::UnknownManifest)?;
                 let stored: JournalConfig = codec::decode(&actual, config.limits.max_record_bytes)?;
-                if stored != config || actual != expected {
+                // A manifest the first format wrote stays authoritative: it is
+                // immutable, so only its decoded configuration can be compared.
+                if stored != config || (codec::is_current(&actual) && actual != expected) {
                     return Err(JournalError::ConfigMismatch);
                 }
             }
@@ -372,7 +374,9 @@ impl<S: SlotStore> Journal<S> {
         record: &Record,
     ) -> Result<bool, JournalError> {
         let stored = self.decode_slot(actual, cursor, slot)?.record;
-        if actual == expected {
+        // A first-format slot can never match a fresh encoding byte for byte, but it
+        // is the same append when it decodes to the same envelope.
+        if actual == expected || (!codec::is_current(actual) && stored == *record) {
             return Ok(true);
         }
         let same_identity = match (&stored, record) {

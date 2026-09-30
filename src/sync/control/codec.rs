@@ -1,47 +1,42 @@
-use bincode::Options;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::journal::JournalError;
+use crate::codec;
 
 const MAGIC: &[u8; 4] = b"S3CJ";
-const VERSION: u8 = 1;
+/// Current record format: a postcard payload.
+const VERSION: u8 = 2;
+/// The first format: a bincode 1 payload, still read so existing journals reopen.
+const LEGACY_VERSION: u8 = 1;
 const HEADER: usize = 9;
 const DIGEST: usize = 32;
 
 pub(super) fn encode<T: Serialize>(value: &T, max_bytes: usize) -> Result<Vec<u8>, JournalError> {
-    let payload_len = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .serialized_size(value)
-        .map_err(|_| JournalError::Corrupt("record size cannot encode"))?;
-    if payload_len > max_bytes.saturating_sub(HEADER + DIGEST) as u64
-        || payload_len > u64::from(u32::MAX)
-    {
-        return Err(JournalError::Capacity);
-    }
-    let payload = bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .serialize(value)
-        .map_err(|_| JournalError::Corrupt("record cannot encode"))?;
+    let payload =
+        codec::to_vec(value).map_err(|_| JournalError::Corrupt("record cannot encode"))?;
     let total = HEADER
         .checked_add(payload.len())
         .and_then(|size| size.checked_add(DIGEST))
         .ok_or(JournalError::Capacity)?;
-    if total > max_bytes || payload.len() > u32::MAX as usize {
+    if total > max_bytes {
         return Err(JournalError::Capacity);
     }
+    let payload_len = u32::try_from(payload.len()).map_err(|_| JournalError::Capacity)?;
     let mut bytes = Vec::with_capacity(total);
     bytes.extend_from_slice(MAGIC);
     bytes.push(VERSION);
-    bytes.extend_from_slice(
-        &u32::try_from(payload.len())
-            .expect("checked length")
-            .to_le_bytes(),
-    );
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
     bytes.extend_from_slice(&payload);
     let checksum = blake3::hash(&bytes);
     bytes.extend_from_slice(checksum.as_bytes());
     Ok(bytes)
+}
+
+/// Whether `bytes` carry the format [`encode`] writes today. Immutable records in
+/// the first format stay valid, but can never be byte-identical to a fresh encoding.
+pub(super) fn is_current(bytes: &[u8]) -> bool {
+    bytes.get(..MAGIC.len()) == Some(MAGIC) && bytes.get(MAGIC.len()) == Some(&VERSION)
 }
 
 pub(super) fn decode<T: DeserializeOwned>(
@@ -51,7 +46,8 @@ pub(super) fn decode<T: DeserializeOwned>(
     if bytes.len() > max_bytes || bytes.len() < HEADER + DIGEST {
         return Err(JournalError::Corrupt("record length outside limit"));
     }
-    if &bytes[..4] != MAGIC || bytes[4] != VERSION {
+    let version = bytes[4];
+    if &bytes[..4] != MAGIC || (version != VERSION && version != LEGACY_VERSION) {
         return Err(JournalError::Corrupt("record format mismatch"));
     }
     let len = u32::from_le_bytes(bytes[5..9].try_into().expect("fixed header")) as usize;
@@ -62,10 +58,11 @@ pub(super) fn decode<T: DeserializeOwned>(
     if blake3::hash(contents).as_bytes() != checksum {
         return Err(JournalError::Corrupt("record checksum mismatch"));
     }
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(u64::try_from(len).expect("bounded record length"))
-        .reject_trailing_bytes()
-        .deserialize(&bytes[HEADER..HEADER + len])
-        .map_err(|_| JournalError::Corrupt("record payload invalid"))
+    let payload = &contents[HEADER..];
+    if version == VERSION {
+        codec::from_slice(payload).map_err(|_| JournalError::Corrupt("record payload invalid"))
+    } else {
+        codec::legacy::from_slice(payload)
+            .map_err(|_| JournalError::Corrupt("record payload invalid"))
+    }
 }

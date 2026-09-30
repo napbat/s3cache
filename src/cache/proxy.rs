@@ -138,7 +138,8 @@ pub(super) struct ResponseOverrides {
     pub(super) content_encoding: Option<String>,
     pub(super) content_language: Option<String>,
     pub(super) cache_control: Option<String>,
-    pub(super) expires: Option<Timestamp>,
+    /// The `response-expires` override rendered as the HTTP-date `Expires` header.
+    pub(super) expires: Option<String>,
 }
 
 /// What an origin response says about an object — the shape [`CachingProxy::observe`]
@@ -384,6 +385,8 @@ pub struct CachingProxy {
     index_scan: ScanConfig,
     recovery_config: Option<groupnet::consistency::volatile_recovery::RecoveryConfig>,
     recovery_rearm: Option<groupnet::consistency::volatile_recovery::RecoveryRearm>,
+    #[cfg(feature = "fleet")]
+    fleet: Option<crate::sync::fleet::config::FleetConfig>,
     #[cfg(test)]
     pub(super) read_return_pause: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     pub(super) metrics: Arc<Metrics>,
@@ -416,7 +419,7 @@ impl CachingProxy {
         metrics.register_index(Arc::clone(&state));
         Self {
             inner: Arc::new(inner),
-            copy_inner: Arc::new(s3s_aws::Proxy::from(copy_client)),
+            copy_inner: Arc::new(s3s_aws::Proxy::builder(copy_client).build()),
             client,
             state,
             obj_cache: TieredCache::new(cfg.cache_bytes, warm, metrics.clone()),
@@ -426,6 +429,8 @@ impl CachingProxy {
             index_scan: ScanConfig::default(),
             recovery_config: None,
             recovery_rearm: None,
+            #[cfg(feature = "fleet")]
+            fleet: None,
             #[cfg(test)]
             read_return_pause: Arc::new(std::sync::Mutex::new(None)),
             metrics,
@@ -474,6 +479,15 @@ impl CachingProxy {
         Ok(self)
     }
 
+    /// Opt in to a bounded peer index bootstrap without changing the default
+    /// guarded origin recovery path.
+    #[cfg(feature = "fleet")]
+    #[must_use]
+    pub fn with_fleet_config(mut self, config: crate::sync::fleet::config::FleetConfig) -> Self {
+        self.fleet = Some(config);
+        self
+    }
+
     /// Start one Groupnet-owned cold origin scan and the gossip apply loop.
     /// Peer events update the LIST index and invalidate hot bodies. A gap, or
     /// an unprovable strong serve-lease lapse, closes local serving and starts
@@ -481,7 +495,23 @@ impl CachingProxy {
     /// background warm-up remains separate.
     pub fn start_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
-        sync.open_recovery(crate::sync::volatile::RecoveryInputs {
+        sync.open_recovery(self.recovery_inputs(buckets));
+        self.start_coherence_apply(sync);
+    }
+
+    /// Bind the optional TCP data plane before the recovery worker and native
+    /// feed applier start. A failed bind opens ordinary guarded origin
+    /// recovery, leaving no peer-ready claim or origin control object.
+    #[cfg(feature = "fleet")]
+    pub async fn start_fleet_coherence(&self, buckets: &[String]) {
+        let Some(sync) = &self.sync else { return };
+        sync.open_fleet_recovery(self.recovery_inputs(buckets))
+            .await;
+        self.start_coherence_apply(sync);
+    }
+
+    fn recovery_inputs(&self, buckets: &[String]) -> crate::sync::volatile::RecoveryInputs {
+        crate::sync::volatile::RecoveryInputs {
             client: self.client.clone(),
             state: self.state.clone(),
             local: self.obj_cache.local(),
@@ -490,7 +520,12 @@ impl CachingProxy {
             metrics: self.metrics.clone(),
             config: self.recovery_config,
             rearm: self.recovery_rearm,
-        });
+            #[cfg(feature = "fleet")]
+            fleet: self.fleet.clone(),
+        }
+    }
+
+    fn start_coherence_apply(&self, sync: &std::sync::Arc<crate::sync::coherence::WriteSync>) {
         sync.start_apply(
             self.obj_cache.local(),
             self.state.clone(),
@@ -757,15 +792,20 @@ impl CachingProxy {
         mut entry: ObjEntry,
     ) -> Option<String> {
         entry.last_modified = wire_stamp(SystemTime::now());
-        // Apply locally first: the writer must never be the one node still answering
-        // from the older entry, not even for the length of a publish. The copy is only
-        // taken when there is a feed to advertise it on.
-        let advertised = self.sync.is_some().then(|| entry.clone());
-        if apply_put(&self.state, bucket, key, entry) {
+        // Index first: the writer must never be the one node still answering from the
+        // older entry, not even for the length of a publish. With a feed, the same
+        // index lock assigns the write's feed position.
+        let Some(sync) = self.sync.as_ref() else {
+            if apply_put(&self.state, bucket, key, entry) {
+                op.record(&self.metrics);
+            }
+            return None;
+        };
+        let (changed, publishing) = sync.index_put(&self.state, bucket, key, entry, &self.metrics);
+        if changed {
             op.record(&self.metrics);
         }
-        let (sync, entry) = (self.sync.as_ref()?, advertised?);
-        let receipt = sync.publish_put(bucket, key, &entry, &self.metrics).await;
+        let receipt = publishing.await;
         sync.ack_write(receipt.token, WRITE_ACK_TIMEOUT, bucket, key, &self.metrics)
             .await;
         Some(receipt.header)
@@ -777,9 +817,14 @@ impl CachingProxy {
     /// [`await_cluster`](Self::await_cluster)).
     pub(super) async fn record_del(&self, bucket: &str, key: &str) -> Option<WriteReceipt> {
         let ts = wire_stamp(SystemTime::now());
-        apply_del(&self.state, bucket, key, ts);
-        let sync = self.sync.as_ref()?;
-        Some(sync.publish_del(bucket, key, ts, &self.metrics).await)
+        let Some(sync) = self.sync.as_ref() else {
+            apply_del(&self.state, bucket, key, ts);
+            return None;
+        };
+        Some(
+            sync.index_del(&self.state, bucket, key, ts, &self.metrics)
+                .await,
+        )
     }
 
     /// Hold a write's response until every alive peer has applied it, then hand back the
@@ -1165,8 +1210,9 @@ impl CachingProxy {
     ///   warm tier's whole value proposition and what `tests/tier_cache.rs` asserts.
     /// * **Already proved** — one relaxed load ([`CachedObject::trusted`]). The steady
     ///   state, and it costs nothing.
-    /// * **Suspect, synced bucket** — the LIST index is this node's own re-read of the
-    ///   origin, so it can arbitrate: a matching `ETag` and an mtime it has not moved
+    /// * **Suspect, synced bucket** — guarded origin or peer recovery has made
+    ///   this node's index current under its lease and feed gate, so it can
+    ///   arbitrate: a matching `ETag` and an mtime it has not moved
     ///   past ([`compare_entry_body`]) proves the copy, and the stamp puts the next read
     ///   of it back on the fast path. Anything else — a different version, a comparison
     ///   neither side carries, or a key the index no longer holds, which is precisely the

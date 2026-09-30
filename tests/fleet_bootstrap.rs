@@ -1,0 +1,962 @@
+//! Origin cost and liveness of opt-in fleet index bootstrap against real `MinIO`.
+
+#![cfg(feature = "fleet")]
+
+mod common;
+
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use common::{
+    Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, head, list, proxy_over, put,
+    wait_for_index, warm_proxy_over,
+};
+use groupnet::consistency::volatile_recovery::{RecoveryConfig, RecoveryStage};
+use s3cache::cache::proxy::CachingProxy;
+use s3cache::metrics::Metrics;
+use s3cache::sync::coherence::WriteSync;
+use s3cache::sync::fleet::config::FleetConfig;
+
+const CAP: usize = 1024 * 1024;
+const READY_DEADLINE: Duration = Duration::from_secs(30);
+const JOIN_READ_DELAY: Duration = Duration::from_secs(8);
+const READ_VECTOR_DEADLINE: Duration = Duration::from_secs(10);
+
+struct PausedListRelease(Arc<Origin>);
+
+impl Drop for PausedListRelease {
+    fn drop(&mut self) {
+        self.0.release_paused_list();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Counts {
+    list: u64,
+    get: u64,
+    head: u64,
+    successful_list: u64,
+    successful_get: u64,
+    successful_head: u64,
+    put: u64,
+    copy: u64,
+    delete: u64,
+}
+
+impl Counts {
+    fn take(origin: &Origin) -> Self {
+        Self {
+            list: origin.ops.list(),
+            get: origin.ops.get(),
+            head: origin.ops.head(),
+            successful_list: origin.ops.successful_list(),
+            successful_get: origin.ops.successful_get(),
+            successful_head: origin.ops.successful_head(),
+            put: origin.ops.put(),
+            copy: origin.ops.copy(),
+            delete: origin.ops.delete(),
+        }
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            list: self.list - before.list,
+            get: self.get - before.get,
+            head: self.head - before.head,
+            successful_list: self.successful_list - before.successful_list,
+            successful_get: self.successful_get - before.successful_get,
+            successful_head: self.successful_head - before.successful_head,
+            put: self.put - before.put,
+            copy: self.copy - before.copy,
+            delete: self.delete - before.delete,
+        }
+    }
+
+    fn assert_no_writes(self) {
+        assert_eq!(self.put, 0, "fleet bootstrap wrote an origin object");
+        assert_eq!(self.copy, 0, "fleet bootstrap copied an origin object");
+        assert_eq!(self.delete, 0, "fleet bootstrap deleted an origin object");
+    }
+}
+
+fn free_tcp_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("test TCP port")
+        .local_addr()
+        .expect("bound TCP port")
+        .port()
+}
+
+async fn mutual_alive(a: &WriteSync, a_name: &str, b: &WriteSync, b_name: &str) {
+    tokio::time::timeout(READY_DEADLINE, async {
+        loop {
+            if a.peer_alive(b_name) && b.peer_alive(a_name) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both gossip views reach Alive before the healthy-donor join");
+}
+
+fn fleet_config(origin: &Origin, bucket: &str, name: &str, ports: &[(&str, u16)]) -> FleetConfig {
+    let port = ports
+        .iter()
+        .find_map(|(peer, port)| (*peer == name).then_some(*port))
+        .expect("node in the complete fleet address book");
+    let address = format!("127.0.0.1:{port}");
+    let book = ports
+        .iter()
+        .map(|(peer, port)| format!("{peer}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    FleetConfig::parse(
+        Some(address.clone()),
+        Some(address),
+        Some(book),
+        Some("minio-fleet-cost-fixture".to_owned()),
+        origin.counted_endpoint(),
+        "us-east-1",
+        name,
+        &[bucket.to_owned()],
+    )
+    .expect("valid explicit fleet configuration")
+    .expect("fleet opted in")
+}
+
+async fn ready(proxy: &CachingProxy, bucket: &str) -> Duration {
+    ready_by(proxy, bucket, Instant::now() + READY_DEADLINE).await
+}
+
+async fn ready_by(proxy: &CachingProxy, bucket: &str, due: Instant) -> Duration {
+    ready_all_by(&[proxy], bucket, due).await
+}
+
+fn serves_locally(proxy: &CachingProxy, bucket: &str) -> bool {
+    proxy
+        .recovery_status()
+        .is_some_and(|status| status.state.stage == RecoveryStage::Ready && status.may_serve)
+        && proxy.initially_ready(&[bucket.to_owned()])
+}
+
+async fn ready_all_by(nodes: &[&CachingProxy], bucket: &str, due: Instant) -> Duration {
+    let started = Instant::now();
+    tokio::time::timeout_at(tokio::time::Instant::from_std(due), async {
+        loop {
+            if nodes.iter().all(|node| serves_locally(node, bucket)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("each current recovery gate and index reach Ready before the fixed deadline");
+    started.elapsed()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReadTiming {
+    get_ms: u128,
+    vector_ms: u128,
+}
+
+async fn sample_reads(proxy: &CachingProxy, bucket: &str) -> ReadTiming {
+    tokio::time::timeout(READ_VECTOR_DEADLINE, async {
+        let started = Instant::now();
+        assert_eq!(list(proxy, bucket).await, ["body"]);
+        let get_started = Instant::now();
+        assert_eq!(get(proxy, bucket, "body").await.as_ref(), b"warm-body");
+        let get_ms = get_started.elapsed().as_millis();
+        assert!(head(proxy, bucket, "body").await.is_ok());
+        ReadTiming {
+            get_ms,
+            vector_ms: started.elapsed().as_millis(),
+        }
+    })
+    .await
+    .expect("LIST/GET/HEAD vector remains responsive")
+}
+
+async fn stage_warm_body(origin: &Origin, dir: &WarmDir, bucket: &str) {
+    {
+        let metrics = Arc::new(Metrics::default());
+        let prior = warm_proxy_over(&origin.counted_client(), CAP, None, dir, &metrics);
+        prior.spawn_background_sync(vec![bucket.to_owned()]);
+        wait_for_index(&prior, origin, bucket).await;
+        assert_eq!(get(&prior, bucket, "body").await.as_ref(), b"warm-body");
+    }
+    tokio::time::timeout(READY_DEADLINE, async {
+        while dir.files() != 1 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the previous process left one persisted warm body");
+}
+
+/// Measure the deployment's ordinary immediate-join schedule separately from
+/// the mutually Alive donor schedule below. A just-started peer may still be
+/// Suspect in the joiner's roster; guarded origin recovery is then legitimate
+/// and must remain bounded, but it is not a Class A saving.
+#[tokio::test]
+async fn immediate_join_records_origin_fallback_cost() {
+    let origin = Origin::start("fleet-immediate-join").await;
+    origin.seed("body", b"warm-body").await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+
+    let off_before = Counts::take(&origin);
+    let (off_donor_udp, off_joiner_udp) = (free_udp_port(), free_udp_port());
+    let off_donor_sync = gossip_node(
+        "immediate-off-a",
+        off_donor_udp,
+        &[("immediate-off-b", off_joiner_udp)],
+    )
+    .await;
+    let off_a = proxy_over(&client, CAP, Some(off_donor_sync));
+    off_a.start_coherence(std::slice::from_ref(&bucket));
+    off_a.spawn_background_sync(vec![bucket.clone()]);
+    let off_donor_ready = ready(&off_a, &bucket).await;
+    let off_joiner_sync = gossip_node(
+        "immediate-off-b",
+        off_joiner_udp,
+        &[("immediate-off-a", off_donor_udp)],
+    )
+    .await;
+    let off_b = proxy_over(&client, CAP, Some(off_joiner_sync));
+    off_b.start_coherence(std::slice::from_ref(&bucket));
+    off_b.spawn_background_sync(vec![bucket.clone()]);
+    let off_joiner_ready = ready(&off_b, &bucket).await;
+    let off_both_ready =
+        ready_all_by(&[&off_a, &off_b], &bucket, Instant::now() + READY_DEADLINE).await;
+    let off_cost = Counts::take(&origin).since(off_before);
+
+    let on_before = Counts::take(&origin);
+    let ports = [
+        ("immediate-on-a", free_tcp_port()),
+        ("immediate-on-b", free_tcp_port()),
+    ];
+    let (on_donor_udp, on_joiner_udp) = (free_udp_port(), free_udp_port());
+    let on_donor_sync = gossip_node(
+        "immediate-on-a",
+        on_donor_udp,
+        &[("immediate-on-b", on_joiner_udp)],
+    )
+    .await;
+    let on_a = proxy_over(&client, CAP, Some(on_donor_sync)).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "immediate-on-a",
+        &ports,
+    ));
+    on_a.start_fleet_coherence(std::slice::from_ref(&bucket))
+        .await;
+    on_a.spawn_background_sync(vec![bucket.clone()]);
+    let on_donor_ready = ready(&on_a, &bucket).await;
+    let on_joiner_sync = gossip_node(
+        "immediate-on-b",
+        on_joiner_udp,
+        &[("immediate-on-a", on_donor_udp)],
+    )
+    .await;
+    let on_b = proxy_over(&client, CAP, Some(on_joiner_sync)).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "immediate-on-b",
+        &ports,
+    ));
+    on_b.start_fleet_coherence(std::slice::from_ref(&bucket))
+        .await;
+    on_b.spawn_background_sync(vec![bucket.clone()]);
+    let on_joiner_ready = ready(&on_b, &bucket).await;
+    let on_both_ready =
+        ready_all_by(&[&on_a, &on_b], &bucket, Instant::now() + READY_DEADLINE).await;
+    let on_cost = Counts::take(&origin).since(on_before);
+
+    let off_read_before = Counts::take(&origin);
+    let off_read_time = sample_reads(&off_b, &bucket).await;
+    let off_read_cost = Counts::take(&origin).since(off_read_before);
+    let on_read_before = Counts::take(&origin);
+    let on_read_time = sample_reads(&on_b, &bucket).await;
+    let on_read_cost = Counts::take(&origin).since(on_read_before);
+    assert!(
+        on_cost.list <= off_cost.list,
+        "immediate fleet join must not add origin LIST attempts: off={off_cost:?}, on={on_cost:?}"
+    );
+    off_cost.assert_no_writes();
+    on_cost.assert_no_writes();
+    off_read_cost.assert_no_writes();
+    on_read_cost.assert_no_writes();
+    println!(
+        "fleet_bootstrap immediate_startup_off={off_cost:?} immediate_startup_on={on_cost:?} immediate_reads_off={off_read_cost:?} immediate_reads_on={on_read_cost:?} positive_get_ms=[{},{}] vector_ms=[{},{}] index_ready_ms=[{},{},{},{}] both_current_ready_ms=[{},{}]",
+        off_read_time.get_ms,
+        on_read_time.get_ms,
+        off_read_time.vector_ms,
+        on_read_time.vector_ms,
+        off_donor_ready.as_millis(),
+        off_joiner_ready.as_millis(),
+        on_donor_ready.as_millis(),
+        on_joiner_ready.as_millis(),
+        off_both_ready.as_millis(),
+        on_both_ready.as_millis()
+    );
+    assert!(origin.ops.writes().is_empty(), "no origin control writes");
+}
+
+/// Start the same two-node schedule first without and then with fleet mode.
+/// Count billed origin attempts, completed responses, and first local-read time.
+/// The fleet transfers an index, not object bytes: the first GET may still
+/// reach `MinIO`, while repeated same-process hot-body reads remain local.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "paired cold and warm request vectors share one origin counter baseline and fixed ordering"
+)]
+async fn cold_join_prices_origin_lists_and_warm_reads() {
+    let origin = Origin::start("fleet-bootstrap-cost").await;
+    origin.seed("body", b"warm-body").await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+
+    let off_before = Counts::take(&origin);
+    let (off_donor_udp, off_joiner_udp) = (free_udp_port(), free_udp_port());
+    let off_donor_sync = gossip_node(
+        "fleet-off-a",
+        off_donor_udp,
+        &[("fleet-off-b", off_joiner_udp)],
+    )
+    .await;
+    let off_a = proxy_over(&client, CAP, Some(Arc::clone(&off_donor_sync)));
+    off_a.start_coherence(std::slice::from_ref(&bucket));
+    off_a.spawn_background_sync(vec![bucket.clone()]);
+    let off_donor_ready = ready(&off_a, &bucket).await;
+    let off_joiner_sync = gossip_node(
+        "fleet-off-b",
+        off_joiner_udp,
+        &[("fleet-off-a", off_donor_udp)],
+    )
+    .await;
+    let off_b = proxy_over(&client, CAP, Some(Arc::clone(&off_joiner_sync)));
+    mutual_alive(
+        &off_donor_sync,
+        "fleet-off-a",
+        &off_joiner_sync,
+        "fleet-off-b",
+    )
+    .await;
+    off_b.start_coherence(std::slice::from_ref(&bucket));
+    off_b.spawn_background_sync(vec![bucket.clone()]);
+    let off_joiner_ready = ready(&off_b, &bucket).await;
+    let off_both_ready =
+        ready_all_by(&[&off_a, &off_b], &bucket, Instant::now() + READY_DEADLINE).await;
+    let off_cold = Counts::take(&origin).since(off_before);
+    assert!(
+        off_cold.list >= 2,
+        "each disabled node completes an origin scan"
+    );
+    assert_eq!(off_cold.list, off_cold.successful_list);
+    let off_first_a = sample_reads(&off_a, &bucket).await;
+    let off_first_b = sample_reads(&off_b, &bucket).await;
+    let off_warm_before = Counts::take(&origin);
+    let off_warm_a = sample_reads(&off_a, &bucket).await;
+    let off_warm_b = sample_reads(&off_b, &bucket).await;
+    let off_warm = Counts::take(&origin).since(off_warm_before);
+
+    let on_before = Counts::take(&origin);
+    let ports = [
+        ("fleet-on-a", free_tcp_port()),
+        ("fleet-on-b", free_tcp_port()),
+    ];
+    let (on_donor_udp, on_joiner_udp) = (free_udp_port(), free_udp_port());
+    let on_donor_sync =
+        gossip_node("fleet-on-a", on_donor_udp, &[("fleet-on-b", on_joiner_udp)]).await;
+    let on_a = proxy_over(&client, CAP, Some(Arc::clone(&on_donor_sync)))
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-on-a", &ports));
+    on_a.start_fleet_coherence(std::slice::from_ref(&bucket))
+        .await;
+    on_a.spawn_background_sync(vec![bucket.clone()]);
+    let on_donor_ready = ready(&on_a, &bucket).await;
+    let on_joiner_sync =
+        gossip_node("fleet-on-b", on_joiner_udp, &[("fleet-on-a", on_donor_udp)]).await;
+    let on_b = proxy_over(&client, CAP, Some(Arc::clone(&on_joiner_sync)))
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-on-b", &ports));
+    mutual_alive(&on_donor_sync, "fleet-on-a", &on_joiner_sync, "fleet-on-b").await;
+    on_b.start_fleet_coherence(std::slice::from_ref(&bucket))
+        .await;
+    on_b.spawn_background_sync(vec![bucket.clone()]);
+    let on_joiner_ready = ready(&on_b, &bucket).await;
+    let on_both_ready =
+        ready_all_by(&[&on_a, &on_b], &bucket, Instant::now() + READY_DEADLINE).await;
+    let on_cold = Counts::take(&origin).since(on_before);
+    assert!(
+        on_cold.list < off_cold.list,
+        "fleet join should replace one full origin LIST scan: off={off_cold:?}, on={on_cold:?}"
+    );
+    assert_eq!(on_cold.list, on_cold.successful_list);
+    let on_first_a = sample_reads(&on_a, &bucket).await;
+    let on_first_b = sample_reads(&on_b, &bucket).await;
+    let on_warm_before = Counts::take(&origin);
+    let on_warm_a = sample_reads(&on_a, &bucket).await;
+    let on_warm_b = sample_reads(&on_b, &bucket).await;
+    let on_warm = Counts::take(&origin).since(on_warm_before);
+    assert!(on_warm.get <= off_warm.get, "fleet must not add warm GETs");
+    assert!(
+        on_warm.head <= off_warm.head,
+        "fleet must not add warm HEADs"
+    );
+    assert_eq!(on_warm.get, on_warm.successful_get);
+    assert_eq!(on_warm.head, on_warm.successful_head);
+
+    off_cold.assert_no_writes();
+    on_cold.assert_no_writes();
+    off_warm.assert_no_writes();
+    on_warm.assert_no_writes();
+    println!(
+        "fleet_bootstrap cold_off={off_cold:?} cold_on={on_cold:?} warm_off={off_warm:?} warm_on={on_warm:?} first_get_ms=[{},{},{},{}] first_vector_ms=[{},{},{},{}] warm_get_ms=[{},{},{},{}] warm_vector_ms=[{},{},{},{}] index_ready_ms=[{},{},{},{}] both_current_ready_ms=[{},{}]",
+        off_first_a.get_ms,
+        off_first_b.get_ms,
+        on_first_a.get_ms,
+        on_first_b.get_ms,
+        off_first_a.vector_ms,
+        off_first_b.vector_ms,
+        on_first_a.vector_ms,
+        on_first_b.vector_ms,
+        off_warm_a.get_ms,
+        off_warm_b.get_ms,
+        on_warm_a.get_ms,
+        on_warm_b.get_ms,
+        off_warm_a.vector_ms,
+        off_warm_b.vector_ms,
+        on_warm_a.vector_ms,
+        on_warm_b.vector_ms,
+        off_donor_ready.as_millis(),
+        off_joiner_ready.as_millis(),
+        on_donor_ready.as_millis(),
+        on_joiner_ready.as_millis(),
+        off_both_ready.as_millis(),
+        on_both_ready.as_millis()
+    );
+    assert!(origin.ops.writes().is_empty(), "no origin control writes");
+}
+
+/// Both joining nodes inherit the same persisted body fixture from an earlier
+/// process. Hold each joining node's next origin LIST after `MinIO` answers, then
+/// issue the same LIST/GET/HEAD schedule at the same fixed delay. The enabled
+/// node must reach Ready from its peer without attempting the held origin LIST;
+/// the disabled node still pays origin GET/HEAD during its blocked scan.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the two warm-join arms keep one fixed request schedule and their cost baselines together"
+)]
+async fn later_join_keeps_persisted_warm_body_origin_free() {
+    let origin = Origin::start("fleet-warm-join").await;
+    origin.seed("body", b"warm-body").await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    let off_dir = WarmDir::new("fleet-warm-off");
+    let on_dir = WarmDir::new("fleet-warm-on");
+    stage_warm_body(&origin, &off_dir, &bucket).await;
+    stage_warm_body(&origin, &on_dir, &bucket).await;
+
+    let (off_donor_udp, off_joiner_udp) = (free_udp_port(), free_udp_port());
+    let off_donor_sync = gossip_node(
+        "fleet-warm-off-a",
+        off_donor_udp,
+        &[("fleet-warm-off-b", off_joiner_udp)],
+    )
+    .await;
+    let off_a = proxy_over(&client, CAP, Some(Arc::clone(&off_donor_sync)));
+    off_a.start_coherence(std::slice::from_ref(&bucket));
+    off_a.spawn_background_sync(vec![bucket.clone()]);
+    ready(&off_a, &bucket).await;
+    let off_before = Counts::take(&origin);
+    let off_joiner_sync = gossip_node(
+        "fleet-warm-off-b",
+        off_joiner_udp,
+        &[("fleet-warm-off-a", off_donor_udp)],
+    )
+    .await;
+    let off_metrics = Arc::new(Metrics::default());
+    let off_b = warm_proxy_over(
+        &client,
+        CAP,
+        Some(Arc::clone(&off_joiner_sync)),
+        &off_dir,
+        &off_metrics,
+    );
+    mutual_alive(
+        &off_donor_sync,
+        "fleet-warm-off-a",
+        &off_joiner_sync,
+        "fleet-warm-off-b",
+    )
+    .await;
+    origin.pause_next_list();
+    let release = PausedListRelease(Arc::clone(&origin));
+    let off_started = Instant::now();
+    off_b.start_coherence(std::slice::from_ref(&bucket));
+    off_b.spawn_background_sync(vec![bucket.clone()]);
+    let off_read_at = off_started + JOIN_READ_DELAY;
+    tokio::time::timeout_at(
+        tokio::time::Instant::from_std(off_read_at),
+        origin.wait_for_paused_list(),
+    )
+    .await
+    .expect("disabled joining node issued its startup origin LIST");
+    tokio::time::sleep_until(tokio::time::Instant::from_std(off_read_at)).await;
+    let off_read_time = sample_reads(&off_b, &bucket).await;
+    let off_cost = Counts::take(&origin).since(off_before);
+    drop(release);
+    ready(&off_b, &bucket).await;
+    let off_ready = off_started.elapsed();
+    sample_reads(&off_b, &bucket).await;
+    assert!(counter(&off_metrics, "warm_hit") >= 1);
+
+    let ports = [
+        ("fleet-warm-on-a", free_tcp_port()),
+        ("fleet-warm-on-b", free_tcp_port()),
+    ];
+    let (on_donor_udp, on_joiner_udp) = (free_udp_port(), free_udp_port());
+    let on_donor_sync = gossip_node(
+        "fleet-warm-on-a",
+        on_donor_udp,
+        &[("fleet-warm-on-b", on_joiner_udp)],
+    )
+    .await;
+    let on_a = proxy_over(&client, CAP, Some(Arc::clone(&on_donor_sync)))
+        .with_fleet_config(fleet_config(&origin, &bucket, "fleet-warm-on-a", &ports));
+    on_a.start_fleet_coherence(std::slice::from_ref(&bucket))
+        .await;
+    on_a.spawn_background_sync(vec![bucket.clone()]);
+    ready(&on_a, &bucket).await;
+    let on_before = Counts::take(&origin);
+    let on_joiner_sync = gossip_node(
+        "fleet-warm-on-b",
+        on_joiner_udp,
+        &[("fleet-warm-on-a", on_donor_udp)],
+    )
+    .await;
+    let on_metrics = Arc::new(Metrics::default());
+    let on_b = warm_proxy_over(
+        &client,
+        CAP,
+        Some(Arc::clone(&on_joiner_sync)),
+        &on_dir,
+        &on_metrics,
+    )
+    .with_fleet_config(fleet_config(&origin, &bucket, "fleet-warm-on-b", &ports));
+    mutual_alive(
+        &on_donor_sync,
+        "fleet-warm-on-a",
+        &on_joiner_sync,
+        "fleet-warm-on-b",
+    )
+    .await;
+    origin.pause_next_list();
+    let on_release = PausedListRelease(Arc::clone(&origin));
+    let on_started = Instant::now();
+    on_b.start_fleet_coherence(std::slice::from_ref(&bucket))
+        .await;
+    on_b.spawn_background_sync(vec![bucket.clone()]);
+    let on_read_at = on_started + JOIN_READ_DELAY;
+    ready_all_by(&[&on_a, &on_b], &bucket, on_read_at).await;
+    let on_ready = on_started.elapsed();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(on_read_at)).await;
+    let on_read_time = sample_reads(&on_b, &bucket).await;
+    let on_cost = Counts::take(&origin).since(on_before);
+    drop(on_release);
+    assert!(counter(&on_metrics, "warm_hit") >= 1);
+
+    assert_eq!(
+        on_cost.list, 0,
+        "peer-built index became Ready without the joining node attempting origin LIST: off={off_cost:?}, on={on_cost:?}"
+    );
+    assert!(
+        off_cost.get >= 1,
+        "blocked scan cannot yet trust the warm body"
+    );
+    assert_eq!(on_cost.get, 0, "on fixture retained its warm body");
+    assert!(on_cost.get < off_cost.get, "fleet saves Class B GETs");
+    assert!(
+        on_cost.head <= off_cost.head,
+        "fleet must not add Class B HEADs: off={off_cost:?}, on={on_cost:?}"
+    );
+    assert!(
+        on_cost.get + on_cost.head < off_cost.get + off_cost.head,
+        "fleet saves total Class B requests: off={off_cost:?}, on={on_cost:?}"
+    );
+    off_cost.assert_no_writes();
+    on_cost.assert_no_writes();
+    println!(
+        "fleet_bootstrap persisted_warm off={off_cost:?} on={on_cost:?} positive_get_ms=[{},{}] vector_ms=[{},{}] index_ready_ms=[{},{}]",
+        off_read_time.get_ms,
+        on_read_time.get_ms,
+        off_read_time.vector_ms,
+        on_read_time.vector_ms,
+        off_ready.as_millis(),
+        on_ready.as_millis()
+    );
+    assert!(origin.ops.writes().is_empty(), "no origin control writes");
+}
+
+/// A follower that already has a peer-built index keeps serving that indexed
+/// bucket while one of its own unrelated origin LISTs is waiting on `MinIO`.
+#[tokio::test]
+async fn ready_follower_keeps_local_reads_during_a_paused_origin_list() {
+    let origin = Origin::start("fleet-paused-list").await;
+    origin.seed("body", b"warm-body").await;
+    let bucket = origin.bucket().to_owned();
+    let other = "fleet-paused-list-other";
+    origin
+        .client()
+        .create_bucket()
+        .bucket(other)
+        .send()
+        .await
+        .expect("create unindexed passthrough bucket");
+    let client = origin.counted_client();
+    let ports = [
+        ("fleet-pause-a", free_tcp_port()),
+        ("fleet-pause-b", free_tcp_port()),
+    ];
+    let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
+    let a_sync = gossip_node("fleet-pause-a", a_udp, &[("fleet-pause-b", b_udp)]).await;
+    let a = proxy_over(&client, CAP, Some(Arc::clone(&a_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-pause-a",
+        &ports,
+    ));
+    a.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    a.spawn_background_sync(vec![bucket.clone()]);
+    ready(&a, &bucket).await;
+    let before_join = Counts::take(&origin);
+    let b_sync = gossip_node("fleet-pause-b", b_udp, &[("fleet-pause-a", a_udp)]).await;
+    let b = proxy_over(&client, CAP, Some(Arc::clone(&b_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-pause-b",
+        &ports,
+    ));
+    mutual_alive(&a_sync, "fleet-pause-a", &b_sync, "fleet-pause-b").await;
+    b.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    b.spawn_background_sync(vec![bucket.clone()]);
+    ready(&b, &bucket).await;
+    ready_all_by(&[&a, &b], &bucket, Instant::now() + READY_DEADLINE).await;
+    assert_eq!(
+        Counts::take(&origin).list,
+        before_join.list,
+        "follower became Ready from its peer without a completed origin scan"
+    );
+    sample_reads(&b, &bucket).await;
+
+    origin.pause_next_list();
+    let release = PausedListRelease(Arc::clone(&origin));
+    let waiting = b.clone();
+    let paused = tokio::spawn(async move { list(&waiting, other).await });
+    tokio::time::timeout(READY_DEADLINE, origin.wait_for_paused_list())
+        .await
+        .expect("follower passthrough LIST reached origin");
+    let before = Counts::take(&origin);
+    tokio::time::timeout(Duration::from_secs(5), sample_reads(&b, &bucket))
+        .await
+        .expect("indexed bucket still serves locally during origin stall");
+    let after = Counts::take(&origin).since(before);
+    assert_eq!(after.list, 0, "indexed LIST did not visit the origin");
+    assert_eq!(after.get, 0, "warm body did not visit the origin");
+    assert_eq!(after.head, 0, "indexed HEAD did not visit the origin");
+    drop(release);
+    assert!(
+        paused
+            .await
+            .expect("passthrough request finishes")
+            .is_empty()
+    );
+    after.assert_no_writes();
+    assert!(origin.ops.writes().is_empty(), "no origin control writes");
+}
+
+/// A changed live roster retires the old finite donor capture. Its already
+/// Ready index can be recaptured under a fresh roster so a third joining node
+/// does not force another full origin inventory.
+#[tokio::test]
+async fn third_join_uses_fresh_ready_donor_capture_without_origin_rescan() {
+    let origin = Origin::start("fleet-third-join").await;
+    origin.seed("body", b"warm-body").await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    let ports = [
+        ("fleet-third-a", free_tcp_port()),
+        ("fleet-third-b", free_tcp_port()),
+        ("fleet-third-c", free_tcp_port()),
+    ];
+    let udp_a = free_udp_port();
+    let udp_b = free_udp_port();
+    let udp_c = free_udp_port();
+    let a_sync = gossip_node(
+        "fleet-third-a",
+        udp_a,
+        &[("fleet-third-b", udp_b), ("fleet-third-c", udp_c)],
+    )
+    .await;
+    let a = proxy_over(&client, CAP, Some(Arc::clone(&a_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-third-a",
+        &ports,
+    ));
+    a.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    a.spawn_background_sync(vec![bucket.clone()]);
+    ready(&a, &bucket).await;
+
+    let b_sync = gossip_node(
+        "fleet-third-b",
+        udp_b,
+        &[("fleet-third-a", udp_a), ("fleet-third-c", udp_c)],
+    )
+    .await;
+    let b = proxy_over(&client, CAP, Some(Arc::clone(&b_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-third-b",
+        &ports,
+    ));
+    mutual_alive(&a_sync, "fleet-third-a", &b_sync, "fleet-third-b").await;
+    b.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    b.spawn_background_sync(vec![bucket.clone()]);
+    ready(&b, &bucket).await;
+    ready_all_by(&[&a, &b], &bucket, Instant::now() + READY_DEADLINE).await;
+    let before_third = Counts::take(&origin);
+
+    let c_sync = gossip_node(
+        "fleet-third-c",
+        udp_c,
+        &[("fleet-third-a", udp_a), ("fleet-third-b", udp_b)],
+    )
+    .await;
+    let c = proxy_over(&client, CAP, Some(Arc::clone(&c_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-third-c",
+        &ports,
+    ));
+    mutual_alive(&a_sync, "fleet-third-a", &c_sync, "fleet-third-c").await;
+    mutual_alive(&b_sync, "fleet-third-b", &c_sync, "fleet-third-c").await;
+    c.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    c.spawn_background_sync(vec![bucket.clone()]);
+    let third_ready = ready(&c, &bucket).await;
+    let all_current_ready =
+        ready_all_by(&[&a, &b, &c], &bucket, Instant::now() + READY_DEADLINE).await;
+    let third_cost = Counts::take(&origin).since(before_third);
+    assert_eq!(
+        third_cost.list, 0,
+        "Ready donor recapture avoids a third full origin scan: {third_cost:?}"
+    );
+    sample_reads(&c, &bucket).await;
+    third_cost.assert_no_writes();
+    println!(
+        "fleet_bootstrap third_join={third_cost:?} index_ready_ms={} all_current_ready_ms={}",
+        third_ready.as_millis(),
+        all_current_ready.as_millis()
+    );
+    assert!(origin.ops.writes().is_empty(), "no origin control writes");
+}
+
+/// The selected donor's TCP address is unreachable despite live gossip.
+/// Peer transfer must stop at a finite deadline and fall back to a guarded
+/// origin scan instead of leaving this node permanently unable to serve.
+#[tokio::test]
+async fn unreachable_donor_falls_back_to_origin_within_budget() {
+    let origin = Origin::start("fleet-donor-unreachable").await;
+    origin.seed("body", b"warm-body").await;
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    let actual_a = free_tcp_port();
+    let actual_b = free_tcp_port();
+    let unreachable_a = free_tcp_port();
+    let a_udp = free_udp_port();
+    let b_udp = free_udp_port();
+    let a_sync = gossip_node("fleet-fault-a", a_udp, &[("fleet-fault-b", b_udp)]).await;
+    let good_book = [("fleet-fault-a", actual_a), ("fleet-fault-b", actual_b)];
+    let a = proxy_over(&client, CAP, Some(Arc::clone(&a_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-fault-a",
+        &good_book,
+    ));
+    a.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    a.spawn_background_sync(vec![bucket.clone()]);
+    ready(&a, &bucket).await;
+
+    let before = Counts::take(&origin);
+    let b_sync = gossip_node("fleet-fault-b", b_udp, &[("fleet-fault-a", a_udp)]).await;
+    let broken_book = [
+        ("fleet-fault-a", unreachable_a),
+        ("fleet-fault-b", actual_b),
+    ];
+    let b = proxy_over(&client, CAP, Some(Arc::clone(&b_sync)))
+        .with_fleet_config(fleet_config(
+            &origin,
+            &bucket,
+            "fleet-fault-b",
+            &broken_book,
+        ))
+        .with_recovery_config(RecoveryConfig {
+            max_members: 16,
+            max_member_bytes: 128,
+            max_barrier_rounds: 4,
+            total_ms: 20_000,
+            attempt_ms: 3_000,
+            settle_ms: 3_000,
+            poll_ms: 50,
+        })
+        .expect("finite fault test recovery budget");
+    mutual_alive(&a_sync, "fleet-fault-a", &b_sync, "fleet-fault-b").await;
+    b.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    b.spawn_background_sync(vec![bucket.clone()]);
+    let fallback_ready = ready(&b, &bucket).await;
+    let fallback = Counts::take(&origin).since(before);
+    assert!(
+        fallback.successful_list >= 1,
+        "failed donor transfer completed a guarded origin scan: {fallback:?}"
+    );
+    sample_reads(&b, &bucket).await;
+    fallback.assert_no_writes();
+    println!(
+        "fleet_bootstrap donor_unreachable={fallback:?} index_ready_ms={}",
+        fallback_ready.as_millis()
+    );
+    assert!(origin.ops.writes().is_empty(), "no origin control writes");
+}
+
+/// A normal serialized writer keeps changing one object and deleting another
+/// throughout a follower's peer bootstrap. Its final acknowledged state must
+/// be visible from the follower without a second full origin inventory.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one serialized mutation schedule and its final follower assertions form one integration scenario"
+)]
+async fn live_mutations_overlap_follower_bootstrap() {
+    let origin = Origin::start("fleet-live-join").await;
+    for n in 0..48 {
+        origin.seed(&format!("seed-{n:03}"), b"seed body").await;
+    }
+    let bucket = origin.bucket().to_owned();
+    let client = origin.counted_client();
+    let ports = [
+        ("fleet-live-a", free_tcp_port()),
+        ("fleet-live-b", free_tcp_port()),
+    ];
+    let (a_udp, b_udp) = (free_udp_port(), free_udp_port());
+    let a_sync = gossip_node("fleet-live-a", a_udp, &[("fleet-live-b", b_udp)]).await;
+    let a = proxy_over(&client, CAP, Some(Arc::clone(&a_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-live-a",
+        &ports,
+    ));
+    a.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    a.spawn_background_sync(vec![bucket.clone()]);
+    ready(&a, &bucket).await;
+
+    let before_join = Counts::take(&origin);
+    let stop = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicU64::new(0));
+    let writer_stop = Arc::clone(&stop);
+    let writer_completed = Arc::clone(&completed);
+    let writer_node = a.clone();
+    let writer_bucket = bucket.clone();
+    let (first_write, first_done) = tokio::sync::oneshot::channel();
+    let writer = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(35), async move {
+            let mut first_write = Some(first_write);
+            let mut round = 0_u64;
+            loop {
+                round += 1;
+                let body = format!("live-version-{round}");
+                put(
+                    &writer_node,
+                    &writer_bucket,
+                    "live-updated",
+                    body.as_bytes(),
+                )
+                .await;
+                put(&writer_node, &writer_bucket, "live-deleted", b"transient").await;
+                delete(&writer_node, &writer_bucket, "live-deleted").await;
+                writer_completed.store(round, Ordering::Release);
+                if let Some(first_write) = first_write.take() {
+                    let _ = first_write.send(());
+                }
+                if round >= 3 && writer_stop.load(Ordering::Acquire) {
+                    return (body, round);
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        })
+        .await
+        .expect("serialized live writer completed within its bound")
+    });
+    tokio::time::timeout(READY_DEADLINE, first_done)
+        .await
+        .expect("first live mutation was acknowledged")
+        .expect("live writer reported its first mutation");
+
+    let b_sync = gossip_node("fleet-live-b", b_udp, &[("fleet-live-a", a_udp)]).await;
+    let b = proxy_over(&client, CAP, Some(Arc::clone(&b_sync))).with_fleet_config(fleet_config(
+        &origin,
+        &bucket,
+        "fleet-live-b",
+        &ports,
+    ));
+    mutual_alive(&a_sync, "fleet-live-a", &b_sync, "fleet-live-b").await;
+    let before_join_rounds = completed.load(Ordering::Acquire);
+    let join_started = Instant::now();
+    b.start_fleet_coherence(std::slice::from_ref(&bucket)).await;
+    b.spawn_background_sync(vec![bucket.clone()]);
+    let join_ready = ready(&b, &bucket).await;
+    let completed_during_join = completed.load(Ordering::Acquire);
+    stop.store(true, Ordering::Release);
+    let (final_body, rounds) = writer.await.expect("live writer task joins");
+    assert!(
+        completed_during_join > before_join_rounds,
+        "at least one full mutation round must commit while the follower joins"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let keys = list(&b, &bucket).await;
+            if keys.contains(&"live-updated".to_owned())
+                && !keys.contains(&"live-deleted".to_owned())
+                && head(&b, &bucket, "live-updated").await.is_ok()
+                && get(&b, &bucket, "live-updated").await.as_ref() == final_body.as_bytes()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("follower serves the final acknowledged update and deletion");
+    let both_current_ready =
+        ready_all_by(&[&a, &b], &bucket, Instant::now() + READY_DEADLINE).await;
+    let join_cost = Counts::take(&origin).since(before_join);
+    assert_eq!(
+        join_cost.list, 0,
+        "live writes did not force an independent full origin LIST: {join_cost:?}"
+    );
+    assert_eq!(join_cost.put, 2 * rounds);
+    assert_eq!(join_cost.delete, rounds);
+    assert_eq!(join_cost.copy, 0);
+    assert_eq!(origin.ops.writes().len() as u64, 3 * rounds);
+    println!(
+        "fleet_bootstrap live_join={join_cost:?} rounds={rounds} before_join={before_join_rounds} during_join={completed_during_join} index_ready_ms={} both_current_ready_ms={} elapsed_ms={}",
+        join_ready.as_millis(),
+        both_current_ready.as_millis(),
+        join_started.elapsed().as_millis()
+    );
+}

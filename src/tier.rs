@@ -3,7 +3,7 @@
 //! to pick. Built on `tierstore`: the hot tier is a byte-weighted moka cache (sharded,
 //! `TinyLFU` admission, via `tierstore-moka`), the warm
 //! tier is a byte-budgeted, restart-surviving mmap-disk store. Its record codec keeps
-//! metadata in a small bincode header and the body as a raw mmap-backed tail, so warm
+//! metadata in a small postcard header and the body as a raw mmap-backed tail, so warm
 //! reads parse metadata without copying object bytes back onto the heap. Blocking file
 //! I/O runs on a dedicated offload pool. Warm is inclusive (fills write hot *and* disk) and
 //! best-effort by policy: a disk error or oversize rejection never blocks the hot fill or
@@ -28,20 +28,21 @@ use tierstore::{CodecTier, Eviction, KeyStatus, OffloadTier, SingleFlight};
 use tierstore_mmap::MmapDiskTier;
 use tierstore_moka::MokaTier;
 
+use crate::codec;
 use crate::metrics::Metrics;
 
 /// `(bucket, key)` — the cache's addressing unit.
 pub type CacheKey = (String, String);
 
 /// A cached object body plus the response metadata needed to reconstruct a GET/HEAD.
-/// `Serialize`/`Deserialize` are retained for backward reads of the original
-/// all-bincode warm record; new records encode only metadata and keep `body`
-/// as an mmap-backed tail.
+/// `Serialize` describes the original all-bincode warm record, which
+/// tests and the decode bench still build as legacy fixtures; the warm tier itself
+/// writes a metadata-only header and keeps `body` as an mmap-backed tail.
 ///
 /// Deliberately **not** `Clone`: the tiers hand out `Arc<CachedObject>`, and a copy's
 /// trust stamp (below) is bookkeeping about *that* copy — a clone would have to decide
 /// whether to carry it, and either answer would be wrong somewhere.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 pub struct CachedObject {
     body: Bytes,
     content_length: Option<i64>,
@@ -59,12 +60,11 @@ pub struct CachedObject {
     /// out `Arc<CachedObject>`, and this is proof-of-freshness *about* a copy rather
     /// than part of the object it describes.
     ///
-    /// **Skipped by serde**, which is load-bearing twice over: the warm tier's on-disk
-    /// encoding does not move (entries written by a binary without this field decode
-    /// unchanged), and — because a decoded entry defaults to `0` while a live cache's
-    /// generation starts at `1` — every copy that comes back off disk is born
-    /// *suspect*. That is the point: a node whose disk outlives its process cannot
-    /// vouch for what happened to those objects while it was down.
+    /// **Never stored**: [`WarmHeader`] has no field for it and the legacy fixture
+    /// layout skips it, so every copy that comes back off disk decodes at `0` while a
+    /// live cache's generation starts at `1` — it is born *suspect*. That is the
+    /// point: a node whose disk outlives its process cannot vouch for what happened to
+    /// those objects while it was down.
     #[serde(skip)]
     trusted_gen: AtomicU64,
 }
@@ -367,9 +367,12 @@ fn warm_key(bucket: &str, key: &str) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// Current warm-record discriminator. A legacy bincode tuple starts with a
-/// string length, so no valid legacy record can collide with these bytes.
-const WARM_MAGIC: &[u8; 8] = b"S3CWRM01";
+/// Current warm-record discriminator: a postcard header ahead of the raw body. A
+/// legacy all-bincode tuple starts with a `u64` string length, so no valid legacy
+/// record can collide with either magic.
+const WARM_MAGIC: &[u8; 8] = b"S3CWRM02";
+/// The previous frame: the same layout with a bincode 1 header.
+const LEGACY_WARM_MAGIC: &[u8; 8] = b"S3CWRM01";
 const WARM_PREFIX_LEN: usize = WARM_MAGIC.len() + size_of::<u32>();
 
 /// Encodes the metadata header and raw body tail. `None` means the complete
@@ -379,7 +382,7 @@ fn encode_warm_record(
     object: &CachedObject,
     max_bytes: usize,
 ) -> Result<Option<Bytes>, tierstore::BoxError> {
-    let header = bincode::serialize(&WarmHeader::capture(key, object))?;
+    let header = codec::to_vec(&WarmHeader::capture(key, object))?;
     let header_len = u32::try_from(header.len())
         .map_err(|_| -> tierstore::BoxError { "warm record header exceeds u32".into() })?;
     let total = WARM_PREFIX_LEN
@@ -398,11 +401,13 @@ fn encode_warm_record(
     Ok(Some(Bytes::from(encoded)))
 }
 
-/// Decodes current framed records without copying the body. Original
-/// all-bincode entries remain readable and age out naturally under LRU.
+/// Decodes current framed records without copying the body. Both earlier layouts —
+/// the bincode-header frame and the original all-bincode tuple — stay readable
+/// through [`codec::legacy`] and age out naturally under LRU as entries rewrite.
 fn decode_warm_record(bytes: &Bytes) -> Result<(CacheKey, Arc<CachedObject>), tierstore::BoxError> {
-    if !bytes.starts_with(WARM_MAGIC) {
-        let (key, legacy): (CacheKey, LegacyWarmObject<'_>) = bincode::deserialize(bytes)?;
+    let magic = bytes.get(..WARM_MAGIC.len()).unwrap_or_default();
+    if magic != WARM_MAGIC && magic != LEGACY_WARM_MAGIC {
+        let (key, legacy): (CacheKey, LegacyWarmObject<'_>) = codec::legacy::from_slice(bytes)?;
         let body = if legacy.body.is_empty() {
             Bytes::new()
         } else {
@@ -436,7 +441,12 @@ fn decode_warm_record(bytes: &Bytes) -> Result<(CacheKey, Arc<CachedObject>), ti
         .checked_add(header_len)
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| -> tierstore::BoxError { "truncated warm record header".into() })?;
-    let header: WarmHeader = bincode::deserialize(&bytes[WARM_PREFIX_LEN..body_start])?;
+    let header_bytes = &bytes[WARM_PREFIX_LEN..body_start];
+    let header: WarmHeader = if magic == WARM_MAGIC {
+        codec::from_slice(header_bytes)?
+    } else {
+        codec::legacy::from_slice(header_bytes)?
+    };
     let body = bytes.slice(body_start..);
     if u64::try_from(body.len()).unwrap_or(u64::MAX) != header.body_len {
         return Err("warm record body length mismatch".into());
@@ -943,17 +953,29 @@ mod tests {
         Arc::new(Metrics::default())
     }
 
+    /// A record the previous release framed — magic `S3CWRM01` and a bincode 1 header —
+    /// still decodes in full, body still sliced out of the record.
     #[test]
-    fn legacy_cached_object_bincode_roundtrip() {
-        let obj = sample();
-        let bytes = bincode::serialize(&obj).unwrap();
-        let back: CachedObject = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(obj.body, back.body);
-        assert_eq!(obj.content_length, back.content_length);
-        assert_eq!(obj.content_type, back.content_type);
-        assert_eq!(obj.e_tag, back.e_tag);
-        assert_eq!(obj.last_modified, back.last_modified);
-        assert_eq!(obj.metadata, back.metadata);
+    fn bincode_header_frames_remain_readable() {
+        let key = ck("b", "framed");
+        let object = sample();
+        let header = bincode::serialize(&super::WarmHeader::capture(&key, &object)).unwrap();
+        let mut framed = super::LEGACY_WARM_MAGIC.to_vec();
+        framed.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+        framed.extend_from_slice(&header);
+        framed.extend_from_slice(&object.body);
+        let framed = Bytes::from(framed);
+
+        let (decoded_key, decoded) = super::decode_warm_record(&framed).expect("decode");
+
+        assert_eq!(decoded_key, key);
+        assert_eq!(decoded.body, object.body);
+        assert_eq!(decoded.content_length, object.content_length);
+        assert_eq!(decoded.content_type, object.content_type);
+        assert_eq!(decoded.e_tag, object.e_tag);
+        assert_eq!(decoded.last_modified, object.last_modified);
+        assert_eq!(decoded.metadata, object.metadata);
+        assert!(framed.as_ptr_range().contains(&decoded.body.as_ptr()));
     }
 
     #[test]
@@ -1031,40 +1053,6 @@ mod tests {
             "legacy bodies must borrow the mmap too"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The trust stamp is bookkeeping about a *copy*, not part of the object, and
-    /// `#[serde(skip)]` is what keeps it off the warm tier's disk format.
-    ///
-    /// Asserted without a fixture of the old bytes, which would only ever prove what
-    /// this build's serializer does anyway: the stamp is varied across the widest value
-    /// it can hold and the encoding must not move by a byte. A field that reached the
-    /// wire — at any width, in any position, even as a length — could not survive that.
-    /// The decode side then pins the consequence: whatever was stamped, what comes back
-    /// off disk is suspect.
-    #[test]
-    fn the_trust_stamp_never_reaches_the_warm_tier() {
-        let obj = sample();
-        let unstamped = bincode::serialize(&obj).unwrap();
-        for generation in [1, 0x0102_0304_0506_0708, u64::MAX] {
-            obj.mark_trusted(generation);
-            assert_eq!(
-                bincode::serialize(&obj).unwrap(),
-                unstamped,
-                "generation {generation} left a trace in the encoding"
-            );
-        }
-
-        let back: CachedObject = bincode::deserialize(&unstamped).unwrap();
-        assert_eq!(back.body, obj.body, "the object itself round-trips");
-        assert!(
-            back.trusted(0),
-            "a decoded entry carries the default generation"
-        );
-        assert!(
-            !back.trusted(1),
-            "which a live cache never issues — so warm entries are born suspect"
-        );
     }
 
     /// A restart is the case the generation floor exists for: the object comes back off

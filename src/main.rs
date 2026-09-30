@@ -15,6 +15,8 @@ use s3s::auth::SimpleAuth;
 use s3s::service::S3ServiceBuilder;
 use tokio::net::TcpListener;
 use tracing::info;
+#[cfg(feature = "fleet")]
+use tracing::warn;
 
 const RECOVERY_REARM_INITIAL_MS: u64 = 5_000;
 const RECOVERY_REARM_MAX_MS: u64 = 60_000;
@@ -32,6 +34,90 @@ fn configure_recovery_rearm(
             max_ms: RECOVERY_REARM_MAX_MS,
         })
         .expect("fixed automatic recovery rearm policy is valid")
+}
+
+/// Start gossip coherence, with fleet index bootstrap when it is both built and
+/// configured; otherwise the guarded origin recovery path.
+#[cfg(feature = "fleet")]
+async fn start_coherence(
+    cp: cache::proxy::CachingProxy,
+    cfg: &Config,
+    region: &str,
+) -> cache::proxy::CachingProxy {
+    let fleet = sync::fleet::config::FleetConfig::parse(
+        std::env::var("S3CACHE_FLEET_BIND").ok(),
+        std::env::var("S3CACHE_FLEET_ADVERTISE").ok(),
+        std::env::var("S3CACHE_FLEET_PEERS").ok(),
+        std::env::var("S3CACHE_FLEET_ORIGIN_ID").ok(),
+        &cfg.endpoint,
+        region,
+        &cfg.node_name,
+        &cfg.buckets,
+    );
+    match fleet {
+        Ok(Some(fleet)) => {
+            let cp = cp.with_fleet_config(fleet);
+            cp.start_fleet_coherence(&cfg.buckets).await;
+            cp
+        }
+        Ok(None) => {
+            cp.start_coherence(&cfg.buckets);
+            cp
+        }
+        Err(error) => {
+            warn!(
+                ?error,
+                "fleet configuration refused; using guarded origin recovery"
+            );
+            cp.start_coherence(&cfg.buckets);
+            cp
+        }
+    }
+}
+
+/// Start gossip coherence on the guarded origin recovery path.
+#[cfg(not(feature = "fleet"))]
+#[expect(
+    clippy::unused_async,
+    reason = "one call shape with the fleet build, whose startup awaits the bulk listener"
+)]
+async fn start_coherence(
+    cp: cache::proxy::CachingProxy,
+    cfg: &Config,
+    _region: &str,
+) -> cache::proxy::CachingProxy {
+    cp.start_coherence(&cfg.buckets);
+    cp
+}
+
+/// Optional Prometheus text endpoint on its own port, so the counters can be graphed
+/// and alerted on instead of diffed out of the stats line by hand. Off by default;
+/// a bad `S3CACHE_METRICS_LISTEN` fails startup rather than leaving a silent blind spot.
+async fn spawn_readiness(
+    cp: &cache::proxy::CachingProxy,
+    cfg: &Config,
+) -> Result<Arc<metrics::StartupReady>, Box<dyn Error + Send + Sync + 'static>> {
+    let readiness = Arc::new(metrics::StartupReady::default());
+    if let Some(listen) = &cfg.metrics_listen {
+        let probe = cp.clone();
+        let buckets = cfg.buckets.clone();
+        let latch = Arc::clone(&readiness);
+        tokio::spawn(async move {
+            loop {
+                if probe.initially_ready(&buckets) {
+                    latch.mark_index_ready();
+                    info!(
+                        "initial index ready for {} configured buckets",
+                        buckets.len()
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+        metrics::spawn_exporter(cp.metrics(), Arc::clone(&readiness), listen).await?;
+    }
+    Ok(readiness)
 }
 
 #[tokio::main]
@@ -54,7 +140,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             .force_path_style(true)
             .build(),
     );
-    let proxy = s3s_aws::Proxy::from(client.clone());
+    let proxy = s3s_aws::Proxy::builder(client.clone()).build();
 
     // One counter set for the whole process: the tiers, the write feed, the proxy and
     // the stats task all report into it.
@@ -92,7 +178,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let cp = cache::proxy::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters)
         .with_index_scan(cfg.index_scan);
     let cp = configure_recovery_rearm(cp, cfg.recovery_rearm);
-    cp.start_coherence(&cfg.buckets);
+    let cp = start_coherence(
+        cp,
+        &cfg,
+        sdk_conf.region().map_or("", |region| region.as_ref()),
+    )
+    .await;
     // Warm the LIST index for the configured buckets in the BACKGROUND — don't block the
     // port on a full pre-sync. The proxy serves immediately; LISTs pass through to the
     // upstream (always correct) until a bucket's index is complete, then flip to
@@ -100,29 +191,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // fails to sync just stays in passthrough (safe).
     cp.spawn_background_sync(cfg.buckets.clone());
     metrics::spawn_stats(cp.metrics(), cfg.stats_secs);
-    // Optional Prometheus text endpoint on its own port, so the counters can be graphed
-    // and alerted on instead of diffed out of the stats line by hand. Off by default;
-    // a bad S3CACHE_METRICS_LISTEN fails startup rather than leaving a silent blind spot.
-    let readiness = Arc::new(metrics::StartupReady::default());
-    if let Some(listen) = &cfg.metrics_listen {
-        let probe = cp.clone();
-        let buckets = cfg.buckets.clone();
-        let latch = Arc::clone(&readiness);
-        tokio::spawn(async move {
-            loop {
-                if probe.initially_ready(&buckets) {
-                    latch.mark_index_ready();
-                    info!(
-                        "initial index ready for {} configured buckets",
-                        buckets.len()
-                    );
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        });
-        metrics::spawn_exporter(cp.metrics(), Arc::clone(&readiness), listen).await?;
-    }
+    let readiness = spawn_readiness(&cp, &cfg).await?;
 
     let service = {
         let mut b = S3ServiceBuilder::new(cp);

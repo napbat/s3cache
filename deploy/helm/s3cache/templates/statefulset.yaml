@@ -45,6 +45,11 @@ spec:
             - name: gossip
               containerPort: {{ .Values.gossip.port }}
               protocol: UDP
+            {{- if .Values.fleet.enabled }}
+            - name: fleet
+              containerPort: {{ .Values.fleet.port | int64 }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.metrics.port | int64 }}
@@ -55,7 +60,7 @@ spec:
             - name: S3CACHE_UPSTREAM_ENDPOINT
               value: {{ required "upstream.endpoint is required" .Values.upstream.endpoint | quote }}
             - name: S3CACHE_BUCKETS
-              value: {{ .Values.upstream.buckets | quote }}
+              value: {{ if .Values.fleet.enabled }}{{ required "upstream.buckets is required when fleet.enabled" .Values.upstream.buckets | quote }}{{ else }}{{ .Values.upstream.buckets | quote }}{{ end }}
             {{- with .Values.indexScan.concurrency }}
             - name: S3CACHE_INDEX_SCAN_CONCURRENCY
               value: {{ . | int64 | quote }}
@@ -103,6 +108,24 @@ spec:
             # does not generate a permanent unresolved-peer warning.
             - name: S3CACHE_GOSSIP_SEEDS
               value: {{ if gt (int .Values.replicaCount) 1 }}"s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }},s3cache-1=s3cache-1.s3cache-gossip:{{ .Values.gossip.port }}"{{ else }}"s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }}"{{ end }}
+            {{- if .Values.fleet.enabled }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: S3CACHE_FLEET_BIND
+              value: "0.0.0.0:{{ .Values.fleet.port | int64 }}"
+            - name: S3CACHE_FLEET_ADVERTISE
+              value: "$(POD_NAME).s3cache-gossip:{{ .Values.fleet.port | int64 }}"
+            - name: S3CACHE_FLEET_ORIGIN_ID
+              value: {{ required "fleet.originId is required when fleet.enabled" .Values.fleet.originId | quote }}
+            {{- $fleetPeers := list }}
+            {{- range $ordinal := until (int .Values.replicaCount) }}
+            {{- $fleetPeers = append $fleetPeers (printf "s3cache-%d=s3cache-%d.s3cache-gossip:%d" $ordinal $ordinal (int $.Values.fleet.port)) }}
+            {{- end }}
+            - name: S3CACHE_FLEET_PEERS
+              value: {{ join "," $fleetPeers | quote }}
+            {{- end }}
             - name: S3CACHE_CONSISTENCY
               value: {{ .Values.gossip.consistency | quote }}
             {{- with .Values.gossip.leaseMs }}

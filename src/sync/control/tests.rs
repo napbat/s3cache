@@ -414,3 +414,53 @@ async fn outcome_can_probe_past_its_intent_from_stale_cursor() {
         Ok(super::AppendResult::Created(at(2)))
     );
 }
+
+/// Frames a bincode 1 payload exactly as the first record format did.
+fn first_format(payload: &impl serde::Serialize) -> Vec<u8> {
+    let payload = bincode::serialize(payload).unwrap();
+    let mut bytes = b"S3CJ".to_vec();
+    bytes.push(1);
+    bytes.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&payload);
+    let checksum = blake3::hash(&bytes);
+    bytes.extend_from_slice(checksum.as_bytes());
+    bytes
+}
+
+/// A journal the first format wrote reopens under the current one: its manifest still
+/// admits the same configuration, its slots scan, a retried append of a stored record
+/// is recovered rather than conflicting, and new appends continue after it.
+#[tokio::test]
+async fn first_format_journal_reopens_and_continues() {
+    let store = MemoryStore::default();
+    let journal = Journal::open(store.clone(), config()).await.unwrap();
+    let start = journal.start("bucket");
+    journal.append(&start, &intent("a", "x")).await.unwrap();
+    for (key, bytes) in &mut store.state.lock().unwrap().objects {
+        *bytes = if key.ends_with("/manifest") {
+            first_format(&config())
+        } else {
+            first_format(&(config().source, "bucket", 0_u64, intent("a", "x")))
+        };
+    }
+
+    let reopened = Journal::open(store.clone(), config()).await.unwrap();
+    assert_eq!(
+        reopened.scan(&start).await.unwrap().records,
+        vec![intent("a", "x")]
+    );
+    assert_eq!(
+        reopened.append(&start, &intent("a", "x")).await,
+        Ok(super::AppendResult::Recovered(at(1)))
+    );
+    assert_eq!(
+        reopened.append(&start, &intent("b", "y")).await,
+        Ok(super::AppendResult::Created(at(2)))
+    );
+    let mut changed = config();
+    changed.max_admission_ms += 1;
+    assert_eq!(
+        Journal::open(store, changed).await.map(|_| ()),
+        Err(JournalError::ConfigMismatch)
+    );
+}

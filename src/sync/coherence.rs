@@ -7,13 +7,19 @@ use groupnet::consistency::{
     AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, LeaseConfig, LeaseView, Leases,
     PeerWrite, PeerWrites, RenewalId, WriteFeed, WriteToken, advertised_head, applied_by_selected,
 };
+#[cfg(feature = "fleet")]
+use groupnet::core::volatile_bootstrap::journal::NativeCut;
 use groupnet::core::{NodeId, Status};
 use groupnet::runtime::{Group, Node};
 use groupnet::transport::udp::UdpTransport;
 use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
-use crate::index::{KeyIndex, ObjEntry, apply_del, apply_put, standard_class};
+use crate::index::{KeyIndex, ObjEntry, OwnPosition, apply_own_del, apply_own_put, standard_class};
+#[cfg(not(feature = "fleet"))]
+use crate::index::{apply_del, apply_put};
+#[cfg(feature = "fleet")]
+use crate::index::{apply_del_native, apply_put_native};
 use crate::metrics::Metrics;
 use crate::sync::volatile::CacheRecoveryAdapter;
 use crate::sync::wire::{
@@ -26,6 +32,47 @@ use crate::tier::LocalCache;
 /// gets a gap (Groupnet closes serving, distrusts bodies, and rescans origin) instead
 /// of per-event application.
 pub(super) const FEED_CAPACITY: usize = 4096;
+
+fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: IndexEvent) {
+    let ts = from_micros(event.ts_us);
+    #[cfg(feature = "fleet")]
+    let cut = NativeCut {
+        writer: peer.as_str().as_bytes().to_vec(),
+        epoch: token.epoch,
+        sequence: token.seq,
+    };
+    #[cfg(not(feature = "fleet"))]
+    let _ = (peer, token);
+    match event.op {
+        IndexOp::Put {
+            size,
+            etag,
+            content_type,
+            storage_class,
+        } => {
+            // Feed rows are skeletal: the first HEAD still completes metadata
+            // from the origin before answering a faithful local HEAD.
+            let entry = ObjEntry {
+                size,
+                last_modified: ts,
+                etag: etag.and_then(|raw| raw.parse().ok()),
+                storage_class: storage_class.map_or_else(standard_class, ObjectStorageClass::from),
+                content_type,
+                meta: None,
+            };
+            #[cfg(feature = "fleet")]
+            apply_put_native(state, &event.bucket, &event.key, entry, cut);
+            #[cfg(not(feature = "fleet"))]
+            apply_put(state, &event.bucket, &event.key, entry);
+        }
+        IndexOp::Del => {
+            #[cfg(feature = "fleet")]
+            apply_del_native(state, &event.bucket, &event.key, ts, cut);
+            #[cfg(not(feature = "fleet"))]
+            apply_del(state, &event.bucket, &event.key, ts);
+        }
+    }
+}
 
 /// How much coherence the cluster pays for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -328,6 +375,10 @@ pub struct WriteSync {
     /// `strong` mode, and a lock-free borrow plus one compare per request.
     lease_view: Option<LeaseView>,
     recovery: OnceLock<RecoveryHandle<CacheRecoveryAdapter>>,
+    /// The opt-in TCP listener lives with this exact recovery handle; a
+    /// dropped node cannot keep accepting requests for a retired claim.
+    #[cfg(feature = "fleet")]
+    pub(crate) fleet_listener: OnceLock<crate::sync::volatile::fleet::FleetListenerGuard>,
     /// The deadline the coherence wait gets: one lease duration (the longest a
     /// silent holder's lapse can take) plus [`WRITE_WAIT_SLACK`].
     write_wait: Duration,
@@ -381,6 +432,8 @@ impl WriteSync {
             leases,
             lease_view: lease_view.clone(),
             recovery: OnceLock::new(),
+            #[cfg(feature = "fleet")]
+            fleet_listener: OnceLock::new(),
             write_wait: lease.duration + WRITE_WAIT_SLACK,
             _node: node,
         }
@@ -418,7 +471,7 @@ impl WriteSync {
         self.mode_allows_local()
     }
 
-    fn mode_allows_local(&self) -> bool {
+    pub(crate) fn mode_allows_local(&self) -> bool {
         match self.consistency {
             Consistency::Strong => self.lease_view.as_ref().is_some_and(LeaseView::valid),
             Consistency::StrongAcks => self.cluster_healthy(),
@@ -552,51 +605,82 @@ impl WriteSync {
         }
     }
 
-    /// Advertise a durable put to peers: everything the entry carries that a peer can
-    /// use, stamped with the local index's timestamp.
-    pub(crate) async fn publish_put(
-        &self,
+    /// Index this node's own put and advertise it to peers: everything the entry
+    /// carries that a peer can use, stamped with the local index's timestamp. The feed
+    /// assigns the write's position under the index lock that applies it, so every own
+    /// write reaches the index, the donor journal and the feed in one order. Returns
+    /// whether the index changed and the advertisement to await.
+    pub(crate) fn index_put<'a>(
+        &'a self,
+        state: &KeyIndex,
         bucket: &str,
         key: &str,
-        entry: &ObjEntry,
-        metrics: &Metrics,
-    ) -> WriteReceipt {
-        let op = IndexOp::Put {
-            size: entry.size,
-            etag: entry.etag.as_ref().map(etag_to_wire),
-            content_type: entry.content_type.clone(),
-            storage_class: Some(entry.storage_class.as_str().to_owned()),
-        };
-        self.publish(op, bucket, key, entry.last_modified, metrics)
-            .await
-    }
-
-    /// Advertise a durable delete to peers.
-    pub(crate) async fn publish_del(
-        &self,
-        bucket: &str,
-        key: &str,
-        ts: SystemTime,
-        metrics: &Metrics,
-    ) -> WriteReceipt {
-        self.publish(IndexOp::Del, bucket, key, ts, metrics).await
-    }
-
-    async fn publish(
-        &self,
-        op: IndexOp,
-        bucket: &str,
-        key: &str,
-        ts: SystemTime,
-        metrics: &Metrics,
-    ) -> WriteReceipt {
+        entry: ObjEntry,
+        metrics: &'a Metrics,
+    ) -> (bool, impl Future<Output = WriteReceipt> + use<'a>) {
         let event = IndexEvent {
-            op,
+            op: IndexOp::Put {
+                size: entry.size,
+                etag: entry.etag.as_ref().map(etag_to_wire),
+                content_type: entry.content_type.clone(),
+                storage_class: Some(entry.storage_class.as_str().to_owned()),
+            },
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            ts_us: to_micros(entry.last_modified),
+        };
+        let (changed, publishing) = apply_own_put(state, bucket, key, entry, || {
+            (self.feed.publish(&event), self.own_position())
+        });
+        (changed, self.advertised(publishing, metrics))
+    }
+
+    /// Index this node's own delete and advertise it to peers, assigning its feed
+    /// position under the same index lock (see [`index_put`](Self::index_put)).
+    pub(crate) fn index_del<'a>(
+        &'a self,
+        state: &KeyIndex,
+        bucket: &str,
+        key: &str,
+        ts: SystemTime,
+        metrics: &'a Metrics,
+    ) -> impl Future<Output = WriteReceipt> + use<'a> {
+        let event = IndexEvent {
+            op: IndexOp::Del,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             ts_us: to_micros(ts),
         };
-        let token = self.feed.publish(&event).await;
+        let (_, publishing) = apply_own_del(state, bucket, key, ts, || {
+            (self.feed.publish(&event), self.own_position())
+        });
+        self.advertised(publishing, metrics)
+    }
+
+    /// This node's feed writer at its last assigned position (zero before its first
+    /// write). Called under the index lock, so it is exactly the write just assigned.
+    #[cfg(feature = "fleet")]
+    fn own_position(&self) -> OwnPosition {
+        NativeCut {
+            writer: self.me.as_str().as_bytes().to_vec(),
+            epoch: self.feed.epoch(),
+            sequence: self.feed.last_token().map_or(0, |token| token.seq),
+        }
+    }
+
+    #[cfg(not(feature = "fleet"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "one call shape with the fleet build, whose position reads this feed"
+    )]
+    fn own_position(&self) -> OwnPosition {}
+
+    async fn advertised(
+        &self,
+        publishing: impl Future<Output = WriteToken>,
+        metrics: &Metrics,
+    ) -> WriteReceipt {
+        let token = publishing.await;
         metrics.feed_published();
         WriteReceipt {
             token,
@@ -766,6 +850,17 @@ impl WriteSync {
             .all(|(_, status)| status == Status::Alive)
     }
 
+    /// Whether this node currently observes `peer` as alive in the gossip roster.
+    ///
+    /// This is a read-only membership observation. It does not grant cache
+    /// authority or imply that the peer has a usable bootstrap capture.
+    #[must_use]
+    pub fn peer_alive(&self, peer: &str) -> bool {
+        self.group
+            .status_held_for(&NodeId::new(peer.to_owned()))
+            .is_some_and(|(status, _)| status == Status::Alive)
+    }
+
     /// Waits (bounded) until one specific write — a [`WRITE_TOKEN_HEADER`]
     /// value echoed by a client — has been applied locally. Tokens this node
     /// issued are trivially satisfied (its own writes are already local);
@@ -803,6 +898,10 @@ impl WriteSync {
     ) {
         let (frontier, view) = Frontier::new();
         let _ = self.view.set(view);
+        // Declare this node's feed writer before any capture can start, at
+        // its current position (zero for a feed with no writes yet).
+        #[cfg(feature = "fleet")]
+        state.register_native_writer(&self.own_position());
         if let Some(leases) = &self.leases {
             let weak = Arc::downgrade(self);
             let poll = lapse_poll(leases.config().duration);
@@ -840,35 +939,7 @@ impl WriteSync {
                     } => {
                         let cache_key = (event.bucket.clone(), event.key.clone());
                         let mutation = local.fence_mutation(&cache_key).await;
-                        let ts = from_micros(event.ts_us);
-                        match event.op {
-                            IndexOp::Put {
-                                size,
-                                etag,
-                                content_type,
-                                storage_class,
-                            } => {
-                                // The feed carries what a peer can act on without an
-                                // origin round-trip: existence, size, ETag, Content-Type
-                                // and storage class. It deliberately does not carry user
-                                // metadata, so the entry stays *skeletal* — it answers
-                                // LIST, and the first HEAD completes it from the origin
-                                // (see `crate::index`).
-                                let entry = ObjEntry {
-                                    size,
-                                    last_modified: ts,
-                                    etag: etag.and_then(|raw| raw.parse().ok()),
-                                    storage_class: storage_class
-                                        .map_or_else(standard_class, ObjectStorageClass::from),
-                                    content_type,
-                                    meta: None,
-                                };
-                                apply_put(&state, &event.bucket, &event.key, entry);
-                            }
-                            IndexOp::Del => {
-                                apply_del(&state, &event.bucket, &event.key, ts);
-                            }
-                        }
+                        apply_feed_index(&state, &peer, token, event);
                         drop(mutation);
                         // The index must move first: a warm body promoted after this hot
                         // eviction decodes suspect and is checked against the new entry
