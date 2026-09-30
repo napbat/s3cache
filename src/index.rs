@@ -29,7 +29,9 @@ use s3s::dto::{
 };
 
 pub(crate) mod fleet;
+mod rows;
 mod scan;
+use rows::{GoneRows, KeyRows};
 pub use scan::ScanConfig;
 
 /// S3's default storage class, and what an object reports when it carries no
@@ -292,9 +294,9 @@ impl KeyIndex {
 #[derive(Default)]
 pub(crate) struct BucketState {
     pub(crate) synced: bool,
-    pub(crate) keys: BTreeMap<String, ObjEntry>,
+    pub(crate) keys: KeyRows,
     /// Deleted keys and when: consulted by [`apply_put`], pruned amortized.
-    pub(crate) gone: BTreeMap<String, SystemTime>,
+    pub(crate) gone: GoneRows,
     /// Generation of the origin rebuild currently allowed to publish into this bucket.
     /// Only whole-bucket rebuild lifecycle changes this generation; per-key HEAD
     /// reconciliation is independent and cannot restart a long-running LIST.
@@ -567,11 +569,7 @@ pub(crate) fn resolve_uncertain_key(
             account_replacement(b, stats, previous, current);
         }
         AuthoritativeKeyState::Absent => {
-            let ts = SystemTime::now();
-            let dead = b.gone.entry(key.to_owned()).or_insert(ts);
-            if *dead < ts {
-                *dead = ts;
-            }
+            b.gone.raise(key, SystemTime::now());
             if let Some(previous) = b.keys.remove(key) {
                 account_replacement(
                     b,
@@ -715,9 +713,10 @@ fn apply_del_with_identity(
         b.gone.retain(|_, dead| *dead >= cutoff);
     }
     let newer_tombstone = !first_rebuild_mutation && b.gone.get(key).is_some_and(|dead| *dead > ts);
-    let dead = b.gone.entry(key.to_owned()).or_insert(ts);
-    if first_rebuild_mutation || *dead < ts {
-        *dead = ts;
+    if first_rebuild_mutation {
+        b.gone.insert(key.to_owned(), ts);
+    } else {
+        b.gone.raise(key, ts);
     }
     if !first_rebuild_mutation && b.keys.get(key).is_some_and(|e| e.last_modified > ts) {
         if let Some(capture) = capture.as_mut() {
@@ -786,39 +785,39 @@ pub(crate) fn complete_entry(
     let Some(bucket) = buckets.get_mut(bucket) else {
         return Completion::NotIndexed;
     };
-    let Some(entry) = bucket.keys.get_mut(key) else {
+    let Some((previous, current)) = bucket.keys.update(key, |entry| {
+        let previous = IndexStats::for_entry(entry);
+        let mut filled = false;
+        if entry.size.is_none() {
+            entry.size = fill.size;
+            filled |= entry.size.is_some();
+        }
+        if entry.etag.is_none() {
+            entry.etag = fill.etag;
+            filled |= entry.etag.is_some();
+        }
+        if entry.content_type.is_none() {
+            entry.content_type = fill.content_type;
+            filled |= entry.content_type.is_some();
+        }
+        if entry.meta.is_none() {
+            entry.meta = Some(Box::new(fill.meta));
+            filled = true;
+        }
+        (previous, filled.then(|| IndexStats::for_entry(entry)))
+    }) else {
         return Completion::NotIndexed;
     };
-    let previous = IndexStats::for_entry(entry);
-    let mut filled = false;
-    if entry.size.is_none() {
-        entry.size = fill.size;
-        filled |= entry.size.is_some();
+    let Some(current) = current else {
+        return Completion::AlreadyComplete;
+    };
+    account_replacement(bucket, stats, previous, current);
+    if let Some(capture) = capture.as_mut()
+        && let Some(entry) = bucket.keys.get(key)
+    {
+        capture.record_put(None, bucket_name, key, entry);
     }
-    if entry.etag.is_none() {
-        entry.etag = fill.etag;
-        filled |= entry.etag.is_some();
-    }
-    if entry.content_type.is_none() {
-        entry.content_type = fill.content_type;
-        filled |= entry.content_type.is_some();
-    }
-    if entry.meta.is_none() {
-        entry.meta = Some(Box::new(fill.meta));
-        filled = true;
-    }
-    if filled {
-        let current = IndexStats::for_entry(entry);
-        account_replacement(bucket, stats, previous, current);
-        if let Some(capture) = capture.as_mut()
-            && let Some(entry) = bucket.keys.get(key)
-        {
-            capture.record_put(None, bucket_name, key, entry);
-        }
-        Completion::Completed
-    } else {
-        Completion::AlreadyComplete
-    }
+    Completion::Completed
 }
 
 /// The `ListObjectsV2` algorithm over an already-borrowed key index — free-standing so it
@@ -831,7 +830,7 @@ pub(crate) fn complete_entry(
 /// `None` when the index cannot answer this request without inventing something — a row
 /// it would have to emit has no known size — and the caller must forward to the origin.
 pub(crate) fn list_objects_v2_from_index(
-    keys: Option<&BTreeMap<String, ObjEntry>>,
+    keys: Option<&KeyRows>,
     inp: &ListObjectsV2Input,
     resume_after: Option<&str>,
 ) -> Option<ListObjectsV2Output> {
@@ -853,13 +852,20 @@ pub(crate) fn list_objects_v2_from_index(
         && max > 0
     {
         let lower = if let Some(cursor) = resume_after {
-            Bound::Excluded(cursor.to_owned())
+            Bound::Excluded(cursor)
         } else if let Some(sa) = &inp.start_after {
-            Bound::Excluded(sa.clone())
+            Bound::Excluded(sa.as_str())
         } else {
             Bound::Unbounded
         };
-        for (key, entry) in keys.range((lower, Bound::Unbounded)) {
+        // No key sorting before the prefix can start with it: seek there
+        // rather than walk every earlier key.
+        let lower = match lower {
+            Bound::Excluded(after) if after >= prefix.as_str() => Bound::Excluded(after),
+            _ if !prefix.is_empty() => Bound::Included(prefix.as_str()),
+            unbounded => unbounded,
+        };
+        for (key, entry) in keys.range_from(lower) {
             if !key.starts_with(&prefix) {
                 if key.as_str() > prefix.as_str() {
                     break; // sorted: past the prefix block
@@ -935,10 +941,7 @@ pub(crate) fn list_objects_v2_from_index(
 /// is only authoritative for the *answer* when the entry is faithful, which is what
 /// [`IndexedHead`] distinguishes. Free-standing alongside [`list_objects_v2_from_index`],
 /// and unit-testable the same way.
-pub(crate) fn head_object_from_index(
-    keys: Option<&BTreeMap<String, ObjEntry>>,
-    key: &str,
-) -> IndexedHead {
+pub(crate) fn head_object_from_index(keys: Option<&KeyRows>, key: &str) -> IndexedHead {
     let Some(entry) = keys.and_then(|keys| keys.get(key)) else {
         return IndexedHead::Absent;
     };
@@ -1096,7 +1099,7 @@ pub(crate) async fn sync_bucket_generation_guarded(
 mod tests {
     use super::{
         AuthoritativeKeyState, BODY_MTIME_SLACK, Completion, EntryFill, IndexedHead, KeyIndex,
-        ObjEntry, ObjMeta, apply_del, apply_put, begin_bucket_resync, complete_entry,
+        KeyRows, ObjEntry, ObjMeta, apply_del, apply_put, begin_bucket_resync, complete_entry,
         entry_matches_body, fence_uncertain_key, finish_bucket_sync_generation,
         head_object_from_index, list_objects_v2_from_index, resolve_uncertain_key,
         restart_bucket_resync_if_current, standard_class, sync_listing_into,
@@ -1548,23 +1551,22 @@ mod tests {
     }
 
     use s3s::dto::{ETag, ListObjectsV2Input, ListObjectsV2Output};
-    use std::collections::BTreeMap;
-    fn index(keys: &[&str]) -> BTreeMap<String, ObjEntry> {
-        keys.iter()
-            .map(|k| {
-                (
-                    (*k).to_owned(),
-                    ObjEntry {
-                        size: Some(1),
-                        last_modified: UNIX_EPOCH,
-                        etag: Some(ETag::Strong(format!("etag-{k}"))),
-                        storage_class: standard_class(),
-                        content_type: None,
-                        meta: None,
-                    },
-                )
-            })
-            .collect()
+    fn index(keys: &[&str]) -> KeyRows {
+        let mut rows = KeyRows::default();
+        for k in keys {
+            rows.insert(
+                (*k).to_owned(),
+                ObjEntry {
+                    size: Some(1),
+                    last_modified: UNIX_EPOCH,
+                    etag: Some(ETag::Strong(format!("etag-{k}"))),
+                    storage_class: standard_class(),
+                    content_type: None,
+                    meta: None,
+                },
+            );
+        }
+        rows
     }
 
     fn list_input(
@@ -1586,10 +1588,7 @@ mod tests {
     }
 
     /// The index's answer, which every row here expects it to be able to give.
-    fn listed(
-        idx: Option<&BTreeMap<String, ObjEntry>>,
-        inp: &ListObjectsV2Input,
-    ) -> ListObjectsV2Output {
+    fn listed(idx: Option<&KeyRows>, inp: &ListObjectsV2Input) -> ListObjectsV2Output {
         let cursor = match classify(inp).expect("test continuation token is valid") {
             Continuation::Absent => None,
             Continuation::Local { cursor, .. } => Some(cursor),
@@ -1616,7 +1615,7 @@ mod tests {
 
     /// Follow the continuation tokens like a real client and collect every key + prefix.
     fn walk_pages(
-        idx: &BTreeMap<String, ObjEntry>,
+        idx: &KeyRows,
         max: i32,
         prefix: &str,
         delim: Option<&str>,
@@ -1692,6 +1691,25 @@ mod tests {
         assert_eq!(page_keys(&out), ["c", "d"]);
     }
 
+    /// A prefix bounds a page from below as `start_after` does: whichever is
+    /// later decides where it begins, and keys sorting around the prefix
+    /// block never leak in.
+    #[test]
+    fn list_starts_at_the_later_of_prefix_and_start_after() {
+        let idx = index(&["a", "p", "p/1", "p/2", "p0", "q"]);
+        let page = |start_after| {
+            page_keys(&listed(
+                Some(&idx),
+                &list_input(1000, None, "p/", None, start_after),
+            ))
+        };
+        assert_eq!(page(None), ["p/1", "p/2"]);
+        assert_eq!(page(Some("a")), ["p/1", "p/2"]);
+        assert_eq!(page(Some("p/")), ["p/1", "p/2"]);
+        assert_eq!(page(Some("p/1")), ["p/2"]);
+        assert!(page(Some("p0")).is_empty());
+    }
+
     #[test]
     fn list_empty_bucket() {
         let out = listed(None, &list_input(1000, None, "", None, None));
@@ -1718,7 +1736,8 @@ mod tests {
     #[test]
     fn list_declines_a_row_whose_size_is_unknown() {
         let mut idx = index(&["a", "b"]);
-        idx.get_mut("b").expect("seeded key").size = None;
+        idx.update("b", |entry| entry.size = None)
+            .expect("seeded key");
         assert!(
             list_objects_v2_from_index(Some(&idx), &list_input(1000, None, "", None, None), None,)
                 .is_none(),

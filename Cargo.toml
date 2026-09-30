@@ -27,6 +27,9 @@ http-body-util = "0.1"
 # Already under hyper-util/s3s; direct so the metrics endpoint can build its own responses.
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
+# Persistent ordered maps: the LIST index's rows share structure with the donor's
+# snapshot at C, so taking it copies no row.
+imbl = "7"
 # The serde codec for s3cache's own formats; `use-std` without the default `heapless`.
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 rlimit = "0.11"
@@ -76,6 +79,7 @@ http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+imbl.workspace = true
 postcard.workspace = true
 rlimit.workspace = true
 s3s.workspace = true

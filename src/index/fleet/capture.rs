@@ -1,6 +1,8 @@
-//! Exact C publication under the live index lock; large encoding runs off-lock.
+//! Exact C publication under the live index lock in O(buckets); measuring and
+//! encoding the image run off-lock, from the snapshot taken at C.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use groupnet::consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, ByteAdmission, Reservation,
@@ -16,16 +18,21 @@ use tokio::sync::Notify;
 
 use crate::index::{KeyIndex, KeyIndexState};
 
-use super::{ImageCaps, ImageError, ImageSize, IndexCapture, clone_state, encode, measure_image};
+use super::{
+    ImageCaps, ImageError, ImageSize, IndexCapture, encode, measure_image, snapshot_state,
+    tallied_size,
+};
 
-/// Exact pending C clone and all admission owners. Move this whole value into
-/// blocking encoding work; cancellation leaves the charge and ingress alive
-/// until the job exits, then Drop unlinks only this candidate.
+/// Exact pending C snapshot and all admission owners. Move this whole value
+/// into blocking encoding work; cancellation leaves the charge and ingress
+/// alive until the job exits, then Drop unlinks only this candidate.
 pub(crate) struct PendingFleetCapture {
     index: Option<Arc<KeyIndex>>,
     ingress: JournalIngress,
-    private: KeyIndexState,
+    /// The index at C, sharing its nodes with the live index until encoded.
+    snapshot: Option<KeyIndexState>,
     size: ImageSize,
+    lock_held: Duration,
     encoded_image: Option<Vec<u8>>,
     commitment: Option<[u8; 32]>,
     encoded: Option<Reservation>,
@@ -67,22 +74,33 @@ impl PendingFleetCapture {
             .with_journal(|journal| same_membership(journal.image_members(), observed))
     }
 
-    /// The image's size, measured at C.
+    /// The image's size, taken at C.
     pub(crate) fn size(&self) -> ImageSize {
         self.size
     }
 
-    /// Encode away from the live publication lock into exactly the size
-    /// measured at C, retaining both image permits.
+    /// How long C held the index write lock.
+    pub(crate) fn lock_held(&self) -> Duration {
+        self.lock_held
+    }
+
+    /// Measure every row of the snapshot and encode it, away from the live
+    /// publication lock, into exactly the size taken at C, retaining both
+    /// image permits. C sized the image from the rows' tallies; a snapshot
+    /// that measures any other size, or holds a row the codec refuses,
+    /// encodes nothing. The snapshot is released here, with any nodes live
+    /// writes copied away from it since C.
     pub(crate) fn encode(
         &mut self,
         universe: &[String],
         caps: ImageCaps,
     ) -> Result<(), ImageError> {
-        if self.encoded_image.is_some() {
+        let snapshot = self.snapshot.take().ok_or(ImageError::Corrupt)?;
+        if measure_image(&snapshot, universe, caps)? != self.size {
             return Err(ImageError::Corrupt);
         }
-        let image = encode(&self.private, universe, caps, self.size)?;
+        let image = encode(&snapshot, universe, caps, self.size)?;
+        drop(snapshot);
         self.commitment = Some(*blake3::hash(&image).as_bytes());
         self.encoded_image = Some(image);
         Ok(())
@@ -301,11 +319,12 @@ impl KeyIndex {
     /// Capture exactly the state and native cuts at C. The caller must invoke
     /// this inside a current recovery publication guard (Control -> `KeyIndex`),
     /// with the suffix reservation acquired beforehand. Under the write lock
-    /// this measures the exact image at C and reserves exactly its encoded and
-    /// decoded size from `admission` before cloning any row or attaching the
-    /// ingress; a refusal attaches nothing. A later source signal cannot pass
-    /// the guard until this bounded clone and ingress attachment finish. No
-    /// network or origin I/O runs here.
+    /// this sizes the exact image at C from the rows' tallies and reserves
+    /// exactly its encoded and decoded size from `admission` before taking
+    /// the snapshot or attaching the ingress; a refusal attaches nothing.
+    /// Everything here is O(buckets + native writers): no row is visited or
+    /// copied, so the guard and the lock are held for microseconds however
+    /// large the index is. No network or origin I/O runs here.
     #[expect(
         clippy::too_many_arguments,
         reason = "one atomic C capture owns the journal, its charges, roster, and index cut"
@@ -327,16 +346,18 @@ impl KeyIndex {
         let config = journal.config();
         let generation = journal.id().recovery_generation;
         let mut live = self.inner.write().map_err(|_| ImageError::Corrupt)?;
-        // measure_image validates exact configured+indexed bucket coverage,
-        // complete sync, no uncertainty, and the ceilings before any copy.
-        let size = measure_image(&live, universe, caps)?;
+        let locked = Instant::now();
+        // tallied_size validates exact configured+indexed bucket coverage,
+        // complete sync, no uncertainty, and the ceilings before anything is
+        // reserved; the rows themselves are measured off-lock at encode.
+        let size = tallied_size(&live, universe, caps)?;
         let encoded = admission
             .reserve(AdmissionClass::Encoded, size.encoded_bytes)
             .map_err(|_| ImageError::Capacity)?;
         let decoded = admission
             .reserve(AdmissionClass::Decoded, size.decoded_bytes)
             .map_err(|_| ImageError::Capacity)?;
-        let private = clone_state(&live, universe)?;
+        let snapshot = snapshot_state(&live, universe)?;
         let mut cuts = Vec::new();
         if live.native_cuts.len() > config.max_cuts {
             return Err(ImageError::Capacity);
@@ -389,11 +410,14 @@ impl KeyIndex {
             config.max_event_bytes,
             caps.name_bytes,
         ));
+        let lock_held = locked.elapsed();
+        drop(live);
         Ok(PendingFleetCapture {
             index: Some(Arc::clone(self)),
             ingress,
-            private,
+            snapshot: Some(snapshot),
             size,
+            lock_held,
             encoded_image: None,
             commitment: None,
             encoded: Some(encoded),
@@ -574,14 +598,17 @@ mod tests {
             .unwrap()
     }
 
-    /// Measure then clone, as the capture does under the write lock.
-    fn clone_state(
+    /// The image a follower stages from this index at C: sized and
+    /// snapshotted as the donor does under the write lock, then encoded and
+    /// decoded.
+    fn staged_at_c(
         index: &KeyIndexState,
         universe: &[String],
         caps: ImageCaps,
     ) -> Result<KeyIndexState, ImageError> {
-        measure_image(index, universe, caps)?;
-        super::clone_state(index, universe)
+        let size = tallied_size(index, universe, caps)?;
+        let snapshot = snapshot_state(index, universe)?;
+        crate::index::fleet::decode(&encode(&snapshot, universe, caps, size)?, caps)
     }
 
     #[test]
@@ -768,7 +795,7 @@ mod tests {
         );
         let donor = pending.finish().unwrap();
         let at_c = super::super::decode(donor.image().as_bytes(), caps).unwrap();
-        assert!(at_c.buckets["bucket"].keys.is_empty());
+        assert_eq!(at_c.buckets["bucket"].keys.len(), 0);
         assert_eq!(
             donor.ingress().with_journal(|journal| {
                 assert!(journal.image_cuts().is_empty());
@@ -806,7 +833,7 @@ mod tests {
             "repaired",
             UNIX_EPOCH + Duration::from_secs(1),
         );
-        let candidate = clone_state(&donor.inner.read().unwrap(), &universe, caps).unwrap();
+        let candidate = staged_at_c(&donor.inner.read().unwrap(), &universe, caps).unwrap();
         assert_eq!(
             index.fleet_install_check(&candidate, &[], &universe, caps.rows),
             Ok(())
@@ -841,7 +868,7 @@ mod tests {
             name_bytes: 64,
         };
         let universe = ["bucket".to_owned()];
-        let candidate = clone_state(&donor.inner.read().unwrap(), &universe, caps).unwrap();
+        let candidate = staged_at_c(&donor.inner.read().unwrap(), &universe, caps).unwrap();
         assert_eq!(
             local.fleet_install_check(&candidate, &[], &universe, caps.rows),
             Err(InstallRefusal::Incompatible)
@@ -866,7 +893,7 @@ mod tests {
         };
         let universe = ["bucket".to_owned()];
         let mut stage = Some(staged(
-            clone_state(&donor.inner.read().unwrap(), &universe, caps).unwrap(),
+            staged_at_c(&donor.inner.read().unwrap(), &universe, caps).unwrap(),
         ));
         local
             .install_fleet_candidate(&mut stage, &[], &universe, caps.rows)
@@ -895,12 +922,17 @@ mod tests {
             name_bytes: 64,
         };
         let universe = ["bucket".to_owned()];
-        let candidate = clone_state(&donor.inner.read().unwrap(), &universe, caps).unwrap();
+        let candidate = staged_at_c(&donor.inner.read().unwrap(), &universe, caps).unwrap();
         assert_eq!(
             local.fleet_install_check(&candidate, &[], &universe, caps.rows),
             Err(InstallRefusal::Incompatible)
         );
-        assert!(local.read().unwrap()["bucket"].gone.contains_key("deleted"));
+        assert!(
+            local.read().unwrap()["bucket"]
+                .gone
+                .get("deleted")
+                .is_some()
+        );
     }
 
     #[test]
@@ -924,7 +956,7 @@ mod tests {
         };
         let universe = ["bucket".to_owned()];
         let mut stage = Some(staged(
-            clone_state(&donor.inner.read().unwrap(), &universe, caps).unwrap(),
+            staged_at_c(&donor.inner.read().unwrap(), &universe, caps).unwrap(),
         ));
         local
             .install_fleet_candidate(&mut stage, &[], &universe, caps.rows)
@@ -946,7 +978,7 @@ mod tests {
         let universe = ["bucket".to_owned()];
         let mut stage = Some(staged({
             let live = index.inner.read().unwrap();
-            clone_state(&live, &universe, caps).unwrap()
+            staged_at_c(&live, &universe, caps).unwrap()
         }));
         index
             .install_fleet_candidate(&mut stage, &[], &universe, caps.rows)
@@ -980,7 +1012,7 @@ mod tests {
         let universe = ["bucket".to_owned()];
         let mut stage = Some(staged({
             let live = index.inner.read().unwrap();
-            clone_state(&live, &universe, caps).unwrap()
+            staged_at_c(&live, &universe, caps).unwrap()
         }));
         for barrier in [writer(1), writer(3)] {
             assert_eq!(

@@ -1111,7 +1111,7 @@ async fn concurrent_start_follower_waits_for_a_slow_builder_and_lists_once() {
 /// bounds it must outlive: the 60 s claim episode, the 30 s donor wait and the
 /// 60 s recovery attempt. (Production lists about 1.5 pages a second, 793k rows
 /// in 8.5 minutes; the bounds restart on every page either way.) Its Ready
-/// recapture then clones and encodes a production-sized image.
+/// recapture then snapshots, measures and encodes a production-sized image.
 const PACED_ROWS: usize = 800_000;
 const PACED_PAGE: Duration = Duration::from_millis(250);
 const PACED_READY_DEADLINE: Duration = Duration::from_mins(10);

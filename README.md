@@ -493,7 +493,11 @@ decision. A body in an unsynced bucket is invalidated without incrementing
 origin-index arm, including cold boot, gaps, and any lapse whose feed/lease proof
 could not retain its index. The origin LIST counter prices the actual request cost.
 `recovery_ready_recaptures` counts each Ready recapture a node starts: a guarded
-clone and encode of its whole index for peers, a few hundred ms of index lock and CPU
-at production size. Expect one after a node's own scan, and one after each lease lapse
-or membership change. Groupnet paces failed attempts, so sustained movement means the
-donor image keeps failing, and pods joining meanwhile scan the origin.
+snapshot of its whole index for peers at C, then a measure and encode of that
+snapshot off the index lock. C holds the recovery fence and the index write lock
+for O(buckets) work, microseconds at production size, so a recapture costs CPU on
+the blocking pool but never pauses the node. Expect one after a node's own scan,
+and one after each lease lapse or membership change. Groupnet paces failed attempts,
+and a capture retired before it has been Ready for a claim window counts as one, so
+sustained movement means the donor image keeps failing, and pods joining meanwhile
+scan the origin.

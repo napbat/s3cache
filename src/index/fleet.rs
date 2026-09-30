@@ -12,7 +12,7 @@ use groupnet::core::volatile_bootstrap::journal::{DeltaIdentity, Invalidation, N
 
 use s3s::dto::{ETag, ObjectStorageClass};
 
-use super::{BucketState, IndexStats, KeyIndexState, ObjEntry};
+use super::{BucketState, GoneRows, IndexStats, KeyIndexState, KeyRows, ObjEntry};
 
 const VERSION: u8 = 1;
 pub(crate) const IMAGE_SCHEMA: u32 = 1;
@@ -20,12 +20,12 @@ const MAX_NATIVE_WRITERS: usize = 256;
 const MAX_NATIVE_ID_BYTES: usize = 256;
 
 mod capture;
-mod clone;
 mod delta;
+mod snapshot;
 mod stage;
 pub(crate) use capture::{FleetDonorImage, InstallRefusal, PendingFleetCapture};
-pub(super) use clone::{clone_state, measure_image};
 pub(super) use delta::{IndexDelta, encode_delete, encode_delta, encode_put};
+pub(super) use snapshot::{measure_image, snapshot_state, tallied_size};
 pub(crate) use stage::FleetStage;
 
 /// Exact donor candidate attached to the live index's publication lock.
@@ -396,12 +396,18 @@ struct DecodeBudget {
 
 // The charge is a finite ownership bound for the private image, not a claim
 // about byte-exact allocator RSS or allocator bookkeeping outside the value.
-// Hash tables are charged well above the standard library's layout. A `BTreeMap`
-// node holds up to 11 entries and every non-root node at least 5, so one entry
-// owns at most 11/5 of an entry slot plus its share of the internal nodes' 12
-// edges: 3 slots and 64 bytes a row bound that with margin. (The previous 32
-// slots charged about 4.5 KiB per production row, so a 100k-row image already
-// needed 448 MiB and the real 798k-row index could never be offered.)
+// Hash tables are charged well above the standard library's layout. The rows
+// live in `imbl`'s B+tree: a leaf holds up to 16 rows inline, and `decode`
+// inserts in key order, which leaves every leaf but the last at least half
+// full, so one row owns at most 2 of its slots plus a sixteenth of the leaf's
+// header, and its share of one separator key and child edge in each branch
+// above (a branch holds at least 8 children). A stage's bounded replay moves
+// only as many rows as its journal holds. 3 slots and 64 bytes a row bound that
+// with margin; measured, an 800k-row production index holds about 450 bytes a
+// row, key, `ETag` and class text included, against a charge of about 650.
+// (The previous 32 slots charged about 4.5 KiB per production row, so a
+// 100k-row image already needed 448 MiB and the real 798k-row index could never
+// be offered.)
 const HASH_SLOTS_PER_BUCKET: usize = 4;
 const HASH_MIN_SLOTS: usize = 8;
 const TREE_SLOTS_PER_ROW: usize = 3;
@@ -519,6 +525,53 @@ fn bucket_bytes(name: usize) -> Result<usize, ImageError> {
     sum(&[text_bytes(name)?, 4, 4])
 }
 
+/// One bucket's share of the image: the bytes [`encode`] writes for its rows
+/// and the charge [`decode`] takes for them. Every row mutation keeps it
+/// current, so the capture at C sizes the whole image in O(buckets) instead
+/// of walking every row under the index lock. The sums wrap, so a row counted
+/// in and later out cancels exactly; a row whose own size overflows counts as
+/// `usize::MAX`, and the off-lock [`measure_image`] of the snapshot refuses it
+/// (or any other disagreement) before a byte is encoded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImageTally {
+    encoded: usize,
+    decoded: usize,
+}
+
+impl ImageTally {
+    /// One live row under a key of `key` bytes.
+    pub(crate) fn entry(key: usize, entry: &ObjEntry) -> Self {
+        let decoded = entry
+            .etag
+            .as_ref()
+            .map(etag_text_len)
+            .transpose()
+            .and_then(|etag| entry_charge(key, etag, entry.storage_class.as_str().len()));
+        Self {
+            encoded: entry_bytes(key, entry).unwrap_or(usize::MAX),
+            decoded: decoded.unwrap_or(usize::MAX),
+        }
+    }
+
+    /// One tombstone under a key of `key` bytes.
+    pub(crate) fn tombstone(key: usize) -> Self {
+        Self {
+            encoded: gone_bytes(key).unwrap_or(usize::MAX),
+            decoded: gone_charge(key).unwrap_or(usize::MAX),
+        }
+    }
+
+    pub(crate) fn add(&mut self, row: Self) {
+        self.encoded = self.encoded.wrapping_add(row.encoded);
+        self.decoded = self.decoded.wrapping_add(row.decoded);
+    }
+
+    pub(crate) fn sub(&mut self, row: Self) {
+        self.encoded = self.encoded.wrapping_sub(row.encoded);
+        self.decoded = self.decoded.wrapping_sub(row.decoded);
+    }
+}
+
 /// Encoded bytes of the image header (version and bucket count).
 const HEADER_BYTES: usize = 1 + 4;
 
@@ -598,8 +651,8 @@ fn write_entry(
     writer.text(entry.storage_class.as_str(), name_bytes)
 }
 
-/// Encode a complete exact bucket universe from an admitted private C clone,
-/// off the live index lock, into exactly the `size` measured for it at C.
+/// Encode a complete exact bucket universe from the snapshot taken at C, off
+/// the live index lock, into exactly the `size` measured for it at C.
 pub(super) fn encode(
     index: &KeyIndexState,
     universe: &[String],
@@ -739,7 +792,7 @@ pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, Ima
         if rows > caps.rows {
             return Err(ImageError::Capacity);
         }
-        let mut keys = BTreeMap::new();
+        let mut keys = KeyRows::default();
         let mut stats = IndexStats::default();
         let mut previous_key = None::<&str>;
         for _ in 0..key_count {
@@ -756,7 +809,7 @@ pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, Ima
         if rows > caps.rows {
             return Err(ImageError::Capacity);
         }
-        let mut gone = BTreeMap::new();
+        let mut gone = GoneRows::default();
         let mut previous_gone = None::<&str>;
         for _ in 0..gone_count {
             let key = reader.text(caps.name_bytes)?;
@@ -829,9 +882,9 @@ mod tests {
             content_type: Some("application/octet-stream".to_owned()),
             meta: None,
         };
-        let mut keys = BTreeMap::new();
+        let mut keys = KeyRows::default();
         keys.insert("present".to_owned(), entry);
-        let mut gone = BTreeMap::new();
+        let mut gone = GoneRows::default();
         gone.insert("deleted".to_owned(), UNIX_EPOCH + Duration::from_secs(20));
         let stats = IndexStats {
             objects: 1,
@@ -944,9 +997,10 @@ mod tests {
             .get_mut("bucket")
             .unwrap()
             .keys
-            .get_mut("present")
-            .unwrap()
-            .etag = Some(ETag::Strong("x".repeat(caps().name_bytes)));
+            .update("present", |entry| {
+                entry.etag = Some(ETag::Strong("x".repeat(caps().name_bytes)));
+            })
+            .unwrap();
         assert!(matches!(
             encode(&long_etag, &["bucket".to_owned()], caps()),
             Err(ImageError::Capacity)

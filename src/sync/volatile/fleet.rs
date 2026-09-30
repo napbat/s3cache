@@ -195,54 +195,46 @@ impl FleetStatePort {
             request.recovery_generation,
         )?;
         let prepared = capture::prepare(admission, id)?;
-        // Measuring and cloning C hold the Ready guard's publication fence and
-        // the index write lock for as long as the bucket makes the clone
-        // (about 300 ms at 800k rows in release): C must be one atomic cut
-        // with the journal ingress it attaches. The blocking pool runs the
-        // copy, but a runtime task that needs the fence or the index meanwhile
-        // (a recovery signal, a local read or write) waits for it, so a
-        // one-worker node pauses for the clone, long enough for a peer to
-        // suspect it. That is why the image's roster binds each member's
-        // presence, not its SWIM status or incarnation, and why Groupnet
-        // paces failed recaptures: the pause costs a bounded few clones per
-        // claim window. A dropped waiter detaches the copy, and Drop of its
+        // C is one atomic cut of the index, its native cuts and the journal
+        // ingress it attaches, taken inside the Ready guard's publication
+        // fence under the index write lock. It sizes the image from the rows'
+        // image tallies and snapshots them by sharing their nodes, so the
+        // fence and the lock are held for O(buckets), not for a copy of every
+        // row: no runtime task that needs either waits longer than for one
+        // index write, and the capture cannot pause a one-CPU node into a
+        // lease lapse. The snapshot is measured and encoded on the blocking
+        // pool below; a dropped waiter detaches that work, and Drop of its
         // result unlinks C again.
-        let guard = request.guard.clone();
-        let index = Arc::clone(&self.adapter.state);
-        let budget = admission.clone();
-        let universe = self.universe.clone();
-        let listener = Arc::clone(&self.listener_alive);
-        let local = Arc::clone(&sync);
-        let (generation, members, clock, wake) = (
-            request.recovery_generation,
-            request.members,
-            request.clock,
-            request.wake,
-        );
-        let pending = tokio::task::spawn_blocking(move || {
-            guard
-                .capture(|current| {
-                    if current != generation
-                        || !local.mode_allows_local()
-                        || !listener.load(Ordering::Acquire)
-                    {
-                        return Err(AdapterError);
-                    }
-                    prepared.attach(&index, &budget, members, &universe, clock, wake)
-                })
-                .ok_or(AdapterError)
-                .flatten()
-        })
-        .await
-        .map_err(|_| AdapterError)
-        .flatten()
-        .inspect_err(|_| {
-            tracing::info!(
-                "fleet Ready recapture declined at C: stale guard, local reads \
-                 closed, or the measured image is over a ceiling or admission"
-            );
-        })?;
-        let size = pending.size();
+        let universe = &self.universe;
+        let entered = Instant::now();
+        let pending = request
+            .guard
+            .capture(|current| {
+                if current != request.recovery_generation
+                    || !sync.mode_allows_local()
+                    || !self.listener_alive()
+                {
+                    return Err(AdapterError);
+                }
+                prepared.attach(
+                    &self.adapter.state,
+                    admission,
+                    request.members,
+                    universe,
+                    request.clock,
+                    request.wake,
+                )
+            })
+            .ok_or(AdapterError)
+            .flatten()
+            .inspect_err(|_| {
+                tracing::info!(
+                    "fleet Ready recapture declined at C: stale guard, local reads \
+                     closed, or the image is over a ceiling or admission"
+                );
+            })?;
+        let c_elapsed = entered.elapsed();
+        let (size, c_lock) = (pending.size(), pending.lock_held());
         let pending = capture::encode(pending, self.universe.clone()).await?;
         if !self
             .source_matches_pending(request.operation, &pending, admission, request.deadline)
@@ -269,6 +261,8 @@ impl FleetStatePort {
                 rows = size.rows,
                 encoded_bytes = size.encoded_bytes,
                 decoded_charge = size.decoded_bytes,
+                c_lock_us = c_lock.as_micros(),
+                c_us = c_elapsed.as_micros(),
                 capture_ms = started.elapsed().as_millis(),
                 "fleet donor image captured"
             );

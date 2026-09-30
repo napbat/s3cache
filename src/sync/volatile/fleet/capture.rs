@@ -22,10 +22,11 @@ static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(1);
 
 /// The image and suffix policy, sized for a real bucket. A production docres row
 /// encodes to about 135 bytes and is charged about 650 decoded bytes (measured:
-/// 800k rows, 108 MB encoded, 512 MiB charged, cloned in about 300 ms), so these
-/// caps (the codec's ceilings) offer an index of up to about 1.5M rows; the
-/// 798k-row production index fits with headroom. A larger index declines peer
-/// transfer and continues guarded origin recovery.
+/// 800k rows, 108 MB encoded, 512 MiB charged; C held the index lock for
+/// microseconds and the snapshot measured and encoded off-lock in about 200 ms
+/// in release), so these caps (the codec's ceilings) offer an index of up to
+/// about 1.5M rows; the 798k-row production index fits with headroom. A larger
+/// index declines peer transfer and continues guarded origin recovery.
 pub(super) const IMAGE_CAPS: ImageCaps = ImageCaps {
     bytes: 256 << 20,
     decoded_bytes: 1 << 30,
