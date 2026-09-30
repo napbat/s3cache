@@ -16,8 +16,6 @@ spec:
     - name: gossip
       port: {{ .Values.gossip.port }}
       protocol: UDP
-    {{- if .Values.fleet.enabled }}
     - name: fleet
       port: {{ .Values.fleet.port | int64 }}
       protocol: TCP
-    {{- end }}

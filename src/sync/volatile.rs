@@ -21,7 +21,6 @@ use crate::metrics::Metrics;
 use crate::sync::coherence::{Consistency, DEFAULT_LEASE_MS, WriteSync};
 use crate::tier::LocalCache;
 
-#[cfg(feature = "fleet")]
 pub(super) mod fleet;
 
 /// The first consumer of the optional reusable volatile-recovery runtime.
@@ -53,7 +52,6 @@ pub(crate) struct RecoveryInputs {
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) config: Option<RecoveryConfig>,
     pub(crate) rearm: Option<RecoveryRearm>,
-    #[cfg(feature = "fleet")]
     pub(crate) fleet: Option<crate::sync::fleet::config::FleetConfig>,
 }
 
@@ -62,7 +60,6 @@ impl WriteSync {
     /// The session is local correlation only, never a claimed durable cursor.
     pub(crate) fn open_recovery(self: &Arc<Self>, inputs: RecoveryInputs) {
         let prepared = self.prepare_recovery(inputs);
-        #[cfg(feature = "fleet")]
         if prepared.fleet.is_some() {
             tracing::warn!(
                 "fleet configured but synchronous coherence startup uses guarded origin recovery; call start_fleet_coherence for peer bootstrap"
@@ -72,7 +69,6 @@ impl WriteSync {
         self.install_recovery(recovery);
     }
 
-    #[cfg(feature = "fleet")]
     pub(crate) async fn open_fleet_recovery(self: &Arc<Self>, inputs: RecoveryInputs) {
         let prepared = self.prepare_recovery(inputs);
         if let Some((recovery, listener)) = fleet::open_recovery(self, &prepared).await {
@@ -96,7 +92,6 @@ impl WriteSync {
             metrics,
             config,
             rearm,
-            #[cfg(feature = "fleet")]
             fleet,
         } = inputs;
         assert!(
@@ -145,7 +140,6 @@ impl WriteSync {
             mode,
             session,
             rearm,
-            #[cfg(feature = "fleet")]
             fleet,
         }
     }
@@ -157,7 +151,6 @@ struct PreparedRecovery {
     mode: RecoveryMode,
     session: u64,
     rearm: Option<RecoveryRearm>,
-    #[cfg(feature = "fleet")]
     fleet: Option<crate::sync::fleet::config::FleetConfig>,
 }
 
