@@ -78,8 +78,10 @@ hot (in-memory, small)  ->  warm (node-local disk, large, optional)  ->  cold (S
 - **cold** — the S3 origin.
 
 Both tiers are node-local; cross-node coherence is handled separately (below): a peer's
-write updates the index and awaits removal of the local hot copy. The warm copy remains
-on disk, decodes suspect, and must prove itself against that newer index before serving.
+write updates the index and awaits removal of the local hot copy. The superseded warm
+copy is then deleted off the acknowledgement path, so dead bodies never crowd live ones
+out of the disk budget; a copy read in the meantime decodes suspect and must prove
+itself against that newer index before serving.
 
 ## Cross-node coherence (gossip write feed)
 

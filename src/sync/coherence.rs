@@ -930,6 +930,12 @@ impl WriteSync {
                             ledger.record(&peer, token).await;
                         }
                         metrics.feed_applied();
+                        // The index has moved past any copy this node holds, so the warm
+                        // copy can never serve again; left in place it would only crowd
+                        // live bodies out of the disk budget until LRU found it. Disk I/O
+                        // stays off the frontier: retire it after the acknowledgement.
+                        let retire = local.clone();
+                        tokio::spawn(async move { retire.invalidate(&cache_key).await });
                     }
                     PeerWrite::Gap {
                         peer,

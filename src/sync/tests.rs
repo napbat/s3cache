@@ -19,7 +19,7 @@ use crate::sync::config::{parse_lease_ms, parse_seeds};
 use crate::sync::wire::{
     IndexEvent, IndexOp, WIRE_MAGIC, decode_event, encode_event, from_micros, to_micros, wire_stamp,
 };
-use crate::tier::{CachedObject, TieredCache};
+use crate::tier::{CachedObject, TieredCache, open_warm};
 
 type Index = Arc<KeyIndex>;
 
@@ -444,6 +444,58 @@ async fn peer_events_fold_into_index_and_invalidate() {
     .await;
     assert_eq!(state.stats().objects, 0);
     assert_eq!(state.stats().logical_bytes, 0);
+}
+
+/// A peer's delete retires this node's warm disk copy too, not just the hot one.
+/// The index no longer names the key, so the file could only ever sit in the disk
+/// budget crowding out live bodies until LRU reached it.
+#[tokio::test]
+async fn peer_delete_retires_the_warm_copy() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_node(&net, "warm-a", "warm-b");
+    let (b_id, _b_node, b_group) = spawn_node(&net, "warm-b", "warm-a");
+    let metrics = Arc::new(Metrics::default());
+    let dir = std::env::temp_dir().join(format!("s3cache-peer-warm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let warm = open_warm(dir.clone(), 1024 * 1024, 64 * 1024, metrics.clone()).unwrap();
+    let cache = TieredCache::new(1024 * 1024, Some(warm), metrics.clone());
+    let state = Arc::new(KeyIndex::default());
+    let sync_b = Arc::new(attach(b_group, b_id, Consistency::Strong));
+    sync_b.start_apply(cache.local(), state.clone(), metrics.clone());
+    let sync_a = attach(a_group, a_id, Consistency::Strong);
+
+    own_put(&sync_a, "gone", written(4), &metrics).await;
+    eventually(
+        || indexed_size(&state, "bkt", "gone") == Some(4),
+        "put reaches the peer index",
+    )
+    .await;
+    let ckey = ("bkt".to_owned(), "gone".to_owned());
+    cache.insert(ckey.clone(), cached(b"body")).await;
+    assert!(cache.get(&ckey).await.is_some(), "the body is cached");
+
+    sync_a
+        .index_del(
+            &KeyIndex::default(),
+            "bkt",
+            "gone",
+            SystemTime::now(),
+            &metrics,
+        )
+        .await;
+    let mut retired = false;
+    for _ in 0..300 {
+        // A lookup that misses hot promotes from warm, so `None` means the disk
+        // copy is gone as well.
+        if indexed_size(&state, "bkt", "gone").is_none() && cache.get(&ckey).await.is_none() {
+            retired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(retired, "the peer delete retired the warm copy");
+    drop(cache);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The strict-LIST barrier: after a publish, `await_fresh` on the peer

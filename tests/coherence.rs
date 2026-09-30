@@ -347,12 +347,12 @@ async fn a_delete_on_a_removes_the_key_from_bs_index() {
     );
 }
 
-/// Applying a peer overwrite updates the index and awaits only hot eviction before
-/// acknowledging. Warm disk remains off the frontier: the changed copy is retained
-/// suspect and rejected against the new index on demand, while unrelated entries keep
-/// their proof and remain free to serve.
+/// Applying a peer overwrite retires only the superseded copy. The acknowledgement
+/// awaits hot eviction alone; the warm file is removed afterwards, so a copy the index
+/// has moved past stops occupying the disk budget, while unrelated entries keep their
+/// proof and remain free to serve.
 #[tokio::test]
-async fn a_peer_overwrite_keeps_warm_disk_off_the_apply_frontier() {
+async fn a_peer_overwrite_retires_only_the_superseded_warm_copy() {
     let origin = Origin::start("coherence-warm-apply").await;
     let bucket = origin.bucket();
     origin.seed("kept", b"never-touched").await;
@@ -376,30 +376,20 @@ async fn a_peer_overwrite_keeps_warm_disk_off_the_apply_frontier() {
     assert_eq!(get(&node_b, bucket, "changed").await, "version-1");
     eventually!("both bodies to reach warm disk", dir.files() == 2);
     let fetched = origin.ops.get();
-    let evictions = counter(&metrics_b, "body_revalidation_evictions");
 
     put_typed(&node_a, bucket, "changed", b"version-2", "text/x-fixture").await;
-    assert_eq!(
-        dir.files(),
-        2,
-        "the applied acknowledgement did not wait for or enqueue warm deletion"
-    );
+    eventually!("the superseded warm copy to be retired", dir.files() == 1);
     assert_eq!(get(&node_b, bucket, "kept").await, "never-touched");
     assert_eq!(
         origin.ops.get(),
         fetched,
-        "the unrelated trusted hot body remains locally serveable"
+        "the unrelated trusted body remains locally serveable"
     );
     assert_eq!(get(&node_b, bucket, "changed").await, "version-2");
     assert_eq!(
         origin.ops.get(),
         fetched + 1,
-        "only the contradicted warm body was refetched"
-    );
-    assert_eq!(
-        counter(&metrics_b, "body_revalidation_evictions"),
-        evictions + 1,
-        "the retained warm copy was checked against the already-updated index"
+        "only the superseded body was refetched"
     );
 }
 

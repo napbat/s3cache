@@ -862,10 +862,10 @@ impl LocalCache {
 
     /// Drop a peer-written key from hot memory before acknowledging the feed event.
     ///
-    /// The apply loop updates its index first. A retained warm copy therefore decodes
-    /// with trust generation zero and must validate against the new entry; only a copy
-    /// for this changed key is fully evicted and fetched again. No disk deletion delays
-    /// the peer frontier or its acknowledgement.
+    /// The apply loop updates its index first. A warm copy promoted before the apply
+    /// loop retires it (after the acknowledgement) decodes with trust generation zero
+    /// and must validate against the new entry. No disk deletion delays the peer
+    /// frontier or its acknowledgement.
     pub(crate) async fn invalidate_hot(&self, key: &CacheKey) {
         self.core.invalidate_hot(key).await;
     }
