@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 /// How long a planned stop lets in-flight requests finish.
 const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long a drained stop waits for PUT tails and for peers to acknowledge the feed
+/// How long a drained stop waits for mutation tails and for peers to acknowledge the feed
 /// seal. With [`DRAIN_WAIT`] it must fit inside the pod's termination grace period
 /// (the Helm chart's `terminationGracePeriodSeconds`).
 const SEAL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);

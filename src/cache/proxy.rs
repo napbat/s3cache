@@ -440,7 +440,7 @@ pub struct CachingProxy {
     recovery_config: Option<groupnet::consistency::volatile_recovery::RecoveryConfig>,
     recovery_rearm: Option<groupnet::consistency::volatile_recovery::RecoveryRearm>,
     fleet: Option<crate::sync::fleet::config::FleetConfig>,
-    /// PUT tails still running, which a planned stop waits out before sealing.
+    /// Mutation tails still running, which a planned stop waits out before sealing.
     pub(super) tails: super::stop::WriteTails,
     /// The `/index-ready` latch (see [`index_ready`](Self::index_ready)).
     pub(super) index_ready: super::readiness::IndexReady,

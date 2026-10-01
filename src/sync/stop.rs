@@ -2,7 +2,7 @@
 //!
 //! A crash leaves peers a gap: the dead life may have committed origin writes it
 //! never published, and only the origin knows which. A planned stop can prove
-//! that tail empty. Once the HTTP drain has finished and every PUT tail has
+//! that tail empty. Once the HTTP drain has finished and every mutation tail has
 //! published (see [`crate::cache::proxy::CachingProxy::seal_writes`]), this life
 //! can publish nothing more, so [`WriteSync::seal`](crate::sync::coherence::WriteSync::seal)
 //! says so on the feed and waits
@@ -97,7 +97,7 @@ impl WriteSync {
     /// on to acknowledge the seal.
     ///
     /// Call it only once nothing can publish again: the HTTP drain has completed and
-    /// every PUT tail has finished. The seal promises the peers that this life wrote
+    /// every mutation tail has finished. The seal promises the peers that this life wrote
     /// nothing after it, which is what lets them skip the restart remediation; a
     /// write published afterwards panics in the feed rather than break that promise.
     pub async fn seal(&self, wait: Duration) -> SealOutcome {

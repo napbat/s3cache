@@ -250,8 +250,17 @@ recheck recovery generation outside the index lock before a local response.
 ### Coverage of this node's own effects
 
 Aligned cuts prove that the stage and the live index applied the same native
-effects in the same writer order. Everything else the live index holds came
-from this node alone and is ordered by no writer cut: rows from
+effects in the same writer order only while the live index has taken no feed
+gap. A delivered gap moves the writer's cut past effects this node never
+applied (`skip_native_gap`), so the cuts align without the effects being the
+same: the missed span may have deleted a key whose tombstone the donor's own
+origin rebuild then forgot. The gap therefore also discards every bucket to
+origin-serving state under the same lock (`KeyIndex::discard_for_gap`): no
+rows or tombstones, a new sync generation, and only the per-key uncertainty
+fences kept, as an origin resync keeps them. Every row the follower then holds
+at install time was either applied from the feed after the gap, and lines up
+with the donor's cut by position, or came from this node alone and is ordered
+by no writer cut: rows from
 origin-validated GET/HEAD observations, the row or tombstone an exact-token
 HEAD writes when it reconciles an uncertain write, a delete of a key the
 donor never held, and every still-open reconciliation. A follower that
@@ -369,11 +378,13 @@ once rather than at the new life's first write.
 **Planned stop: seal.** On `SIGTERM` the binary retracts its serve-lease,
 drains HTTP connections for up to 10 s, and only if the drain completed seals
 its write feed (`CachingProxy::seal_writes`, then `WriteSync::seal`). The seal
-first waits for every PUT tail, the spawned origin-and-publish task a PUT runs
-so a client hang-up cannot strand an applied write, and then promises the peers
-that this life publishes nothing more. It waits up to 5 s for every peer a
-write waits on to acknowledge the seal. A drain that timed out, a PUT tail still
-running, or a crash leaves the feed unsealed: the restart stays an ordinary gap,
+first waits for every mutation tail, the spawned origin-and-publish task each
+PUT, DELETE, DeleteObjects, copy, and multipart completion runs
+(`CachingProxy::mutation_tail`) so a client hang-up cannot strand an applied
+write, and then promises the peers that this life publishes nothing more. It
+waits up to 5 s for every peer a write waits on to acknowledge the seal. A
+drain that timed out, a mutation tail still running, or a crash leaves the
+feed unsealed: the restart stays an ordinary gap,
 which is always safe. The Helm chart's
 `availability.terminationGracePeriodSeconds` (default 30) must cover the
 drain plus the seal wait.
