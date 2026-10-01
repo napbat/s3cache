@@ -396,6 +396,64 @@ async fn a_freshness_timeout_routes_to_origin_and_is_counted() {
     assert_eq!(counter(&proxy, "read_licence_bypasses"), 0);
 }
 
+/// A write whose cluster wait stalls carries no guarantee, so it is never answered as a
+/// success: the peer neither applied it nor provably stopped serving, and a read through
+/// it could still return the state the write replaced.
+#[tokio::test]
+async fn a_stalled_write_is_a_503_not_a_success() {
+    let net = Network::new();
+    let a_id = NodeId::new("stall-a");
+    let b_id = NodeId::new("stall-b");
+    let a_node = Node::builder(a_id.clone(), net.endpoint(a_id.clone()))
+        .seed(b_id.clone())
+        .config(brisk())
+        .spawn();
+    let b_node = Node::builder(b_id.clone(), net.endpoint(b_id.clone()))
+        .seed(a_id.clone())
+        .config(brisk())
+        .spawn();
+    let lease = LeaseConfig::for_duration(Duration::from_millis(300));
+    // A advertises the ack tier but runs no apply loop, so it never acknowledges.
+    let _peer = WriteSync::attach(
+        a_node.join_group("s3cache"),
+        a_id.clone(),
+        Consistency::StrongAcks,
+        lease,
+        None,
+    );
+    let b_group = b_node.join_group("s3cache");
+    let sync = Arc::new(WriteSync::attach(
+        b_group.clone(),
+        b_id,
+        Consistency::StrongAcks,
+        lease,
+        None,
+    ));
+    let proxy = proxy(Some(sync));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !b_group.members().contains(&a_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the peers converge");
+
+    let entry = ObjEntry {
+        size: Some(1),
+        last_modified: at(1_700_000_000),
+        etag: Some(ETag::Strong("e1".to_owned())),
+        storage_class: standard_class(),
+        content_type: None,
+        meta: None,
+    };
+    let error = proxy
+        .record_put(crate::cache::proxy::IndexedWrite::Put, "bkt", "k", entry)
+        .await
+        .expect_err("a stalled write must not be acknowledged");
+    assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+    assert_eq!(counter(&proxy, "ack_timeouts"), 1);
+}
+
 #[tokio::test]
 async fn an_unlicensed_read_records_its_bypass_reason() {
     let (_node, sync) = solo("unlicensed-read");

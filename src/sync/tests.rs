@@ -237,7 +237,7 @@ fn env_spellings_parse_into_a_config() {
 
 /// Only the leased mode advertises [`CAP_LEASE`], because only it constructs a
 /// lease set — a node advertising it without a running granter freezes every other
-/// reader's confirmation until membership reaps it.
+/// reader's confirmation until it grants or departs.
 #[test]
 fn only_a_mode_that_grants_leases_advertises_that_it_does() {
     assert_eq!(Consistency::Strong.capabilities(), [CAP_ACKS, CAP_LEASE]);
@@ -655,7 +655,9 @@ async fn write_tokens_upgrade_reads_to_strict() {
 /// The pre-lease mode's contract, kept exactly as it was for the one release it
 /// survives: the write-ack wait has to actually fire when a peer does not
 /// acknowledge — the counter operators watch is only worth watching if it moves —
-/// and the stalled outcome must not retire feed history the peer still needs.
+/// the stalled outcome must not retire feed history the peer still needs, and it is
+/// reported to the caller as carrying no guarantee, so the client gets a 503 rather
+/// than a success.
 #[tokio::test]
 async fn in_strong_acks_an_unacked_write_is_counted_and_not_retired() {
     let net = Network::new();
@@ -677,7 +679,7 @@ async fn in_strong_acks_an_unacked_write_is_counted_and_not_retired() {
     .await;
 
     let receipt = own_put(&sync_b, "unacked", written(1), &metrics).await;
-    sync_b
+    let guaranteed = sync_b
         .ack_write(
             receipt.token,
             Duration::from_millis(200),
@@ -686,6 +688,7 @@ async fn in_strong_acks_an_unacked_write_is_counted_and_not_retired() {
             &metrics,
         )
         .await;
+    assert!(!guaranteed, "a stalled wait must never be acknowledged");
     assert!(
         metrics
             .prometheus_text()
@@ -772,7 +775,7 @@ async fn a_dropped_peers_lease_lapses_and_the_write_completes_inside_one_duratio
 
     let started = Instant::now();
     let receipt = own_put(&sync_a, "lapsed", written(1), &metrics).await;
-    sync_a
+    let guaranteed = sync_a
         .ack_write(
             receipt.token,
             Duration::from_millis(200),
@@ -781,6 +784,7 @@ async fn a_dropped_peers_lease_lapses_and_the_write_completes_inside_one_duratio
             &metrics,
         )
         .await;
+    assert!(guaranteed, "a proven lapse carries the guarantee");
     let stalled = started.elapsed();
     assert!(
         stalled < TEST_LEASE * 3,
@@ -796,20 +800,67 @@ async fn a_dropped_peers_lease_lapses_and_the_write_completes_inside_one_duratio
         "and never as the alarm it is not"
     );
 
-    // And the cost is not recurring: the lapsed holder has left the wait set, so the
-    // next write is back on the fast path.
+    // And the cost is not recurring: the next write carries the guarantee without
+    // waiting out B again. B is either out of the wait set (Applied) or, while its
+    // entry lingers, excused at once by the lapse already proven (Lapsed).
     let started = Instant::now();
     let receipt = own_put(&sync_a, "after", written(2), &metrics).await;
     assert!(matches!(
         sync_a
             .wait_cluster_applied(receipt.token, Duration::from_secs(5))
             .await,
-        WriteWait::Applied
+        WriteWait::Applied | WriteWait::Lapsed(_)
     ));
     assert!(
         started.elapsed() < TEST_LEASE,
-        "a lapsed peer is excused once, not once per write"
+        "a lapsed peer is waited out once, not once per write"
     );
+}
+
+/// The availability price of a roster that only grows, made visible: a granter that dies
+/// without departing stays counted — through suspect, dead and reap — so the survivor
+/// serves from the origin until it returns, and names it as the reason.
+#[tokio::test]
+async fn a_granter_that_crashed_without_departing_is_named_until_it_returns() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_node(&net, "absent-a", "absent-b");
+    let (b_id, b_node, b_group) = spawn_node(&net, "absent-b", "absent-a");
+    let sync_a = attach(a_group, a_id, Consistency::Strong);
+    let sync_b = attach(b_group, b_id.clone(), Consistency::Strong);
+    eventually(
+        || sync_a.lease_granted_by(&b_id).is_some(),
+        "B to grant A's serve-lease",
+    )
+    .await;
+    assert!(
+        sync_a.absent_granters().is_empty(),
+        "B is alive and granting"
+    );
+
+    // A crash: no departure, the node simply stops. Dropping the handles is not enough
+    // on its own — the receive loop keeps the node ticking until its endpoint is
+    // evicted, which registering the id again does.
+    drop(sync_b);
+    drop(b_node);
+    drop(net.endpoint(b_id.clone()));
+    eventually(
+        || sync_a.absent_granters() == [b_id.clone()],
+        "A to name B as the counted granter it is waiting on",
+    )
+    .await;
+    // Past the reap horizon B is still counted, and A still cannot serve locally.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(sync_a.absent_granters(), std::slice::from_ref(&b_id));
+    assert!(!sync_a.may_serve_local());
+
+    // B returns under the same id (a StatefulSet pod) and is no longer named.
+    let (b_id, _b_node, b_group) = spawn_node(&net, "absent-b", "absent-a");
+    let _sync_b = attach(b_group, b_id, Consistency::Strong);
+    eventually(
+        || sync_a.absent_granters().is_empty(),
+        "A to see the returned granter alive",
+    )
+    .await;
 }
 
 #[tokio::test]

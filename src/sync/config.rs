@@ -77,26 +77,23 @@ impl WriteSync {
     /// mixed fleet has one membership timing rather than two. The tuning **is** part of
     /// the lease migration, not decoration around it:
     ///
-    /// * A reader's confirmation is a min over its whole roster, and only a **reap**
-    ///   removes a member from it. So one `CAP_LEASE` member that stops publishing
-    ///   grants — crashed, hung, partitioned — freezes *every* reader's confirmation
-    ///   cluster-wide. Each reader's window closes within one `D` of the freeze and
-    ///   cannot reopen until membership reaps the silent member, at the reap horizon:
-    ///   `2 × dead_timeout_ms` past the `Dead` verdict, itself up to
-    ///   `detection_window_ms` past the silence.
-    /// * Untuned that is `0.9 + 20 − 2` ≈ **19s of cluster-wide origin-serving** —
-    ///   correct reads throughout, none of them cached. At `dead_timeout_ms = D = 2s` it
-    ///   is ≈ **3s**.
+    /// * A reader's confirmation is a min over its whole roster, and only a
+    ///   **departure** removes a member from it: a reap does not, because an
+    ///   asymmetric partition that outlives the reap horizon reaps a writer that is
+    ///   still writing. So one `CAP_LEASE` member that stops publishing grants without
+    ///   departing — crashed, hung, partitioned — keeps *every* reader serving from the
+    ///   origin until it grants again (`read_absent_granter_bypasses` and a log line
+    ///   name it). A planned stop departs and is dropped at once.
+    /// * What the tuning still buys is membership's own timing: suspicion, the `Dead`
+    ///   verdict and the reap that the write-feed apply loop, readiness and the fleet
+    ///   bootstrap follow.
     ///
     /// What it costs is the other end of the same horizon: `2 × dead_timeout_ms` is also
     /// how long a returning node's entries stay recoverable by a digest, so a partition
     /// outliving ~4s lands on the write-feed **gap** path instead of reconciling —
     /// distrust every cached body, re-LIST from the origin. That is not a regression to
     /// work around; the origin is the authority this index caches, and the gap path is
-    /// s3cache's standing remedy for "this node provably missed writes". Trading a rare,
-    /// loud, correct
-    /// resync for 16s off every unreaped-granter freeze is the right side of that deal
-    /// for a cache.
+    /// s3cache's standing remedy for "this node provably missed writes".
     pub async fn new(cfg: SyncConfig) -> Option<Self> {
         let me = NodeId::new(cfg.node_id.as_str());
         let transport = match UdpTransport::bind(me.clone(), cfg.bind.as_str()).await {

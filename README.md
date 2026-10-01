@@ -231,15 +231,16 @@ heuristic earlier releases used:
   until validated. LIST and index-backed absence still require a complete bucket
   index. A feed gap during boot supersedes the scan and requires a fresh one.
 - **A lapse with no gap behind it gets a recovery, and usually keeps the cache.** Not
-  every way of losing the licence arrives as an event: a peer scaled in, lost for good,
-  or restarted while the write feed was quiet freezes this node's confirmation with no
-  gap to notice. The lapse latches, so a watcher on the lease recovers from it — and a
+  every way of losing the licence arrives as an event: a peer that departs (a planned
+  stop or scale-in) is dropped from the roster with a lapse, and a peer restarted while
+  the write feed was quiet freezes this node's confirmation with no gap to notice. The
+  lapse latches, so a watcher on the lease recovers from it — and a
   lapse is *not* proof that anything changed, only that this node stopped being allowed
   to serve, so the watcher proves the cache rather than throwing it away. It stands the
   licence down, waits for **every granter separately** to adopt a renewal published
   after the lapse (so every wait held against the old one is resolved — read per granter
   rather than off the confirmed watermark, which is a *min* over the roster and advances
-  when the member pinning it is merely reaped), settles for the fabric's
+  when the member pinning it merely departs), settles for the fabric's
   entry-propagation bound (`2 × anti_entropy_interval`), checks that no peer which was
   live at the lapse has vanished from membership since, and then barriers on every peer's
   advertised feed head — re-running the vanished check once more afterwards, because the
@@ -261,28 +262,36 @@ box is the long form):
   over one lease duration can believe it holds a lease the granter already expired. It
   is an assumption about *rates* — a few hundred ppm on any healthy host — never about
   wall-clock steps, which cannot affect it.
-- **The fail-slow reader is the one shape no lease bounds.** A node that keeps
+- **A write is never acknowledged without the guarantee.** A reader that keeps
   *renewing* while it stops *applying* — a stuck apply loop, a partition that carries
-  gossip but not writes — offers neither an ack nor a lapse, so writes behind it run to
-  their own deadline (`D + 1s`) and end with **no** guarantee, counted as
-  `ack_timeouts` and logged naming the node. Raising the deadline cannot help; the
-  remedy is operational — stop that pod. The log line names it.
-- **One unresponsive pod freezes every reader, briefly.** Confirmation is a min over
-  the whole roster and only a *reap* removes a member, so a pod that stops granting
-  freezes every other reader's lease cluster-wide: reads stay correct and all of them
-  go to the origin. s3cache tunes `dead_timeout` down to `D` for exactly this, turning
-  the untuned ~19s of cluster-wide origin-serving into ≈3s. The freeze *ends* at the
-  reap rather than latching: each frozen reader watches its own lapse and recovers from
-  it (above), so it comes back in service — and, in the common case, still warm. The
-  price is the other end of the same horizon: a partition outliving ~4s lands on the
-  write-feed **gap** path (distrust + origin re-LIST) instead of reconciling — loud,
-  correct, and the standing remedy a cache wants.
+  gossip but not writes — is granted no new renewal by the writer until it applies the
+  write, so its lease lapses within `D` and the write ends on that lapse. What is left
+  — a peer whose current life has not yet proven it counts the writer, a writer still
+  in its warm-up window, a mixed-version fleet mid-rollout, an un-leased peer that does
+  not ack — runs to the deadline (`D + 1s`) and is answered **503 `ServiceUnavailable`**
+  rather than success, counted as `ack_timeouts` and logged naming the node. The write
+  may have reached the origin and is already on the write feed, so every node converges
+  on it; a retry (or a read) settles which outcome the client got.
+- **A pod that dies without departing keeps the survivors on the origin until it
+  returns.** Confirmation is a min over the roster, and the roster only grows: a granter
+  stays in it through suspect, dead and reap, and leaves only once its grant map says it
+  *departed*. So after a crash (or a partition) every other reader serves from the
+  origin — correct, slower — until the pod comes back under the same id (a StatefulSet
+  pod grants again on boot) or the survivor restarts. A *planned* stop does not latch
+  it: on `SIGTERM` (a rollout, a scale-in) the node departs the lease set before it
+  drains, and readers drop it as soon as they see the departure — even while membership
+  still lists it — re-synchronize once (cheaply, without an origin scan), and serve
+  locally again. Each read sent to the origin for this reason counts
+  `read_absent_granter_bypasses`, and the survivor logs `serving reads from the origin:
+  lease granters <ids> are counted but not alive` whenever that set changes (and once
+  more when they are all back), so the pod it is waiting on is named. Before this rule
+  the reap released the readers after about 3 s, which is how a partition outliving the
+  reap horizon let a reader serve with no granter at all.
 - **First write after a pod dies costs up to `D`.** That is the lapse being waited out,
   once. It shows up as `write_lease_lapses`, not `ack_timeouts`, because the guarantee
-  held. A *planned* stop does not pay it: on `SIGTERM` (a rollout, a scale-in) the node
-  retracts its serve-lease before it drains, so there is no lapse to wait out. That is
-  the write side only — the reader-side freeze above is unchanged either way, because
-  the departing node's capability advertisement lives in every roster until the reap.
+  held. A *planned* stop does not pay it: the departing node retracts its serve-lease
+  before it drains, so there is no lapse to wait out. While an asymmetric partition
+  lasts, every write pays it, because each ends on a lapse.
 - **A planned restart keeps the peers' index; a crash costs one origin scan.** After
   its HTTP drain completes (10 s at most), a stopping node seals its write feed and
   waits up to 5 s for peers to acknowledge the seal. A peer that saw it crosses the
@@ -556,12 +565,13 @@ worth wiring an alert around: **`write_lease_lapses` is the guarantee working** 
 stopped acknowledging, its serve-lease expired, and the write completed knowing that peer
 can serve nothing cached until it re-synchronizes. Sustained movement means a pod is
 unresponsive and each such write cost up to one lease duration, but no read was ever
-stale. **`ack_timeouts` is the absence of the guarantee**: peers still live and still
-behind when the wait's deadline passed (in `strong`, the fail-slow reader — renewing but
-not applying — plus any un-leased peer that did not ack). Alert on that one.
-`unhealthy_bypasses` counts reads sent to the origin because this node held no licence or
-could not reach every advertised feed head before the freshness-barrier deadline.
-`read_licence_bypasses` and `read_freshness_bypasses` split those causes. They
+stale. **`ack_timeouts` is the absence of the guarantee**: a peer still live and still
+behind when the wait's deadline passed, and that write was answered 503. Alert on that
+one. `unhealthy_bypasses` counts reads sent to the origin because this node held no
+licence or could not reach every advertised feed head before the freshness-barrier
+deadline. `read_licence_bypasses` and `read_freshness_bypasses` split those causes, and
+`read_absent_granter_bypasses` is the part of `read_licence_bypasses` spent waiting on a
+lease granter that crashed without departing (the log names it). They
 do not include a read whose session token could not be verified in time.
 Some unhealthy bypasses are expected at startup and after a feed gap.
 `body_revalidation_evictions` counts suspect cached bodies rejected by the

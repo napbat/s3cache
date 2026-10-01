@@ -307,6 +307,9 @@ counters! {
     unhealthy_bypasses => unhealthy_bypass,
     /// Record a read routed to the origin because this node cannot serve locally.
     read_licence_bypasses => read_licence_bypass,
+    /// Record a licence bypass while a lease granter this node still counts is not
+    /// alive (crashed without departing): the read waits on that granter's return.
+    read_absent_granter_bypasses => read_absent_granter_bypass,
     /// Record a read routed to the origin after the freshness barrier timed out.
     read_freshness_bypasses => read_freshness_bypass,
     /// Record a skeletal index entry completed from an origin response (the one

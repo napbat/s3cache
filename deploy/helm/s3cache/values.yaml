@@ -100,7 +100,8 @@ gossip:
   # The knob trading write-stall-under-failure against renewal traffic: a writer whose
   # peer goes silent stalls at most one D, and each pod republishes one small entry every
   # D/3 to keep its lease. It also sets the fleet's membership dead_timeout, so raising it
-  # lengthens the freeze a single unresponsive pod costs every reader. Empty = 2000.
+  # slows failure detection. A pod that dies without a SIGTERM keeps every other pod
+  # serving reads from the origin until it returns, whatever D is. Empty = 2000.
   leaseMs: ""
 
 # Peer index bootstrap: whenever upstream.buckets is set, a joining pod copies a

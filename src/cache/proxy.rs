@@ -653,6 +653,9 @@ impl CachingProxy {
         if !sync.may_serve_local() {
             self.metrics.unhealthy_bypass();
             self.metrics.read_licence_bypass();
+            if !sync.absent_granters().is_empty() {
+                self.metrics.read_absent_granter_bypass();
+            }
             return ReadRoute::Origin;
         }
         if !sync.await_fresh(READ_BARRIER_TIMEOUT).await {
@@ -768,22 +771,19 @@ impl CachingProxy {
         spawn_key_reconcile(&self.client, &self.state, bucket, key, token, reason);
     }
 
-    /// A mutation this node forwarded but cannot describe: the origin's answer does not
-    /// prove the write was refused, so the key may hold the new object, the old one, or
-    /// nothing. Every node must answer it from the origin until an origin HEAD resolves
-    /// it, so this fences it here, advertises the uncertainty to every peer (see
+    /// A mutation this node forwarded but cannot describe, on a path that is already
+    /// answering the client an error: the origin's answer does not prove the write was
+    /// refused, so the key may hold the new object, the old one, or nothing. Every node
+    /// must answer it from the origin until an origin HEAD resolves it, so this fences
+    /// it here, advertises the uncertainty to every peer (see
     /// [`IndexOp::unknown`](crate::sync::wire::IndexOp::unknown)), and holds the caller
     /// until the cluster has fenced it too or lost the right to serve, exactly as a
-    /// describable write is held ([`record_put`](Self::record_put)). Returns the
-    /// advertisement's session token when coherence is on.
-    pub(super) async fn publish_unknown(
-        &self,
-        bucket: &str,
-        key: &str,
-        reason: &str,
-    ) -> Option<String> {
+    /// describable write is held ([`record_put`](Self::record_put)). A stalled wait
+    /// changes nothing here: the caller's error already tells the client the outcome is
+    /// unknown.
+    pub(super) async fn publish_unknown(&self, bucket: &str, key: &str, reason: &str) {
         let receipt = self.announce_unknown(bucket, key, reason).await;
-        self.await_cluster(receipt, bucket, key).await
+        self.settle_cluster(receipt, bucket, key).await;
     }
 
     /// [`publish_unknown`](Self::publish_unknown) without the cluster wait, for a batch
@@ -839,22 +839,25 @@ impl CachingProxy {
     /// until every alive peer has applied the invalidation (a couple of in-cluster hops
     /// behind the origin round-trip already paid), so a subsequent read via ANY node is
     /// fresh with no client cooperation. Returns the write's session token when
-    /// coherence is on. The caller has already dropped this node's own body copy — the
-    /// writer must not serve its own stale bytes while the cluster round runs.
+    /// coherence is on, or a 503 when the wait stalled (see
+    /// [`await_cluster`](Self::await_cluster)). The caller has already dropped this
+    /// node's own body copy — the writer must not serve its own stale bytes while the
+    /// cluster round runs.
     pub(super) async fn record_put(
         &self,
         op: IndexedWrite,
         bucket: &str,
         key: &str,
         mut entry: ObjEntry,
-    ) -> Option<String> {
+    ) -> S3Result<Option<String>> {
         // A write whose response carried neither an `ETag` nor a size describes nothing
         // a reader could check a copy against: it is reconciled as an uncertain one.
         if entry.etag.is_none() && entry.size.is_none() {
             op.record(&self.metrics);
-            return self
-                .publish_unknown(bucket, key, "the write's response described no object")
+            let receipt = self
+                .announce_unknown(bucket, key, "the write's response described no object")
                 .await;
+            return self.await_cluster(receipt, bucket, key).await;
         }
         entry.last_modified = wire_stamp(SystemTime::now());
         // Index first: the writer must never be the one node still answering from the
@@ -864,16 +867,14 @@ impl CachingProxy {
             if apply_put(&self.state, bucket, key, entry) {
                 op.record(&self.metrics);
             }
-            return None;
+            return Ok(None);
         };
         let (changed, publishing) = sync.index_put(&self.state, bucket, key, entry, &self.metrics);
         if changed {
             op.record(&self.metrics);
         }
         let receipt = publishing.await;
-        sync.ack_write(receipt.token, WRITE_ACK_TIMEOUT, bucket, key, &self.metrics)
-            .await;
-        Some(receipt.header)
+        self.await_cluster(Some(receipt), bucket, key).await
     }
 
     /// Record a durable delete: tombstone + remove locally and advertise it to peers,
@@ -894,16 +895,46 @@ impl CachingProxy {
 
     /// Hold a write's response until every alive peer has applied it, then hand back the
     /// session token for the response header (see [`record_put`](Self::record_put)).
+    ///
+    /// A stalled wait is a 503: some peer that may still serve what the write
+    /// invalidated neither applied it nor provably lapsed, so the write must not be
+    /// acknowledged. The origin may hold it, and it is already on the write feed, so
+    /// every peer converges on it; the client's retry (or its next read) settles which.
     pub(super) async fn await_cluster(
         &self,
         receipt: Option<WriteReceipt>,
         bucket: &str,
         key: &str,
-    ) -> Option<String> {
-        let (sync, receipt) = (self.sync.as_ref()?, receipt?);
-        sync.ack_write(receipt.token, WRITE_ACK_TIMEOUT, bucket, key, &self.metrics)
-            .await;
-        Some(receipt.header)
+    ) -> S3Result<Option<String>> {
+        let (Some(sync), Some(receipt)) = (self.sync.as_ref(), receipt) else {
+            return Ok(None);
+        };
+        if sync
+            .ack_write(receipt.token, WRITE_ACK_TIMEOUT, bucket, key, &self.metrics)
+            .await
+        {
+            Ok(Some(receipt.header))
+        } else {
+            Err(s3s::s3_error!(
+                ServiceUnavailable,
+                "the write reached the origin, but a cache peer neither applied it nor \
+                 provably stopped serving in time; its outcome is unknown, retry it"
+            ))
+        }
+    }
+
+    /// [`await_cluster`](Self::await_cluster) on a path already answering an error: the
+    /// wait still runs, so the cluster is fenced before the error is answered, but a
+    /// stall adds nothing the error does not already say.
+    pub(super) async fn settle_cluster(
+        &self,
+        receipt: Option<WriteReceipt>,
+        bucket: &str,
+        key: &str,
+    ) {
+        if let Err(stalled) = self.await_cluster(receipt, bucket, key).await {
+            tracing::debug!("{bucket}/{key}: stalled while answering an error: {stalled}");
+        }
     }
 
     /// Warm each bucket's LIST index in the background so startup stays instant and

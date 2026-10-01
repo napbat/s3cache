@@ -64,12 +64,10 @@ impl WriteSync {
     /// after the stop the up-to-`D` wait it would otherwise spend proving what this
     /// node already knows.
     ///
-    /// It does **not** shorten the reader-side freeze, and must not be sold as if it
-    /// did: this node's `~caps` advertisement lives in every peer's roster until
-    /// membership reaps it, so every other reader's confirmation stays frozen for the
-    /// reap horizon exactly as it would after a crash. That half is `watch_lapses`'
-    /// business — it ends the freeze with a remediation, not with a shorter wait — and
-    /// the two are complements: `leave` is the write side, the watcher is the read side.
+    /// It also ends the reader-side freeze: a reader stops counting a granter as soon
+    /// as it sees that granter's departure, so every other reader re-synchronizes once
+    /// and serves locally again instead of waiting for this node to return. A crash
+    /// has no such way out — the survivors serve from the origin until it comes back.
     ///
     /// A no-op in every mode but `strong`, and never an error: a rejected retraction
     /// (a full actor inbox on the way out) just means the entry expires by TTL instead,

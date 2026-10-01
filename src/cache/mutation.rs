@@ -150,7 +150,7 @@ impl CachingProxy {
             }
             let token = worker
                 .record_put(IndexedWrite::Put, &bucket, &key, entry)
-                .await;
+                .await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)
         })
@@ -185,14 +185,14 @@ impl CachingProxy {
             // object may be untouched, or may now be a different version entirely. What
             // the key resolves to is the origin's to report, so every node answers it
             // from the origin until an origin HEAD says.
-            let token = if versioned {
+            let receipt = if versioned {
                 worker
-                    .publish_unknown(&bucket, &key, "a version-scoped delete")
+                    .announce_unknown(&bucket, &key, "a version-scoped delete")
                     .await
             } else {
-                let receipt = worker.record_del(&bucket, &key).await;
-                worker.await_cluster(receipt, &bucket, &key).await
+                worker.record_del(&bucket, &key).await
             };
+            let token = worker.await_cluster(receipt, &bucket, &key).await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)
         })
@@ -229,7 +229,7 @@ impl CachingProxy {
                                 .or(receipt);
                         }
                         worker
-                            .await_cluster(receipt, &bucket, "<batch delete>")
+                            .settle_cluster(receipt, &bucket, "<batch delete>")
                             .await;
                     }
                     return Err(error);
@@ -284,7 +284,7 @@ impl CachingProxy {
             }
             let token = worker
                 .await_cluster(receipt, &bucket, "<batch delete>")
-                .await;
+                .await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)
         })
@@ -328,7 +328,7 @@ impl CachingProxy {
             entry.etag = completed.or(entry.etag);
             let token = worker
                 .record_put(IndexedWrite::MultipartComplete, &bucket, &key, entry)
-                .await;
+                .await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)
         })
@@ -420,7 +420,7 @@ impl CachingProxy {
             entry.etag = copied_etag.or(entry.etag);
             let token = worker
                 .record_put(IndexedWrite::Copy, &bucket, &key, entry)
-                .await;
+                .await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)
         })

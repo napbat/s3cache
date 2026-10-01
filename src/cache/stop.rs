@@ -85,7 +85,7 @@ impl CachingProxy {
                         .await
                         .or(receipt);
                 }
-                self.await_cluster(receipt, bucket, "<terminated mutation>")
+                self.settle_cluster(receipt, bucket, "<terminated mutation>")
                     .await;
                 Err(s3s::s3_error!(
                     InternalError,

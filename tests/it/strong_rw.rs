@@ -850,6 +850,7 @@ fn counters(metrics: &Metrics) -> String {
         "recovery_origin_scans",
         "recovery_fallbacks",
         "read_licence_bypasses",
+        "read_absent_granter_bypasses",
         "read_freshness_bypasses",
         "body_revalidations",
         "body_revalidation_evictions",

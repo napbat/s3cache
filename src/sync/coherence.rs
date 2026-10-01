@@ -187,10 +187,10 @@ impl Consistency {
     ///
     /// [`CAP_LEASE`] is advertised **only** by a mode that constructs a
     /// [`Leases`], and the two are wired together in [`WriteSync::attach`] for
-    /// that reason. Readers wait for a confirmation from every not-reaped
-    /// advertiser, so advertising without a running granter freezes every
-    /// other reader's confirmation cluster-wide until membership reaps this
-    /// node — the lease shell's own named failure, and the more expensive half
+    /// that reason. Readers wait for a confirmation from every advertiser that has
+    /// not departed, so advertising without a running granter freezes every
+    /// other reader's confirmation cluster-wide until this node grants or
+    /// departs — the lease shell's own named failure, and the more expensive half
     /// of the same footgun the ack tier documents.
     pub(super) fn capabilities(self) -> &'static [&'static str] {
         match self {
@@ -337,8 +337,8 @@ pub struct WriteSync {
     /// This node's participation in the coherence-lease tier — `Some` only in
     /// [`Consistency::Strong`]. Held here because **dropping it stops the
     /// protocol**: no renewals (this node's own window closes within `D`), no
-    /// grants (every peer's confirmation freezes until membership reaps this
-    /// node), no ingest.
+    /// grants (every peer's confirmation freezes until this node grants again or
+    /// departs), no ingest.
     pub(super) leases: Option<Leases>,
     /// The read handle of the lease above: the whole read-side licence in
     /// `strong` mode, and a lock-free borrow plus one compare per request.
@@ -362,6 +362,9 @@ pub struct WriteSync {
     pub(super) advertisement: Arc<Advertisement>,
     /// Seeds not in the roster yet (see [`WriteSync::expect_seeds`]).
     pub(super) unmet_seeds: Arc<UnmetSeeds>,
+    /// The counted granters membership last did not report alive, as last logged
+    /// (see [`absent_granters`](Self::absent_granters)).
+    absent_granters: std::sync::Mutex<Vec<NodeId>>,
 }
 
 impl WriteSync {
@@ -376,7 +379,7 @@ impl WriteSync {
     /// The lease set is constructed **before** the advertisement, and the order is the
     /// contract rather than a style: [`CAP_LEASE`] says "I grant your leases and I block
     /// my writes on yours", and a node that advertises it without a running granter
-    /// freezes every other reader's confirmation until membership reaps it.
+    /// freezes every other reader's confirmation until it grants or departs.
     ///
     /// # Panics
     /// If called outside a Tokio runtime in a mode that runs a lease set — the tier
@@ -414,6 +417,7 @@ impl WriteSync {
             write_wait: lease.duration + WRITE_WAIT_SLACK,
             advertisement,
             unmet_seeds: Arc::default(),
+            absent_granters: std::sync::Mutex::default(),
             _node: node,
         }
     }
@@ -456,6 +460,49 @@ impl WriteSync {
             Consistency::StrongAcks => self.cluster_healthy(),
             Consistency::Bounded => true,
         }
+    }
+
+    /// The granters this node's serve-lease still counts that membership does not
+    /// report alive — crashed (or partitioned) without departing, so this node cannot
+    /// be confirmed until they return, and serves from the origin meanwhile. Empty in
+    /// any mode holding no lease.
+    ///
+    /// Logs whenever the set changes, naming the missing granters, so an operator can
+    /// tell why a survivor is not serving locally. A granter that left on purpose
+    /// departs and is dropped from the roster as soon as its departure is seen; only one
+    /// that vanished stays here, until it returns.
+    pub(crate) fn absent_granters(&self) -> Vec<NodeId> {
+        let Some(leases) = &self.leases else {
+            return Vec::new();
+        };
+        let statuses = self.group.statuses();
+        let mut absent: Vec<NodeId> = leases
+            .roster()
+            .into_iter()
+            .filter(|granter| {
+                !statuses
+                    .iter()
+                    .any(|(id, status)| id == granter && *status == Status::Alive)
+            })
+            .collect();
+        absent.sort();
+        let mut logged = self
+            .absent_granters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *logged != absent {
+            if absent.is_empty() {
+                info!("every counted lease granter is alive again");
+            } else {
+                warn!(
+                    "serving reads from the origin: lease granters {} are counted but not \
+                     alive (crashed without departing); local reads resume once they return",
+                    node_names(&absent)
+                );
+            }
+            logged.clone_from(&absent);
+        }
+        absent
     }
 
     pub(super) fn install_recovery(&self, recovery: RecoveryHandle<CacheRecoveryAdapter>) {
@@ -509,13 +556,13 @@ impl WriteSync {
     ///
     /// A mid-life freeze does not read as `None`: a granter that goes silent stops
     /// *advancing* the min, it does not remove itself from it, so this keeps
-    /// answering `Some` with the stale value it was frozen at until membership reaps
-    /// the granter. Movement, not `Some`-ness, is the signal.
+    /// answering `Some` with the stale value it was frozen at until the granter grants
+    /// again or departs. Movement, not `Some`-ness, is the signal.
     ///
     /// And movement is a weaker signal than it looks, which is why the staged lapse
     /// recovery does not rest on it alone: a min advances when the member *pinning*
-    /// it leaves, so reaping a dead granter moves this while another granter's grant
-    /// is still frozen. [`lease_granted_by`](Self::lease_granted_by) is the per-granter
+    /// it leaves, so a departure moves this while another granter's grant is still
+    /// frozen. [`lease_granted_by`](Self::lease_granted_by) is the per-granter
     /// reading that answers the question this one only approximates.
     pub(crate) fn lease_confirmed(&self) -> Option<RenewalId> {
         self.leases.as_ref().and_then(Leases::confirmed)
@@ -743,8 +790,11 @@ impl WriteSync {
     }
 
     /// [`wait_cluster_applied`](Self::wait_cluster_applied) with the bookkeeping every
-    /// write path wants. Never an error: an unresponsive peer is either dying (SWIM will
-    /// exclude it), lapsed (out of service by its own clock), or partitioned.
+    /// write path wants. Returns whether the wait carries the coherence guarantee
+    /// ([`WriteWait::Applied`] or [`WriteWait::Lapsed`]). `false` is a stall: some peer
+    /// that may still be serving what this write invalidated neither applied it nor
+    /// provably lapsed, so the caller must not report the write as a success.
+    #[must_use = "a stalled write carries no guarantee and must not be acknowledged"]
     pub(crate) async fn ack_write(
         &self,
         token: WriteToken,
@@ -752,9 +802,10 @@ impl WriteSync {
         bucket: &str,
         key: &str,
         metrics: &Metrics,
-    ) {
+    ) -> bool {
         let outcome: WriteWait = self.wait_cluster_applied(token, timeout).await;
         let retires_feed = outcome.retires_feed(self.consistency);
+        let guaranteed = matches!(outcome, WriteWait::Applied | WriteWait::Lapsed(_));
         match outcome {
             WriteWait::Applied => {}
             WriteWait::Lapsed(stragglers) => {
@@ -772,7 +823,10 @@ impl WriteSync {
             }
             WriteWait::Stalled { waiting_on, lapsed } => {
                 let who = node_names(&waiting_on);
-                warn!("write ack timed out for {bucket}/{key} ({who}); a peer may lag");
+                warn!(
+                    "write ack timed out for {bucket}/{key} ({who}); \
+                     answering 503, the write may be applied at the origin"
+                );
                 metrics.ack_timeout();
                 if !lapsed.is_empty() {
                     // The lease tier *did* resolve this write, on a lapse, and the
@@ -796,6 +850,7 @@ impl WriteSync {
         if retires_feed {
             self.feed.retire_through(token).await;
         }
+        guaranteed
     }
 
     /// Whether this node's membership view is fully alive — the `strong-acks` and
