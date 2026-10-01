@@ -5,6 +5,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 description = "Transparent S3 caching proxy — serves LIST and HEAD from an in-memory key index and GET from a tiered hot (heap) / warm (disk) / cold (origin) object cache, write-through (fill-on-write) to an upstream S3. Cuts S3 request costs for chatty clients."
 license = "MIT"
 
@@ -21,7 +22,7 @@ blake3 = "1.8.5"
 bytes = { version = "1", features = ["serde"] }
 futures = "0.3"
 getrandom = "0.4"
-groupnet = { git = "https://github.com/napbat/groupnet", rev = "a59208984af183267e6b9e3666f612846c38f98e", features = ["consistency-leases", "consistency-volatile-recovery", "consistency-volatile-bootstrap-bulk", "tcp", "udp"] }
+groupnet = { git = "https://github.com/napbat/groupnet", rev = "499a8594ab10e160f6dd94bb3948d438564c647d", features = ["consistency-leases", "consistency-volatile-recovery", "consistency-volatile-bootstrap-bulk", "tcp", "udp"] }
 http = "1"
 http-body-util = "0.1"
 # Already under hyper-util/s3s; direct so the metrics endpoint can build its own responses.
@@ -57,6 +58,7 @@ pedantic = { level = "deny", priority = -1 }
 name = "s3cache"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 license.workspace = true
 

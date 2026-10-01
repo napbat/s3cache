@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Rust 1.85+ for edition 2024 (rust:1 tracks the latest stable 1.x).
+# Rust 1.98+ (rust-version) (rust:1 tracks the latest stable 1.x).
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
