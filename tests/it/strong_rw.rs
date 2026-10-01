@@ -1289,6 +1289,13 @@ fn cut() -> Link {
     }
 }
 
+/// How long a cut must last for each side to reap the other and then keep serving
+/// past a stalled write's whole wait: the binary tunes `dead_timeout_ms` to the lease
+/// `D` and reaps a member `2 × dead_timeout_ms` past its `Dead` verdict, which follows
+/// the silence by a detection window plus the suspect timeout (well inside one more
+/// `D`), and a write waits at most `D` plus a second of slack.
+const PAST_THE_REAP_HORIZON: Duration = Duration::from_millis(5 * DEFAULT_LEASE_MS);
+
 /// Steady state, with origin answers arriving out of order.
 #[tokio::test(flavor = "multi_thread")]
 async fn steady_state_with_origin_jitter() {
@@ -1375,6 +1382,28 @@ async fn asymmetric_partitions() {
             cluster.net.set(b, a, cut());
             cluster.note("cut b->a");
             tokio::time::sleep(LEASE + Duration::from_millis(1500)).await;
+            cluster.net.heal();
+            cluster.note("heal");
+        },
+    )
+    .await;
+}
+
+/// One direction cut for longer than the reap horizon: the reader that hears nothing
+/// from the writer stops counting it as a granter while the writer still counts the
+/// reader — the asymmetric partition behind a stalled acknowledgement.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_asymmetric_partition_past_the_reap_horizon() {
+    scenario(
+        "rw-asym-reap",
+        ["rw-asym-reap-a", "rw-asym-reap-b"],
+        21,
+        |cluster, _| async move {
+            let [a, b] = cluster.names;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cluster.net.set(a, b, cut());
+            cluster.note("cut a->b past the reap horizon");
+            tokio::time::sleep(PAST_THE_REAP_HORIZON).await;
             cluster.net.heal();
             cluster.note("heal");
         },
