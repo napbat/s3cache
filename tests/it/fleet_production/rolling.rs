@@ -78,10 +78,10 @@ struct Replacement {
 }
 
 /// Bring up the replacement of the stopped pod `index` the way a `StatefulSet`
-/// does. The survivor reaps the old member; its seed resolver relearns the
-/// name for the replacement's new address before the replacement gossips (on
-/// 2026-10-01 at 4.9 s after the `SIGTERM`, once the old member was reaped);
-/// and the new life starts [`POD_START`] after the stop.
+/// does. The survivor reaps the old member and keeps contacting it as a seed
+/// (Groupnet's seed resolver relearned its new address on 2026-10-01 at 4.9 s
+/// after the `SIGTERM`, once the old member was reaped); the new life starts
+/// [`POD_START`] after the stop.
 async fn replace(fleet: &Fleet, index: usize, survivor: &Node, stopped: Instant) -> Node {
     let name = NodeId::new(fleet.names[index]);
     let group = survivor.sync.group();
@@ -89,7 +89,6 @@ async fn replace(fleet: &Fleet, index: usize, survivor: &Node, stopped: Instant)
         group.status_held_for(&name).is_none()
     })
     .await;
-    group.add_peer(name);
     tokio::time::sleep(POD_START.saturating_sub(stopped.elapsed())).await;
     let node = fleet.node(index).await;
     milestone("gossip bound", fleet.names[index]);

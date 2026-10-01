@@ -1,18 +1,22 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use groupnet::consistency::LeaseConfig;
 use groupnet::core::{Config, NodeId};
-use groupnet::runtime::{Group, Node};
+use groupnet::runtime::{Group, NamedSeeds, Node, SeedEvent, SystemResolver};
 use groupnet::transport::Transport;
 use groupnet::transport::udp::UdpTransport;
 use tracing::{info, warn};
 
 use crate::sync::coherence::{Consistency, DEAD_TIMEOUT_FLOOR_MS, DEFAULT_LEASE_MS, WriteSync};
+use crate::sync::readiness::UnmetSeeds;
 
-/// Attempts (one per second) to resolve a gossip seed's DNS name within one
-/// refresh cycle — a `StatefulSet` peer's record can lag its own startup.
+/// Attempts to resolve a gossip seed's DNS name before it is reported
+/// unresolvable — a `StatefulSet` peer's record can lag its own startup.
 const SEED_RESOLVE_ATTEMPTS: u32 = 30;
+
+/// The wait between those first attempts.
+const SEED_RETRY: Duration = Duration::from_secs(1);
 
 /// How often each seed is re-resolved, forever. Pod IPs churn on restarts
 /// and the seed's DNS record follows; re-resolution is the recovery channel
@@ -20,23 +24,33 @@ const SEED_RESOLVE_ATTEMPTS: u32 = 30;
 /// peer is deaf to us until OUR datagrams come from an address it knows).
 const SEED_REFRESH: Duration = Duration::from_secs(15);
 
-/// Resolves `host:port` (a DNS name or a literal address) to a socket
-/// address, retrying briefly; `None` when it never resolves.
-async fn resolve_seed(addr: &str) -> Option<std::net::SocketAddr> {
-    for attempt in 0..SEED_RESOLVE_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        match tokio::net::lookup_host(addr).await {
-            Ok(mut addrs) => {
-                if let Some(sock) = addrs.next() {
-                    return Some(sock);
-                }
+/// The seed resolution [`WriteSync::new`] runs: the system resolver, on
+/// s3cache's startup window and refresh cadence.
+fn seed_resolution() -> NamedSeeds {
+    NamedSeeds::new(SystemResolver)
+        .retry_interval(SEED_RETRY)
+        .startup_attempts(SEED_RESOLVE_ATTEMPTS)
+        .refresh_interval(SEED_REFRESH)
+}
+
+/// Logs what the seed resolver did and releases readiness for a seed that
+/// outlived its startup window: no pod holds that name, let alone an index.
+fn observe_seed(event: &SeedEvent, unmet: &OnceLock<Arc<UnmetSeeds>>) {
+    match event {
+        SeedEvent::Resolved {
+            node,
+            addr,
+            previous: Some(_),
+            ..
+        } => info!("gossip seed `{node}` moved to {addr}; re-registering"),
+        SeedEvent::Resolved { previous: None, .. } => {}
+        SeedEvent::Unresolved { node, name, error } => {
+            warn!("gossip seed `{node}={name}` not resolving yet ({error}); will keep trying");
+            if let Some(unmet) = unmet.get() {
+                unmet.give_up(node);
             }
-            Err(error) => tracing::debug!("resolving gossip seed `{addr}`: {error}"),
         }
     }
-    None
 }
 
 /// Everything the gossip layer needs, independent of where it came from.
@@ -95,6 +109,12 @@ impl WriteSync {
     /// work around; the origin is the authority this index caches, and the gap path is
     /// s3cache's standing remedy for "this node provably missed writes".
     pub async fn new(cfg: SyncConfig) -> Option<Self> {
+        Self::bind(cfg, seed_resolution()).await
+    }
+
+    /// [`new`](Self::new) with seeds resolved by `resolution` (resolver and
+    /// timing); the seeds themselves and the observer come from here.
+    pub(crate) async fn bind(cfg: SyncConfig, resolution: NamedSeeds) -> Option<Self> {
         let me = NodeId::new(cfg.node_id.as_str());
         let transport = match UdpTransport::bind(me.clone(), cfg.bind.as_str()).await {
             Ok(transport) => transport,
@@ -108,8 +128,26 @@ impl WriteSync {
         let advertise = cfg
             .advertise
             .or_else(|| transport.local_addr().ok().map(|addr| addr.to_string()));
-        let mut builder =
-            Node::builder(me.clone(), transport.clone()).config(gossip_config(cfg.lease_ms));
+        let seeds: Vec<NodeId> = cfg
+            .seeds
+            .iter()
+            .filter(|(id, _)| *id != cfg.node_id) // a pod seeding itself (uniform config) is a no-op
+            .map(|(id, _)| NodeId::new(id.as_str()))
+            .collect();
+        // Seeds resolve off the startup path (DNS for a just-starting peer may
+        // lag, and a slow resolver must not delay serving), inside groupnet:
+        // each joins the seed set now and reaches the transport once resolved.
+        // The readiness set is filled below, before this function yields, and
+        // the first `Unresolved` comes a whole startup window later.
+        let unmet = Arc::new(OnceLock::new());
+        let observed = Arc::clone(&unmet);
+        let mut resolution = resolution.on_event(move |event| observe_seed(event, &observed));
+        for (id, addr) in &cfg.seeds {
+            resolution = resolution.seed(NodeId::new(id.as_str()), addr.as_str());
+        }
+        let mut builder = Node::builder(me.clone(), transport)
+            .config(gossip_config(cfg.lease_ms))
+            .named_seeds(resolution);
         if let Some(advertise) = advertise {
             builder = builder.advertise_addr(advertise);
         }
@@ -120,47 +158,8 @@ impl WriteSync {
         info!(
             "gossip coherence bound on `{bind}` as `{node_id}` (consistency: {mode}, lease: {lease_ms}ms)"
         );
-        let sync = WriteSync::attach(
-            group.clone(),
-            me,
-            cfg.consistency,
-            lease,
-            Some(Box::new(node)),
-        );
-        let seeds: Vec<(String, String)> = cfg
-            .seeds
-            .into_iter()
-            .filter(|(id, _)| *id != cfg.node_id) // a pod seeding itself (uniform config) is a no-op
-            .collect();
-        let unmet = sync.expect_seeds(seeds.iter().map(|(id, _)| NodeId::new(id.as_str())));
-        // Seeds resolve off the startup path (DNS for a just-starting peer may
-        // lag, and a slow resolver must not delay serving): each one registers
-        // with the transport and joins via `add_peer` once its address is known.
-        for (id, addr) in seeds {
-            let (transport, group, unmet) = (transport.clone(), group.clone(), Arc::clone(&unmet));
-            tokio::spawn(async move {
-                let seed = NodeId::new(id.as_str());
-                let mut registered: Option<std::net::SocketAddr> = None;
-                loop {
-                    match resolve_seed(&addr).await {
-                        Some(sock) if registered != Some(sock) => {
-                            if registered.is_some() {
-                                info!("gossip seed `{id}` moved to {sock}; re-registering");
-                            }
-                            transport.register_peer(seed.clone(), sock);
-                            group.add_peer(seed.clone());
-                            registered = Some(sock);
-                        }
-                        None if registered.is_none() => {
-                            warn!("gossip seed `{id}={addr}` not resolving yet; will keep trying");
-                            unmet.give_up(&seed);
-                        }
-                        Some(_) | None => {}
-                    }
-                    tokio::time::sleep(SEED_REFRESH).await;
-                }
-            });
-        }
+        let sync = WriteSync::attach(group, me, cfg.consistency, lease, Some(Box::new(node)));
+        let _ = unmet.set(sync.expect_seeds(seeds));
         Some(sync)
     }
 
@@ -202,9 +201,8 @@ impl WriteSync {
         sync
     }
 
-    /// The gossip group this node's feed, leases and membership ride on: a
-    /// read of its roster, or a peer learned out of band the way the seed
-    /// resolver relearns a seed whose address moved.
+    /// The gossip group this node's feed, leases and membership ride on, for
+    /// a read of its roster.
     #[must_use]
     pub fn group(&self) -> &Group {
         &self.group

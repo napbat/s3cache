@@ -5,7 +5,7 @@ use groupnet::consistency::volatile_recovery::{RecoveryStage, RecoveryStatus};
 use groupnet::consistency::{CAP_ACKS, CAP_LEASE, LeaseConfig};
 use groupnet::core::volatile_recovery::RecoveryState;
 use groupnet::core::{Config, NodeId, Status};
-use groupnet::runtime::{Group, Node};
+use groupnet::runtime::{Group, NamedSeeds, Node, ResolveFuture, SeedResolver, SystemResolver};
 use groupnet::transport::mem::{MemTransport, Network};
 use s3s::dto::GetObjectOutput;
 
@@ -15,7 +15,7 @@ use crate::sync::coherence::{
     CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, KeyReconcile, WriteReceipt, WriteSync, WriteWait,
     recovery_generation_permits, waits_on, waits_on_unleased,
 };
-use crate::sync::config::{parse_lease_ms, parse_seeds};
+use crate::sync::config::{SyncConfig, parse_lease_ms, parse_seeds};
 use crate::sync::wire::{
     IndexEvent, IndexOp, WIRE_MAGIC, decode_event, encode_event, from_micros, to_micros, wire_stamp,
 };
@@ -233,6 +233,137 @@ fn env_spellings_parse_into_a_config() {
         "zero is the engine's `never expires` — the stale claim the tier prevents"
     );
     assert_eq!(parse_lease_ms(Some("soon")), DEFAULT_LEASE_MS);
+}
+
+/// The seed cadence the resolution tests run on: fast enough to watch several
+/// rounds, slow enough not to spin.
+const TEST_SEED_CADENCE: Duration = Duration::from_millis(20);
+
+/// Failed lookups before the test's unresolvable seed is reported.
+const TEST_STARTUP_ATTEMPTS: u32 = 3;
+
+/// How long a loopback gossip pair may take to (re)meet.
+const TEST_REJOIN: Duration = Duration::from_secs(20);
+
+/// A seed name whose address the test moves at will; `None` does not resolve.
+#[derive(Clone, Default)]
+struct MovableSeed(Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>);
+
+impl MovableSeed {
+    fn point_at(&self, addr: Option<std::net::SocketAddr>) {
+        *self.0.lock().expect("seed address") = addr;
+    }
+}
+
+impl SeedResolver for MovableSeed {
+    fn resolve<'a>(&'a self, name: &'a str) -> ResolveFuture<'a> {
+        let addr = *self.0.lock().expect("seed address");
+        Box::pin(async move {
+            addr.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, name.to_owned()))
+        })
+    }
+}
+
+fn loopback() -> std::net::SocketAddr {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .expect("a free loopback UDP port")
+}
+
+fn seed_config(id: &str, bind: std::net::SocketAddr, seeds: &[(&str, &str)]) -> SyncConfig {
+    SyncConfig {
+        bind: bind.to_string(),
+        advertise: None,
+        seeds: seeds
+            .iter()
+            .map(|(id, addr)| ((*id).to_owned(), (*addr).to_owned()))
+            .collect(),
+        node_id: id.to_owned(),
+        consistency: Consistency::Strong,
+        lease_ms: DEFAULT_LEASE_MS,
+    }
+}
+
+fn sees_alive(sync: &WriteSync, peer: &str) -> bool {
+    sync.group().member_status(&NodeId::new(peer)) == Some(Status::Alive)
+}
+
+async fn within(limit: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        tokio::time::sleep(TEST_SEED_CADENCE).await;
+    }
+}
+
+/// A seed whose name never resolves stops holding readiness once its startup
+/// window is spent, instead of keeping the pod out of the Service forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unresolvable_seed_releases_readiness_after_its_window() {
+    let resolution = NamedSeeds::new(MovableSeed::default())
+        .retry_interval(TEST_SEED_CADENCE)
+        .startup_attempts(TEST_STARTUP_ATTEMPTS)
+        .refresh_interval(TEST_SEED_CADENCE);
+    let sync = WriteSync::bind(
+        seed_config("seed-lone", loopback(), &[("seed-ghost", "ghost:1")]),
+        resolution,
+    )
+    .await
+    .expect("binds loopback");
+    assert!(
+        sync.peer_may_hold_index(),
+        "an unmet seed may hold an index"
+    );
+    within(TEST_REJOIN, "the unresolvable seed is given up", || {
+        !sync.peer_may_hold_index()
+    })
+    .await;
+}
+
+/// A seed that comes back at a new address is relearned by re-resolution, and
+/// this node reaches the new life — which, seeding nobody, would otherwise
+/// never hear from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_moved_seed_is_relearned_and_rejoins() {
+    let (a, b_first, b_moved) = (loopback(), loopback(), loopback());
+    let name_b = MovableSeed::default();
+    name_b.point_at(Some(b_first));
+    let resolution = NamedSeeds::new(name_b.clone())
+        .retry_interval(TEST_SEED_CADENCE)
+        .refresh_interval(TEST_SEED_CADENCE);
+    let node_a = WriteSync::bind(seed_config("seed-a", a, &[("seed-b", "b:1")]), resolution)
+        .await
+        .expect("binds loopback");
+    let peer = |bind| {
+        WriteSync::bind(
+            seed_config("seed-b", bind, &[]),
+            NamedSeeds::new(SystemResolver),
+        )
+    };
+    // The first life runs on a runtime of its own, so stopping it is a crash.
+    let pod = tokio::runtime::Runtime::new().expect("a runtime for the first life");
+    let first = pod
+        .spawn(peer(b_first))
+        .await
+        .expect("the first life starts")
+        .expect("binds loopback");
+    within(TEST_REJOIN, "the pair meets", || {
+        sees_alive(&node_a, "seed-b") && sees_alive(&first, "seed-a")
+    })
+    .await;
+
+    drop(first);
+    pod.shutdown_background();
+    within(TEST_REJOIN, "the old life is gone", || {
+        !sees_alive(&node_a, "seed-b")
+    })
+    .await;
+    name_b.point_at(Some(b_moved));
+    let moved = peer(b_moved).await.expect("binds loopback");
+    within(TEST_REJOIN, "the moved seed rejoins", || {
+        sees_alive(&node_a, "seed-b") && sees_alive(&moved, "seed-a")
+    })
+    .await;
 }
 
 /// Only the leased mode advertises [`CAP_LEASE`], because only it constructs a

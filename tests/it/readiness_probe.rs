@@ -235,8 +235,8 @@ async fn a_replacement_is_not_ready_beside_an_indexed_peer() {
     assert!(survivor.ready(), "an index holder left alone is ready");
 
     let replacement = fleet.node(1).await;
-    // The seed resolver re-registers a seed whose address moved.
-    survivor.sync.group().add_peer(NodeId::new(fleet.names[1]));
+    // No relearning by hand: the survivor keeps contacting its seed, so the
+    // replacement rejoins on its own.
     assert!(!replacement.ready(), "a fresh life beside an index holder");
     until("the replacement reads its peer's index", || {
         assert!(!replacement.ready(), "ready before it has an index");
