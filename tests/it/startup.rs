@@ -68,7 +68,7 @@ async fn timed_out_scan_retries_without_publishing_a_stale_page() {
             .is_some_and(|status| status.state.stage == RecoveryStage::Ready)
     );
     origin.release_paused_list();
-    assert!(list(&proxy, &bucket).await.is_empty());
+    assert_eq!(list(&proxy, &bucket).await, [] as [&str; 0]);
     assert!(origin.stored("doomed").await.is_none());
 }
 

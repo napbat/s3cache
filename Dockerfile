@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
-# Rust 1.98+ (rust-version) (rust:1 tracks the latest stable 1.x).
+# rust-toolchain.toml selects `stable`, and the workspace's rust-version is the
+# latest stable. The `rust:1` image can lag a new stable release by days, so
+# install the toolchain that file selects instead of trusting the image's.
 FROM rust:1-bookworm AS build
 WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY benches ./benches

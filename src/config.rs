@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(parse_list("a,b"), ["a", "b"]);
         assert_eq!(parse_list(" a , b ,"), ["a", "b"]);
         assert!(parse_list("").is_empty(), "an unset list is no entries");
-        assert!(parse_list(",  ,").is_empty());
+        assert_eq!(parse_list(",  ,"), [] as [&str; 0]);
     }
 
     #[test]

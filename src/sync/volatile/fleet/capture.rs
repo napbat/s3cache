@@ -64,7 +64,7 @@ pub(super) fn next_id(
     generation: u64,
 ) -> Result<CaptureId, AdapterError> {
     let serial = NEXT_CAPTURE
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
             old.checked_add(1)
         })
         .map_err(|_| AdapterError)?;

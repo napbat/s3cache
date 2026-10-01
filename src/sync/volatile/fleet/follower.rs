@@ -205,7 +205,7 @@ impl FleetStatePort {
                 let continued_cuts = coverage.proven_cuts.clone();
                 let attachment = attachment.clone();
                 let applier_generation = NEXT_APPLIER
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                         old.checked_add(1)
                     })
                     .map_err(|_| AdapterError)?;

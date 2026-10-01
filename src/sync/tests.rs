@@ -203,7 +203,7 @@ fn env_spellings_parse_into_a_config() {
             ("b".to_owned(), "host-b:2".to_owned())
         ]
     );
-    assert!(parse_seeds("").is_empty());
+    assert_eq!(parse_seeds(""), [] as [(String, String); 0]);
     assert!(parse_seeds("no-equals-sign").is_empty(), "malformed drops");
     assert!(Consistency::parse("") == Consistency::Strong);
     assert!(Consistency::parse(" Bounded ") == Consistency::Bounded);

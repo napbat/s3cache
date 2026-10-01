@@ -584,11 +584,9 @@ async fn ready_follower_keeps_local_reads_during_a_paused_origin_list() {
     assert_eq!(after.get, 0, "warm body did not visit the origin");
     assert_eq!(after.head, 0, "indexed HEAD did not visit the origin");
     drop(release);
-    assert!(
-        paused
-            .await
-            .expect("passthrough request finishes")
-            .is_empty()
+    assert_eq!(
+        paused.await.expect("passthrough request finishes"),
+        [] as [&str; 0]
     );
     after.assert_no_writes();
     assert!(origin.ops.writes().is_empty(), "no origin control writes");

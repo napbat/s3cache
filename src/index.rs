@@ -1717,7 +1717,7 @@ mod tests {
         let idx = index(&["a/1", "a/2", "b/1", "c/1"]);
         // Each common prefix must appear exactly once across paged results.
         let (keys, prefixes) = walk_pages(&idx, 1, "", Some("/"));
-        assert!(keys.is_empty());
+        assert_eq!(keys, [] as [&str; 0]);
         assert_eq!(prefixes, ["a/", "b/", "c/"]);
     }
 
@@ -1764,7 +1764,7 @@ mod tests {
         assert_eq!(page(Some("a")), ["p/1", "p/2"]);
         assert_eq!(page(Some("p/")), ["p/1", "p/2"]);
         assert_eq!(page(Some("p/1")), ["p/2"]);
-        assert!(page(Some("p0")).is_empty());
+        assert_eq!(page(Some("p0")), [] as [&str; 0]);
     }
 
     #[test]

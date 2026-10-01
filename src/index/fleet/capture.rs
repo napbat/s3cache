@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(at_c.buckets["bucket"].keys.len(), 0);
         assert_eq!(
             donor.ingress().with_journal(|journal| {
-                assert!(journal.image_cuts().is_empty());
+                assert_eq!(journal.image_cuts(), [] as [NativeCut; 0]);
                 journal.current_cursor().unwrap().position
             }),
             1
