@@ -1,7 +1,3 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::SystemTime;
-
 use async_trait::async_trait;
 use s3s::dto::{
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CopyObjectInput, CopyObjectOutput,
@@ -9,16 +5,10 @@ use s3s::dto::{
     GetObjectOutput, HeadObjectInput, HeadObjectOutput, ListObjectsV2Input, ListObjectsV2Output,
     PutObjectInput, PutObjectOutput,
 };
-use s3s::{S3Error, S3Request, S3Response, S3Result};
+use s3s::{S3Request, S3Response, S3Result};
 
-use crate::cache::copy;
-use crate::cache::proxy::{
-    CachingProxy, IndexedWrite, ReadRoute, ResponseOverrides, observed_entry, write_storage_class,
-    written_object,
-};
-use crate::index::{ObjEntry, ObjMeta};
+use crate::cache::proxy::{CachingProxy, ReadRoute, ResponseOverrides};
 use crate::list_token::{Continuation, classify, rewrite_for_origin};
-use crate::tier::CachedObject;
 
 /// Moves the `response-*` fields out of an input into a [`ResponseOverrides`]; one macro
 /// so GET and HEAD (which spell them identically) cannot drift apart.
@@ -63,26 +53,6 @@ macro_rules! apply_overrides {
             out.expires.clone_from(&overrides.expires);
         }
     }};
-}
-
-/// Why a failed PUT cannot be assumed not to have reached durable origin state. A 412 is
-/// normally a conclusive client-side race; it becomes contradictory only when this proxy
-/// had just vouched that the exact precondition held in its locally-serveable index.
-fn uncertain_put_error(error: &S3Error, locally_vouched: bool) -> Option<&'static str> {
-    match error.status_code() {
-        Some(http::StatusCode::PRECONDITION_FAILED) if locally_vouched => {
-            Some("origin rejected a locally-vouched precondition")
-        }
-        Some(status) if status.is_server_error() || status == http::StatusCode::REQUEST_TIMEOUT => {
-            Some("origin returned an ambiguous server failure")
-        }
-        None => Some("origin response was unavailable"),
-        _ => None,
-    }
-}
-
-fn copy_conflict_needs_reconcile(error: &S3Error, create_only: bool) -> bool {
-    create_only && error.status_code() == Some(http::StatusCode::PRECONDITION_FAILED)
 }
 
 #[async_trait]
@@ -141,306 +111,43 @@ impl s3s::S3 for CachingProxy {
         self.inner.list_objects_v2(req).await
     }
 
-    // Writes: forward (write-through), then update the index from the result — and, when
-    // the write knows exactly what a read of it will report, keep the body it just wrote
-    // rather than dropping it (see [`buffered_put_body`](CachingProxy::buffered_put_body)).
+    // Writes forward to the upstream and bring every node into line with the result
+    // before answering; see `cache::mutation`.
     async fn put_object(
         &self,
-        mut req: S3Request<PutObjectInput>,
+        req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        // Everything a HEAD of this object will report, straight off the request that
-        // created it — no HEAD needed to learn what we were just told. Except the
-        // Content-Type: with none set the origin invents one, and an entry claiming to
-        // know it would answer HEADs the origin answers differently, so such an entry
-        // stays skeletal until a forwarded HEAD completes it.
-        let faithful = req.input.content_type.is_some();
-        let meta = ObjMeta {
-            cache_control: req.input.cache_control.clone(),
-            content_disposition: req.input.content_disposition.clone(),
-            content_encoding: req.input.content_encoding.clone(),
-            content_language: req.input.content_language.clone(),
-            // `x-amz-meta-*` names are HTTP header names, so the origin reports them
-            // lowercased whatever case they were sent in; capturing them verbatim would
-            // make a HEAD off this entry differ from the origin's in the key casing.
-            metadata: req.input.metadata.as_ref().map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
-                    .collect()
-            }),
-        };
-        let content_type = req.input.content_type.clone();
-        let mut entry = ObjEntry {
-            // A PUT with no Content-Length leaves the size unknown rather than zero: a
-            // fabricated `0` is served as an authoritative Content-Length forever.
-            size: req.input.content_length,
-            last_modified: SystemTime::UNIX_EPOCH, // stamped by `record_put`
-            etag: None,
-            storage_class: write_storage_class(req.input.storage_class.as_ref()),
-            content_type: content_type.clone(),
-            meta: faithful.then(|| Box::new(meta.clone())),
-        };
-        // Read before the write round-trip, not after it: a remediation that distrusts
-        // the cache while this one is in flight must leave the copy it lands suspect —
-        // this node's own bytes are not proof that a peer's concurrent write did not
-        // land behind them at the origin.
-        let generation = self.obj_cache.suspect_gen();
-        // The bytes a client writes are the bytes its next read wants, and they are
-        // already in hand: buffer them (bounded by the same per-object cap the read path
-        // uses) so a freshly written object's first read is not a guaranteed origin GET.
-        let written = if self.sync.as_ref().is_none_or(|sync| sync.may_serve_local()) {
-            self.buffered_put_body(&mut req.input).await
-        } else {
-            None
-        };
-        let ckey = (bucket.clone(), key.clone());
-        let locally_vouched = self.locally_vouches_for_put(&req.input);
-        // Invalidate before the origin call. Besides closing the ordinary in-flight read
-        // window, this is the only ordering that survives a process crash after the
-        // origin applies a write but before it can answer: no warm or hot copy of the old
-        // body is left behind to be trusted after restart.
-        self.obj_cache.invalidate(&ckey).await;
-
-        // The request future belongs to the inbound connection and is cancelled when that
-        // client times out. Once the mutation starts, its origin result and coherence tail
-        // must outlive that future or an applied write can leave the local index behind.
-        let worker = self.clone();
-        let tail_guard = self.tails.track();
-        let reconcile_bucket = bucket.clone();
-        let reconcile_key = key.clone();
-        let tail = tokio::spawn(async move {
-            let _tail_guard = tail_guard;
-            let mut resp = match worker.inner.put_object(req).await {
-                Ok(resp) => resp,
-                Err(error) => {
-                    if let Some(reason) = uncertain_put_error(&error, locally_vouched) {
-                        worker.reconcile_uncertain_put(&bucket, &key, reason);
-                    }
-                    return Err(error);
-                }
-            };
-            // The origin's ETag rides back on the response, so the index learns it here
-            // rather than paying a HEAD for what a later HEAD will want to report.
-            entry.etag = resp.output.e_tag.clone();
-            // An origin GET that started during this PUT may have filled the old
-            // body after the pre-write invalidation. Fence it again at commit.
-            worker.obj_cache.invalidate(&ckey).await;
-            // The body just written takes the dropped copy's place. An ETag-less write
-            // response cannot faithfully describe the object and therefore fills nothing.
-            if let (Some(body), Some(e_tag)) = (written, entry.etag.clone()) {
-                let out = written_object(content_type, e_tag, &meta, body.len());
-                // Stamped as of before the write: a remediation that moved the generation
-                // while it was in flight leaves this copy suspect, as intended.
-                let filled = CachedObject::from_get(&out, body);
-                filled.mark_trusted(generation);
-                worker.obj_cache.insert(ckey, Arc::new(filled)).await;
-                worker.metrics.write_fill();
-            }
-            let token = worker
-                .record_put(IndexedWrite::Put, &bucket, &key, entry)
-                .await;
-            Self::attach_token(&mut resp.headers, token);
-            Ok(resp)
-        });
-        match tail.await {
-            Ok(result) => result,
-            Err(error) => {
-                self.reconcile_uncertain_put(
-                    &reconcile_bucket,
-                    &reconcile_key,
-                    "PUT completion task terminated",
-                );
-                Err(s3s::s3_error!(
-                    InternalError,
-                    "s3cache: PUT completion task failed: {error}"
-                ))
-            }
-        }
+        self.put(req).await
     }
 
     async fn delete_object(
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let versioned = req.input.version_id.is_some();
-        let mut resp = self.inner.delete_object(req).await?;
-        self.obj_cache
-            .invalidate(&(bucket.clone(), key.clone()))
-            .await;
-        // A version-scoped delete removes one version, not the key: the current object
-        // may be untouched, or may now be a different version entirely. Only the local
-        // body copy is provably stale — what the key resolves to stays the origin's to
-        // report, so no tombstone is recorded and the entry is left for a HEAD or the
-        // next sync to correct.
-        let token = if versioned {
-            None
-        } else {
-            let receipt = self.record_del(&bucket, &key).await;
-            self.await_cluster(receipt, &bucket, &key).await
-        };
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
+        self.delete(req).await
     }
 
     async fn delete_objects(
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let bucket = req.input.bucket.clone();
-        let quiet = req.input.delete.quiet.unwrap_or(false);
-        let requested: Vec<(String, bool)> = req
-            .input
-            .delete
-            .objects
-            .iter()
-            .map(|o| (o.key.clone(), o.version_id.is_some()))
-            .collect();
-        let mut resp = self.inner.delete_objects(req).await?;
-        // `DeleteObjects` is partial-failure by contract: the call succeeds while
-        // individual keys are refused (a legal hold, a retention lock, a permission).
-        // Unindexing every *requested* key makes a key the origin still holds vanish
-        // cluster-wide — LIST loses it and HEAD 404s — until the next resync, so the
-        // applied set is read off the response. In quiet mode the origin omits the
-        // Deleted half, and what was asked for minus what was refused is the same set.
-        let refused: BTreeSet<&str> = resp
-            .output
-            .errors
-            .iter()
-            .flatten()
-            .filter_map(|e| e.key.as_deref())
-            .collect();
-        let deleted: BTreeSet<&str> = resp
-            .output
-            .deleted
-            .iter()
-            .flatten()
-            .filter_map(|d| d.key.as_deref())
-            .collect();
-        let mut receipt = None;
-        for (key, versioned) in &requested {
-            let applied = if quiet {
-                !refused.contains(key.as_str())
-            } else {
-                deleted.contains(key.as_str())
-            };
-            if !applied {
-                continue;
-            }
-            self.obj_cache
-                .invalidate(&(bucket.clone(), key.clone()))
-                .await;
-            if *versioned {
-                continue; // one version, not the key — see `delete_object`
-            }
-            // Keep the newest receipt: its token covers the whole batch (one writer,
-            // ordered feed), so the cluster round is paid once rather than per key —
-            // a 1000-key batch of 2s waits is half an hour of held response.
-            receipt = self.record_del(&bucket, key).await.or(receipt);
-        }
-        let token = self.await_cluster(receipt, &bucket, "<batch delete>").await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
+        self.delete_batch(req).await
     }
 
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let mut resp = self.inner.complete_multipart_upload(req).await?;
-        self.obj_cache
-            .invalidate(&(bucket.clone(), key.clone()))
-            .await;
-        // Multipart is how the big objects arrive, and indexing them at a placeholder
-        // size poisoned the range-promotion decision (a "0-byte" entry promoted a
-        // multi-GB fetch). One HEAD learns the real size — and, since it is being paid
-        // for anyway, everything else a HEAD of the assembled object reports.
-        let observed = self.upstream_meta(&bucket, &key).await;
-        let mut entry = observed_entry(observed.as_ref());
-        entry.etag = resp.output.e_tag.clone().or(entry.etag);
-        let token = self
-            .record_put(IndexedWrite::MultipartComplete, &bucket, &key, entry)
-            .await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
+        self.complete_upload(req).await
     }
 
     async fn copy_object(
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        let bucket = req.input.bucket.clone();
-        let key = req.input.key.clone();
-        let source = req.input.copy_source.clone();
-        let storage_class = write_storage_class(req.input.storage_class.as_ref());
-        let create_only = copy::destination_must_be_absent(&req);
-        // Invalidate before forwarding, for the same crash boundary as PUT: a
-        // successful overwrite must never leave an old body trusted locally.
-        self.obj_cache
-            .invalidate(&(bucket.clone(), key.clone()))
-            .await;
-        let mut resp = match copy::forward(&self.copy_inner, req).await {
-            Ok(resp) => resp,
-            Err(error) => {
-                if copy_conflict_needs_reconcile(&error, create_only) {
-                    // The origin's 412 proves an immutable create-only
-                    // destination already exists. That can race ahead of this
-                    // proxy's LIST index (for example after an interrupted
-                    // response), where an immediate HEAD would otherwise be a
-                    // false local 404. One authoritative HEAD folds the proven
-                    // object into this node before the 412 reaches the caller;
-                    // the caller can then confirm it without replaying COPYs.
-                    if let Some(observed) = self.upstream_meta(&bucket, &key).await {
-                        self.observe(&bucket, &key, &observed);
-                        self.metrics.copy_conflict_reconciled();
-                    } else {
-                        self.metrics.copy_conflict_reconcile_miss();
-                    }
-                }
-                return Err(error);
-            }
-        };
-        // A GET could have cached the old destination after the pre-copy
-        // invalidation. Fence that fill after the origin commits the copy.
-        self.obj_cache
-            .invalidate(&(bucket.clone(), key.clone()))
-            .await;
-        let copied_etag = resp
-            .output
-            .copy_object_result
-            .as_ref()
-            .and_then(|result| result.e_tag.clone());
-        let mut entry = if let Some(size) = copied_etag
-            .as_ref()
-            .and_then(|etag| copy::indexed_source_size(self, &source, etag))
-        {
-            // The matching ETag proves the copied bytes have the indexed source's
-            // length. Keep the row skeletal because metadata can change without the
-            // ETag changing; a later HEAD/GET completes it if anyone needs those fields.
-            self.metrics.copy_head_avoided();
-            ObjEntry {
-                size: Some(size),
-                last_modified: SystemTime::UNIX_EPOCH,
-                etag: copied_etag.clone(),
-                storage_class,
-                content_type: None,
-                meta: None,
-            }
-        } else {
-            self.metrics.copy_head_fallback();
-            let observed = self.upstream_meta(&bucket, &key).await;
-            observed_entry(observed.as_ref())
-        };
-        entry.etag = copied_etag.or(entry.etag);
-        let token = self
-            .record_put(IndexedWrite::Copy, &bucket, &key, entry)
-            .await;
-        Self::attach_token(&mut resp.headers, token);
-        Ok(resp)
+        // Boxed: the copy's request and its tail state are large enough on the stack to
+        // trip clippy's `large_futures`.
+        Box::pin(self.copy(req)).await
     }
 
     // GET: cacheable (no part/conditional) small objects are served from the tiered
@@ -1043,37 +750,5 @@ impl s3s::S3 for CachingProxy {
         req: S3Request<s3s::dto::WriteGetObjectResponseInput>,
     ) -> S3Result<S3Response<s3s::dto::WriteGetObjectResponseOutput>> {
         self.inner.write_get_object_response(req).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{copy_conflict_needs_reconcile, uncertain_put_error};
-    use s3s::{S3Error, S3ErrorCode};
-
-    #[test]
-    fn only_a_locally_vouched_412_is_an_uncertain_mutation() {
-        let rejected = S3Error::new(S3ErrorCode::PreconditionFailed);
-        assert_eq!(uncertain_put_error(&rejected, false), None);
-        assert_eq!(
-            uncertain_put_error(&rejected, true),
-            Some("origin rejected a locally-vouched precondition")
-        );
-
-        let failed = S3Error::new(S3ErrorCode::InternalError);
-        assert_eq!(
-            uncertain_put_error(&failed, false),
-            Some("origin returned an ambiguous server failure")
-        );
-    }
-
-    #[test]
-    fn only_a_create_only_412_requests_copy_conflict_reconciliation() {
-        let conflict = S3Error::new(S3ErrorCode::PreconditionFailed);
-        assert!(copy_conflict_needs_reconcile(&conflict, true));
-        assert!(!copy_conflict_needs_reconcile(&conflict, false));
-
-        let failed = S3Error::new(S3ErrorCode::InternalError);
-        assert!(!copy_conflict_needs_reconcile(&failed, true));
     }
 }

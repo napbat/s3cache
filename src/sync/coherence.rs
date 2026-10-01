@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::index::{
     KeyIndex, ObjEntry, apply_del_native, apply_own_del, apply_own_put, apply_put_native,
-    standard_class,
+    fence_own_uncertain_key, fence_uncertain_key_native, standard_class,
 };
 use crate::metrics::Metrics;
 use crate::sync::stop::Crossing;
@@ -40,10 +40,21 @@ pub(super) fn native_cut(peer: &NodeId, token: WriteToken) -> NativeCut {
     }
 }
 
-fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: IndexEvent) {
+/// Fold one peer event into the index. A put that describes nothing (see
+/// [`IndexOp::unknown`]) fences its key instead, and the fence's token is returned for
+/// the caller to reconcile with the origin.
+fn apply_feed_index(
+    state: &KeyIndex,
+    peer: &NodeId,
+    token: WriteToken,
+    event: &IndexEvent,
+) -> Option<u64> {
     let ts = from_micros(event.ts_us);
     let cut = native_cut(peer, token);
-    match event.op {
+    if event.op.describes_nothing() {
+        return fence_uncertain_key_native(state, &event.bucket, &event.key, &cut);
+    }
+    match &event.op {
         IndexOp::Put {
             size,
             etag,
@@ -53,11 +64,13 @@ fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: I
             // Feed rows are skeletal: the first HEAD still completes metadata
             // from the origin before answering a faithful local HEAD.
             let entry = ObjEntry {
-                size,
+                size: *size,
                 last_modified: ts,
-                etag: etag.and_then(|raw| raw.parse().ok()),
-                storage_class: storage_class.map_or_else(standard_class, ObjectStorageClass::from),
-                content_type,
+                etag: etag.as_ref().and_then(|raw| raw.parse().ok()),
+                storage_class: storage_class
+                    .clone()
+                    .map_or_else(standard_class, ObjectStorageClass::from),
+                content_type: content_type.clone(),
                 meta: None,
             };
             apply_put_native(state, &event.bucket, &event.key, entry, cut);
@@ -66,7 +79,13 @@ fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: I
             apply_del_native(state, &event.bucket, &event.key, ts, cut);
         }
     }
+    None
 }
+
+/// Starts an origin reconciliation of a key this node fenced under `token` (see
+/// [`IndexOp::unknown`]), given `(bucket, key, token)`. The proxy supplies it, so the
+/// apply loop holds no reference back to the proxy that owns this feed.
+pub(crate) type KeyReconcile = Arc<dyn Fn(&str, &str, u64) + Send + Sync>;
 
 /// How much coherence the cluster pays for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -621,6 +640,29 @@ impl WriteSync {
         self.advertised(publishing, metrics)
     }
 
+    /// Fence a key this node wrote but cannot describe, and advertise that to peers as
+    /// [`IndexOp::unknown`], assigning its feed position under the same index lock (see
+    /// [`index_put`](Self::index_put)). Returns the fence's token, which the caller
+    /// reconciles with the origin, and the advertisement to await.
+    pub(crate) fn index_unknown<'a>(
+        &'a self,
+        state: &KeyIndex,
+        bucket: &str,
+        key: &str,
+        metrics: &'a Metrics,
+    ) -> (u64, impl Future<Output = WriteReceipt> + use<'a>) {
+        let event = IndexEvent {
+            op: IndexOp::unknown(),
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            ts_us: to_micros(SystemTime::now()),
+        };
+        let (token, publishing) = fence_own_uncertain_key(state, bucket, key, || {
+            (self.feed.publish(&event), self.own_position())
+        });
+        (token, self.advertised(publishing, metrics))
+    }
+
     /// This node's feed writer at its last assigned position (zero before its first
     /// write). Called under the index lock, so it is exactly the write just assigned.
     fn own_position(&self) -> NativeCut {
@@ -840,9 +882,11 @@ impl WriteSync {
     }
 
     /// Spawn the apply loop: peer events update the LIST index and invalidate
-    /// hot bodies. A gap synchronously closes Groupnet's local serving gate
-    /// and schedules an origin rebuild. In `strong`, a small watcher reports
-    /// the lease's monotone lapse count to that same recovery driver.
+    /// hot bodies. A peer write that describes nothing fences its key, and
+    /// `reconcile` resolves that fence from the origin. A gap synchronously
+    /// closes Groupnet's local serving gate, discards the index, and schedules
+    /// its rebuild. In `strong`, a small watcher reports the lease's monotone
+    /// lapse count to that same recovery driver.
     ///
     /// Takes `self` as an [`Arc`] because the lapse watcher holds a weak
     /// reference back to this object, avoiding a task/handle cycle.
@@ -851,6 +895,7 @@ impl WriteSync {
         local: LocalCache,
         state: Arc<KeyIndex>,
         metrics: Arc<Metrics>,
+        reconcile: KeyReconcile,
     ) {
         let (frontier, view) = Frontier::new();
         let _ = self.view.set(view);
@@ -913,8 +958,14 @@ impl WriteSync {
                     } => {
                         let cache_key = (event.bucket.clone(), event.key.clone());
                         let mutation = local.fence_mutation(&cache_key).await;
-                        apply_feed_index(&state, &peer, token, event);
+                        let fenced = apply_feed_index(&state, &peer, token, &event);
                         drop(mutation);
+                        // Fenced before the acknowledgement below: from then on this
+                        // node answers the key from the origin until the reconciliation
+                        // resolves it.
+                        if let Some(fence) = fenced {
+                            reconcile(&event.bucket, &event.key, fence);
+                        }
                         // The index must move first: a warm body promoted after this hot
                         // eviction decodes suspect and is checked against the new entry
                         // before it can be served. Awaiting moka removal before the ack
@@ -939,7 +990,7 @@ impl WriteSync {
                     } => {
                         warn!("write-feed gap from `{peer}`: distrusting bodies, resyncing index");
                         sync.forget_crossing(&peer);
-                        state.skip_native_gap(&native_cut(&peer, missed_through));
+                        state.discard_for_gap(&native_cut(&peer, missed_through));
                         // The public signal fences serving before returning; the
                         // recovery worker distrusts bodies and guards every origin
                         // scan page with that exact operation's permit. Frontier

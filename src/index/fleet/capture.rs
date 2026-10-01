@@ -734,11 +734,11 @@ mod tests {
         index.register_native_writer(&peer_at(3, 4));
         let budget = admission();
         let pending = pending(&index, &budget, 1);
-        index.skip_native_gap(&peer_at(5, 0));
+        index.discard_for_gap(&peer_at(5, 0));
         pending.ingress.with_journal(|journal| {
             assert_eq!(journal.invalidation(), Some(Invalidation::Gap));
         });
-        index.skip_native_gap(&peer_at(3, 9));
+        index.discard_for_gap(&peer_at(3, 9));
         assert_eq!(
             index.inner.read().unwrap().native_cuts[b"peer".as_slice()],
             (5, 0)

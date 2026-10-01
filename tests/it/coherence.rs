@@ -17,7 +17,8 @@ use common::{
 };
 use s3cache::cache::proxy::CachingProxy;
 use s3cache::metrics::Metrics;
-use s3s::dto::{ETag, ETagCondition};
+use s3s::S3;
+use s3s::dto::{ETag, ETagCondition, HeadObjectOutput, PutObjectInput};
 
 /// Nothing here is about the size cap; keep every object cacheable.
 const CAP: usize = 1024 * 1024;
@@ -344,6 +345,68 @@ async fn a_delete_on_a_removes_the_key_from_bs_index() {
         origin.ops.head(),
         heads + 1,
         "the replicated 404 was decided by the origin"
+    );
+}
+
+/// A typed write through `proxy` whose `x-amz-meta-version` names it.
+async fn put_versioned(proxy: &CachingProxy, bucket: &str, key: &str, body: &[u8], version: &str) {
+    let bytes = bytes::Bytes::copy_from_slice(body);
+    let input = PutObjectInput {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        content_length: Some(i64::try_from(bytes.len()).expect("small")),
+        body: Some(common::body_blob(bytes)),
+        content_type: Some("text/x-fixture".to_owned()),
+        metadata: Some([("version".to_owned(), version.to_owned())].into()),
+        ..Default::default()
+    };
+    proxy
+        .put_object(common::request(input))
+        .await
+        .expect("put succeeds");
+}
+
+fn meta_version(out: &HeadObjectOutput) -> Option<&str> {
+    out.metadata
+        .as_ref()
+        .and_then(|meta| meta.get("version"))
+        .map(String::as_str)
+}
+
+/// A HEAD B forwarded before A's overwrite reached it answers about the version the
+/// overwrite replaced. That answer may be returned to its own caller (it was in flight
+/// with the write), but it must lend B's new entry nothing: folded in, it would make
+/// every later HEAD through B report the new `ETag` with the old version's
+/// `x-amz-meta-*`, an object the origin never held.
+#[tokio::test]
+async fn a_head_from_before_an_overwrite_lends_the_new_entry_nothing() {
+    let origin = Origin::start("coherence-head-race").await;
+    let bucket = origin.bucket();
+    let (node_a, node_b) = two_nodes(&origin, ("head-race-a", "head-race-b")).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
+    put_versioned(&node_a, bucket, "ptr", b"first", "1").await;
+
+    origin.pause_next_head("ptr");
+    let (reader, read_bucket) = (node_b.clone(), bucket.to_owned());
+    let in_flight = tokio::spawn(async move { head(&reader, &read_bucket, "ptr").await });
+    origin.wait_for_paused_head().await;
+    put_versioned(&node_a, bucket, "ptr", b"second!", "2").await;
+    origin.release_paused_head();
+    let raced = in_flight
+        .await
+        .expect("head task")
+        .expect("the raced HEAD answers");
+    assert_eq!(
+        meta_version(&raced),
+        Some("1"),
+        "it left before the overwrite"
+    );
+
+    let after = head(&node_b, bucket, "ptr").await.expect("HEAD after");
+    assert_eq!(
+        (after.e_tag.as_ref().map(ETag::value), meta_version(&after)),
+        (origin.etag("ptr").await.as_deref(), Some("2")),
+        "a HEAD after the acknowledged overwrite describes the new version, whole"
     );
 }
 

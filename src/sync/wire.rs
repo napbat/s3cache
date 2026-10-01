@@ -43,6 +43,38 @@ pub(crate) enum IndexOp {
     Del,
 }
 
+impl IndexOp {
+    /// A write whose effect at the origin its writer cannot describe: the origin
+    /// answered with an error that does not prove it refused the write, so the key may
+    /// now hold the new object, the old one, or nothing. It is a `Put` that carries
+    /// neither an `ETag` nor a size, so a reader has nothing to check a copy against —
+    /// what a node that predates this rule already does with it: index the key
+    /// skeletally, drop its hot copy, and send its reads to the origin until an origin
+    /// answer completes it. A current reader fences the key instead and reconciles it
+    /// with one origin HEAD (see `CachingProxy::publish_unknown`).
+    pub(crate) fn unknown() -> Self {
+        Self::Put {
+            size: None,
+            etag: None,
+            content_type: None,
+            storage_class: None,
+        }
+    }
+
+    /// Whether this is [`unknown`](Self::unknown): a put with no identity a reader
+    /// could check, which the writer itself could not describe either.
+    pub(crate) fn describes_nothing(&self) -> bool {
+        matches!(
+            self,
+            Self::Put {
+                size: None,
+                etag: None,
+                ..
+            }
+        )
+    }
+}
+
 /// One durable write: the operation, its `(bucket, key)`, and the writer's wall-clock
 /// timestamp — the cross-writer LWW tiebreak, in **microseconds** so it is not coarser
 /// than the clock a local write is stamped with (see [`wire_stamp`]).

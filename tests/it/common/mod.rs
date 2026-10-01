@@ -22,6 +22,7 @@
 //! that `s3s` already covers. The *outbound* hop is real all the way to `MinIO`.
 
 pub mod diff;
+pub mod faultnet;
 pub mod fleet;
 mod response_pause;
 pub mod synthetic;
@@ -303,6 +304,58 @@ struct Interference {
     /// What tests wrote and deleted through the forwarder, merged into the
     /// synthetic listing.
     overlay: synthetic::Overlay,
+    /// Upper bound, in milliseconds, of a uniform hold on every object response
+    /// after `MinIO` produced it, so an answer describing an older state can land
+    /// after a newer write. Zero answers on time.
+    object_jitter_ms: AtomicU64,
+    /// Chance, in thousandths, that a successful single-object PUT or DELETE is
+    /// answered with a 500 after `MinIO` applied it.
+    applied_fault_per_mille: AtomicU64,
+    /// Splitmix state for the two draws above.
+    rng: AtomicU64,
+}
+
+impl Interference {
+    /// One uniform draw below `bound` (zero for a zero bound).
+    fn below(&self, bound: u64) -> u64 {
+        if bound == 0 {
+            return 0;
+        }
+        let mut z = self
+            .rng
+            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+            .wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) % bound
+    }
+
+    /// How long to hold this object response, and whether to fail it after `MinIO`
+    /// applied it: only a single-object PUT or DELETE, since a copy or a multipart step
+    /// has its own completion shape.
+    fn object_plan(&self, req: &Request<Incoming>, on_key: bool) -> (u64, bool) {
+        let object_request = on_key
+            && matches!(
+                *req.method(),
+                Method::GET | Method::HEAD | Method::PUT | Method::DELETE
+            );
+        let jitter = self.object_jitter_ms.load(Ordering::SeqCst);
+        let hold = if object_request && jitter > 0 {
+            self.below(jitter + 1)
+        } else {
+            0
+        };
+        let object_write = on_key
+            && matches!(*req.method(), Method::PUT | Method::DELETE)
+            && !req.headers().contains_key("x-amz-copy-source")
+            && req
+                .uri()
+                .query()
+                .is_none_or(|query| !query.contains("uploadId"));
+        let fault_rate = self.applied_fault_per_mille.load(Ordering::SeqCst);
+        let applied_fault = object_write && fault_rate > 0 && self.below(1000) < fault_rate;
+        (hold, applied_fault)
+    }
 }
 
 impl Origin {
@@ -555,6 +608,24 @@ impl Origin {
     pub fn release_faulted_put(&self) {
         self.interference.put_fault.release();
     }
+
+    /// Hold every object response (GET, HEAD, PUT, DELETE) for a uniform delay below
+    /// `max` after `MinIO` produced it; zero answers on time again.
+    pub fn jitter_object_responses(&self, max: std::time::Duration) {
+        self.interference.object_jitter_ms.store(
+            u64::try_from(max.as_millis()).expect("test jitter fits"),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Answer `per_mille` thousandths of successful single-object PUTs and DELETEs
+    /// with a 500 after `MinIO` applied them: the ambiguity a proxy sees when the
+    /// upstream connection fails after the origin commits.
+    pub fn fail_applied_writes(&self, per_mille: u16) {
+        self.interference
+            .applied_fault_per_mille
+            .store(u64::from(per_mille), Ordering::SeqCst);
+    }
 }
 
 /// A transparent forwarder to `upstream` that counts what passes through it.
@@ -572,6 +643,10 @@ async fn counting_proxy(
         .await
         .expect("bind the counting proxy");
     let addr = listener.local_addr().expect("counter address");
+    let upstream = Arc::new(Upstream {
+        addr: upstream,
+        idle: Mutex::new(Vec::new()),
+    });
     tokio::spawn(async move {
         let http = ConnBuilder::new(TokioExecutor::new());
         loop {
@@ -580,17 +655,19 @@ async fn counting_proxy(
             };
             let ops = Arc::clone(&ops);
             let interference = Arc::clone(&interference);
+            let upstream = Arc::clone(&upstream);
             let conn = http
                 .serve_connection(
                     TokioIo::new(socket),
                     service_fn(move |req: Request<Incoming>| {
                         let ops = Arc::clone(&ops);
                         let interference = Arc::clone(&interference);
+                        let upstream = Arc::clone(&upstream);
                         async move {
                             ops.record(req.method(), req.uri(), req.headers());
                             let method = req.method().clone();
                             let uri = req.uri().clone();
-                            let response = forward(upstream, req, &interference).await;
+                            let response = forward(&upstream, req, &interference).await;
                             ops.record_success(&method, &uri, response.status());
                             Ok::<_, std::convert::Infallible>(response)
                         }
@@ -619,7 +696,7 @@ const HOP_BY_HOP: [&str; 7] = [
 ];
 
 async fn forward(
-    upstream: SocketAddr,
+    upstream: &Upstream,
     req: Request<Incoming>,
     interference: &Interference,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
@@ -633,6 +710,9 @@ async fn forward(
         head_pause_key,
         synthetic_rows,
         overlay,
+        object_jitter_ms: _,
+        applied_fault_per_mille: _,
+        rng: _,
     } = interference;
     let faulted = put_fault.claim(&req);
     let path = req.uri().path().trim_start_matches('/');
@@ -644,6 +724,7 @@ async fn forward(
             .split_once('/')
             .is_some_and(|(_, key)| percent_decoded(key) == *head_pause_key.lock().unwrap())
         && head_pause.claim();
+    let (hold, applied_fault) = interference.object_plan(&req, on_key);
     if req.method() == Method::GET && !on_key && list_fault.load(Ordering::SeqCst) {
         return Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -683,17 +764,7 @@ async fn forward(
         Ok(resp) if faulted && resp.status().is_success() => {
             put_fault.origin_applied();
             put_fault.wait_release().await;
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header("content-type", "application/xml")
-                .body(
-                    Full::new(Bytes::from_static(
-                        b"<Error><Code>InternalError</Code><Message>injected after apply</Message></Error>",
-                    ))
-                    .map_err(|never| match never {})
-                    .boxed(),
-                )
-                .expect("an injected 500 is well-formed")
+            injected_after_apply()
         }
         Ok(resp) => {
             if let Some((method, key, query, request)) = &written
@@ -710,6 +781,12 @@ async fn forward(
             if held_head {
                 head_pause.hold().await;
             }
+            if hold > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+            if applied_fault && resp.status().is_success() {
+                return injected_after_apply();
+            }
             resp.map(|body| body.map_err(std::io::Error::other).boxed())
         }
         Err(err) => Response::builder()
@@ -721,6 +798,21 @@ async fn forward(
             )
             .expect("a 502 is well-formed"),
     }
+}
+
+/// The 500 a write gets when its upstream connection fails after `MinIO` applied it.
+fn injected_after_apply() -> Response<BoxBody<Bytes, std::io::Error>> {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "application/xml")
+        .body(
+            Full::new(Bytes::from_static(
+                b"<Error><Code>InternalError</Code><Message>injected after apply</Message></Error>",
+            ))
+            .map_err(|never| match never {})
+            .boxed(),
+        )
+        .expect("an injected 500 is well-formed")
 }
 
 fn percent_decoded(value: &str) -> String {
@@ -740,23 +832,48 @@ fn percent_decoded(value: &str) -> String {
     String::from_utf8(out).expect("UTF-8 query value")
 }
 
+/// `MinIO` behind the forwarder, with the idle connections a relay may reuse. A
+/// fresh connection per request leaves one socket in `TIME_WAIT` per request, and a
+/// busy suite exhausts the host's ephemeral ports. Only an idle connection is reused,
+/// so a held response never queues another request behind it.
+struct Upstream {
+    addr: SocketAddr,
+    idle: Mutex<Vec<hyper::client::conn::http1::SendRequest<Incoming>>>,
+}
+
+impl Upstream {
+    fn idle_sender(&self) -> Option<hyper::client::conn::http1::SendRequest<Incoming>> {
+        let mut idle = self.idle.lock().unwrap();
+        idle.retain(|sender| !sender.is_closed());
+        let ready = idle
+            .iter()
+            .position(hyper::client::conn::http1::SendRequest::is_ready)?;
+        Some(idle.swap_remove(ready))
+    }
+}
+
 async fn relay(
-    upstream: SocketAddr,
+    upstream: &Upstream,
     req: Request<Incoming>,
 ) -> Result<Response<Incoming>, Box<dyn std::error::Error + Send + Sync>> {
     let (mut parts, body) = req.into_parts();
     for name in HOP_BY_HOP {
         parts.headers.remove(name);
     }
-    let stream = TcpStream::connect(upstream).await?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    // The connection has to keep running while the response body streams back.
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    Ok(sender
-        .send_request(Request::from_parts(parts, body))
-        .await?)
+    let mut sender = if let Some(sender) = upstream.idle_sender() {
+        sender
+    } else {
+        let stream = TcpStream::connect(upstream.addr).await?;
+        let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        // The connection has to keep running while the response body streams back.
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    };
+    let response = sender.send_request(Request::from_parts(parts, body)).await;
+    upstream.idle.lock().unwrap().push(sender);
+    Ok(response?)
 }
 
 /// An `aws_sdk_s3` client for `endpoint` — the same shape `main.rs` builds (path style,

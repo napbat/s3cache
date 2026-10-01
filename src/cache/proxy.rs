@@ -230,6 +230,63 @@ fn authoritative_head_entry(
     }
 }
 
+/// Reconcile a key fenced under `token` with an authoritative origin HEAD, retrying with
+/// capped backoff while the origin cannot answer. The exact token is checked before each
+/// request and atomically with its result, so neither a newer uncertainty nor a later
+/// definitive mutation can be overwritten by this task.
+fn spawn_key_reconcile(
+    client: &aws_sdk_s3::Client,
+    state: &Arc<KeyIndex>,
+    bucket: &str,
+    key: &str,
+    token: u64,
+    reason: &str,
+) {
+    let client = client.clone();
+    let state = Arc::clone(state);
+    let bucket = bucket.to_owned();
+    let key = key.to_owned();
+    tracing::warn!(
+        "origin state of `{bucket}/{key}` is uncertain ({reason}); fencing and reconciling the key with origin HEAD"
+    );
+    tokio::spawn(async move {
+        let mut backoff = SYNC_RETRY_MIN;
+        loop {
+            if !uncertain_key_is_current(&state, &bucket, &key, token) {
+                return;
+            }
+            let authoritative = match client.head_object().bucket(&bucket).key(&key).send().await {
+                Ok(head) => AuthoritativeKeyState::Present(authoritative_head_entry(&head)),
+                Err(error)
+                    if error.as_service_error().is_some_and(
+                        aws_sdk_s3::operation::head_object::HeadObjectError::is_not_found,
+                    ) =>
+                {
+                    AuthoritativeKeyState::Absent
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "origin reconciliation of `{bucket}/{key}` failed (retrying in {backoff:?}): {error}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(SYNC_RETRY_MAX);
+                    continue;
+                }
+            };
+            let outcome = match authoritative {
+                AuthoritativeKeyState::Present(_) => "present",
+                AuthoritativeKeyState::Absent => "absent",
+            };
+            if resolve_uncertain_key(&state, &bucket, &key, token, authoritative) {
+                info!("reconciled uncertain `{bucket}/{key}` as {outcome}");
+            } else {
+                tracing::debug!("origin reconciliation of `{bucket}/{key}` was superseded");
+            }
+            return;
+        }
+    });
+}
+
 /// Whether a `PutObject` stores something other than *the body it carries, described by
 /// the headers on the request* — the write path's twin of the `origin_only` set on
 /// [`CachingProxy::serve_get`]. Each of these makes a later plain GET report something a
@@ -530,10 +587,21 @@ impl CachingProxy {
     }
 
     fn start_coherence_apply(&self, sync: &std::sync::Arc<crate::sync::coherence::WriteSync>) {
+        let (client, state) = (self.client.clone(), Arc::clone(&self.state));
         sync.start_apply(
             self.obj_cache.local(),
             self.state.clone(),
             self.metrics.clone(),
+            Arc::new(move |bucket: &str, key: &str, token: u64| {
+                spawn_key_reconcile(
+                    &client,
+                    &state,
+                    bucket,
+                    key,
+                    token,
+                    "a peer's write described no object",
+                );
+            }),
         );
     }
 
@@ -688,72 +756,52 @@ impl CachingProxy {
     }
 
     /// Fence an ambiguously-mutated key and reconcile only that key with an authoritative
-    /// origin HEAD. The exact key token is checked before the request and atomically with
-    /// its result, so neither a newer uncertainty nor a later definitive mutation can be
-    /// overwritten by this task.
-    pub(super) fn reconcile_uncertain_put(&self, bucket: &str, key: &str, reason: &str) {
-        let generation = fence_uncertain_key(&self.state, bucket, key);
-        let client = self.client.clone();
-        let state = self.state.clone();
-        let bucket = bucket.to_owned();
-        let key = key.to_owned();
-        let reason = reason.to_owned();
-        tracing::warn!(
-            "origin outcome for PUT `{bucket}/{key}` is uncertain ({reason}); fencing and reconciling the key with origin HEAD"
-        );
-        tokio::spawn(async move {
-            let mut backoff = SYNC_RETRY_MIN;
-            loop {
-                if !uncertain_key_is_current(&state, &bucket, &key, generation) {
-                    return;
-                }
-                match client.head_object().bucket(&bucket).key(&key).send().await {
-                    Ok(head) => {
-                        if resolve_uncertain_key(
-                            &state,
-                            &bucket,
-                            &key,
-                            generation,
-                            AuthoritativeKeyState::Present(authoritative_head_entry(&head)),
-                        ) {
-                            info!("reconciled uncertain PUT `{bucket}/{key}` as present");
-                        } else {
-                            tracing::debug!(
-                                "origin reconciliation of `{bucket}/{key}` was superseded"
-                            );
-                        }
-                        return;
-                    }
-                    Err(error)
-                        if error.as_service_error().is_some_and(
-                            aws_sdk_s3::operation::head_object::HeadObjectError::is_not_found,
-                        ) =>
-                    {
-                        if resolve_uncertain_key(
-                            &state,
-                            &bucket,
-                            &key,
-                            generation,
-                            AuthoritativeKeyState::Absent,
-                        ) {
-                            info!("reconciled uncertain PUT `{bucket}/{key}` as absent");
-                        } else {
-                            tracing::debug!(
-                                "origin reconciliation of `{bucket}/{key}` was superseded"
-                            );
-                        }
-                        return;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "origin reconciliation of `{bucket}/{key}` failed (retrying in {backoff:?}): {error}"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(SYNC_RETRY_MAX);
-                    }
-                }
-            }
-        });
+    /// origin HEAD. This node alone: a write's own path advertises the uncertainty to its
+    /// peers with [`publish_unknown`](Self::publish_unknown) instead.
+    fn reconcile_uncertain_key(&self, bucket: &str, key: &str, reason: &str) {
+        let token = fence_uncertain_key(&self.state, bucket, key);
+        spawn_key_reconcile(&self.client, &self.state, bucket, key, token, reason);
+    }
+
+    /// A mutation this node forwarded but cannot describe: the origin's answer does not
+    /// prove the write was refused, so the key may hold the new object, the old one, or
+    /// nothing. Every node must answer it from the origin until an origin HEAD resolves
+    /// it, so this fences it here, advertises the uncertainty to every peer (see
+    /// [`IndexOp::unknown`](crate::sync::wire::IndexOp::unknown)), and holds the caller
+    /// until the cluster has fenced it too or lost the right to serve, exactly as a
+    /// describable write is held ([`record_put`](Self::record_put)). Returns the
+    /// advertisement's session token when coherence is on.
+    pub(super) async fn publish_unknown(
+        &self,
+        bucket: &str,
+        key: &str,
+        reason: &str,
+    ) -> Option<String> {
+        let receipt = self.announce_unknown(bucket, key, reason).await;
+        self.await_cluster(receipt, bucket, key).await
+    }
+
+    /// [`publish_unknown`](Self::publish_unknown) without the cluster wait, for a batch
+    /// that advertises every key first and then waits once (see
+    /// [`await_cluster`](Self::await_cluster)).
+    pub(super) async fn announce_unknown(
+        &self,
+        bucket: &str,
+        key: &str,
+        reason: &str,
+    ) -> Option<WriteReceipt> {
+        let ckey = (bucket.to_owned(), key.to_owned());
+        let Some(sync) = self.sync.as_ref() else {
+            self.reconcile_uncertain_key(bucket, key, reason);
+            self.obj_cache.invalidate(&ckey).await;
+            return None;
+        };
+        let (token, publishing) = sync.index_unknown(&self.state, bucket, key, &self.metrics);
+        spawn_key_reconcile(&self.client, &self.state, bucket, key, token, reason);
+        // Fenced first, so no fill can commit the old body behind this: a copy left in
+        // place would be served again, trusted, once the reconciliation resolves.
+        self.obj_cache.invalidate(&ckey).await;
+        Some(publishing.await)
     }
 
     /// A key fenced by an ambiguous mutation may only be read from the origin until its
@@ -795,6 +843,14 @@ impl CachingProxy {
         key: &str,
         mut entry: ObjEntry,
     ) -> Option<String> {
+        // A write whose response carried neither an `ETag` nor a size describes nothing
+        // a reader could check a copy against: it is reconciled as an uncertain one.
+        if entry.etag.is_none() && entry.size.is_none() {
+            op.record(&self.metrics);
+            return self
+                .publish_unknown(bucket, key, "the write's response described no object")
+                .await;
+        }
         entry.last_modified = wire_stamp(SystemTime::now());
         // Index first: the writer must never be the one node still answering from the
         // older entry, not even for the length of a publish. With a feed, the same
@@ -899,11 +955,12 @@ impl CachingProxy {
 
     /// Fold what an origin response proved into the index. An already-indexed key is
     /// *completed* in place — the response fills the fields a skeletal entry lacks and
-    /// nothing else, so this observes rather than writes and cannot reorder against a
-    /// concurrent write. A key that is not indexed at all is added as a read
-    /// observation, stamped with the origin's own mtime in the index's whole seconds (the
-    /// truest clock available for something the origin just described) and advertised to
-    /// nobody: peers learn real writes from their writers.
+    /// nothing else, and only when it describes the version the entry does — so this
+    /// observes rather than writes and cannot reorder against a concurrent write. A key
+    /// that is not indexed at all is added as a read observation, stamped with the
+    /// origin's own mtime in the index's whole seconds (the truest clock available for
+    /// something the origin just described) and advertised to nobody: peers learn real
+    /// writes from their writers.
     pub(super) fn observe(&self, bucket: &str, key: &str, observed: &ObservedObject) {
         let fill = EntryFill {
             size: observed.size,
@@ -916,7 +973,7 @@ impl CachingProxy {
                 self.metrics.index_backfill();
                 return;
             }
-            Completion::AlreadyComplete => return,
+            Completion::AlreadyComplete | Completion::OtherVersion => return,
             Completion::NotIndexed => {}
         }
         let entry = ObjEntry {
@@ -1500,13 +1557,19 @@ impl CachingProxy {
             }
         }
         self.metrics.head_miss();
+        // Registered before the request leaves: a write applied here while it is in
+        // flight makes its answer about a version this index has moved past.
+        let fence = cache_eligible.then(|| self.obj_cache.observation_fence(&ckey));
         let resp = self.inner.head_object(req).await?;
         // This answer is exactly what the entry was missing, so fold it in: the key's
         // next HEAD is local *and* identical to this one, which is the whole point of
         // forwarding a skeletal entry's first. Only for a plain HEAD — a conditional or
         // version-scoped answer describes something other than the current object.
-        if cache_eligible {
-            self.observe(&ckey.0, &ckey.1, &observed!(&resp.output));
+        if let Some(fence) = fence {
+            let observed = observed!(&resp.output);
+            fence
+                .commit(|| self.observe(&ckey.0, &ckey.1, &observed))
+                .await;
         }
         Ok(resp)
     }

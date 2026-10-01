@@ -12,7 +12,7 @@ use s3s::dto::GetObjectOutput;
 use crate::index::{KeyIndex, ObjEntry, standard_class};
 use crate::metrics::Metrics;
 use crate::sync::coherence::{
-    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, WriteReceipt, WriteSync, WriteWait,
+    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, KeyReconcile, WriteReceipt, WriteSync, WriteWait,
     recovery_generation_permits, waits_on, waits_on_unleased,
 };
 use crate::sync::config::{parse_lease_ms, parse_seeds};
@@ -176,7 +176,7 @@ fn wired_pair_named(
     let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
     let state = Arc::new(KeyIndex::default());
     let sync_b = Arc::new(attach(b_group, b_id, consistency));
-    sync_b.start_apply(cache.local(), state.clone(), metrics);
+    sync_b.start_apply(cache.local(), state.clone(), metrics, no_reconcile());
     let sync_a = attach(a_group, a_id, consistency);
     (sync_a, sync_b, state, cache)
 }
@@ -189,6 +189,11 @@ async fn eventually(mut cond: impl FnMut() -> bool, what: &str) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for: {what}");
+}
+
+/// An apply loop for tests whose peers write nothing they cannot describe.
+fn no_reconcile() -> KeyReconcile {
+    Arc::new(|_: &str, _: &str, _: u64| {})
 }
 
 /// The env spellings [`WriteSync::new`] is configured through: seeds split on the
@@ -461,7 +466,12 @@ async fn peer_delete_retires_the_warm_copy() {
     let cache = TieredCache::new(1024 * 1024, Some(warm), metrics.clone());
     let state = Arc::new(KeyIndex::default());
     let sync_b = Arc::new(attach(b_group, b_id, Consistency::Strong));
-    sync_b.start_apply(cache.local(), state.clone(), metrics.clone());
+    sync_b.start_apply(
+        cache.local(),
+        state.clone(),
+        metrics.clone(),
+        no_reconcile(),
+    );
     let sync_a = attach(a_group, a_id, Consistency::Strong);
 
     own_put(&sync_a, "gone", written(4), &metrics).await;
@@ -496,6 +506,75 @@ async fn peer_delete_retires_the_warm_copy() {
     assert!(retired, "the peer delete retired the warm copy");
     drop(cache);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A peer's write it could not describe (the origin failed it after perhaps applying
+/// it) fences the key here before this node acknowledges it: the hot copy goes, the
+/// key reads from the origin, and the fence's token goes to the origin
+/// reconciliation. The writer's next describable write clears the fence.
+#[tokio::test]
+async fn an_undescribed_peer_write_fences_the_key_before_it_is_acknowledged() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_node(&net, "unknown-a", "unknown-b");
+    let (b_id, _b_node, b_group) = spawn_node(&net, "unknown-b", "unknown-a");
+    let metrics = Arc::new(Metrics::default());
+    let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
+    let state = Arc::new(KeyIndex::default());
+    let reconciling = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sync_b = Arc::new(attach(b_group, b_id, Consistency::Strong));
+    let handed = Arc::clone(&reconciling);
+    sync_b.start_apply(
+        cache.local(),
+        state.clone(),
+        metrics.clone(),
+        Arc::new(move |bucket: &str, key: &str, token: u64| {
+            handed
+                .lock()
+                .unwrap()
+                .push((bucket.to_owned(), key.to_owned(), token));
+        }),
+    );
+    let sync_a = attach(a_group, a_id, Consistency::Strong);
+
+    let first = own_put(&sync_a, "ptr", written(4), &metrics).await;
+    assert!(
+        sync_b
+            .reached_token(&first.header, Duration::from_secs(5))
+            .await
+    );
+    let ckey = ("bkt".to_owned(), "ptr".to_owned());
+    cache.insert(ckey.clone(), cached(b"old")).await;
+
+    let (_, publishing) = sync_a.index_unknown(&KeyIndex::default(), "bkt", "ptr", &metrics);
+    let unknown = publishing.await;
+    assert!(
+        sync_b
+            .reached_token(&unknown.header, Duration::from_secs(5))
+            .await
+    );
+    let token = state.read().unwrap()["bkt"]
+        .uncertain_keys
+        .get("ptr")
+        .copied();
+    assert!(token.is_some(), "the applied event left the key fenced");
+    assert_eq!(
+        *reconciling.lock().unwrap(),
+        [("bkt".to_owned(), "ptr".to_owned(), token.unwrap())],
+        "the fence went to the origin reconciliation"
+    );
+    assert!(
+        cache.get(&ckey).await.is_none(),
+        "the hot copy is gone before the acknowledgement"
+    );
+
+    let later = own_put(&sync_a, "ptr", written(5), &metrics).await;
+    assert!(
+        sync_b
+            .reached_token(&later.header, Duration::from_secs(5))
+            .await
+    );
+    assert!(state.read().unwrap()["bkt"].uncertain_keys.is_empty());
+    assert_eq!(indexed_size(&state, "bkt", "ptr"), Some(5));
 }
 
 /// The strict-LIST barrier: after a publish, `await_fresh` on the peer

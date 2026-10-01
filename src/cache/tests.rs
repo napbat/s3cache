@@ -132,6 +132,7 @@ async fn a_lease_revoked_after_local_body_lookup_forces_origin_get() {
         proxy.obj_cache.local(),
         proxy.state.clone(),
         proxy.metrics.clone(),
+        Arc::new(|_: &str, _: &str, _: u64| {}),
     );
     tokio::time::timeout(Duration::from_secs(3), async {
         while !sync.may_serve_local() {
@@ -165,6 +166,7 @@ async fn a_lease_revoked_after_index_answer_forces_origin_list() {
         proxy.obj_cache.local(),
         proxy.state.clone(),
         proxy.metrics.clone(),
+        Arc::new(|_: &str, _: &str, _: u64| {}),
     );
     tokio::time::timeout(Duration::from_secs(3), async {
         while !sync.may_serve_local() {
