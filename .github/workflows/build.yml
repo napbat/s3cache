@@ -44,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets --all-features
-      - run: cargo test --locked --workspace --all-features --lib --bins --test it -- metrics_endpoint:: tier_cache:: startup_readiness::
+      - run: "cargo test --locked --workspace --all-features --lib --bins --test it -- metrics_endpoint:: tier_cache:: startup_readiness::"
       - run: cargo doc --locked --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
