@@ -13,9 +13,9 @@
 //!   scan, and the other node follows it;
 //! * a follower serves HEAD, GET, PUT and DELETE traffic while it bootstraps,
 //!   and installs its donor's image without one origin LIST;
-//! * a rolling update restarts both pods in turn, the second one as soon as
-//!   the first has installed its image: neither restart makes an origin scan
-//!   or falls back.
+//! * `StatefulSet` rolling updates ([`rolling`]) restart both pods in turn,
+//!   the first update and every later one, whose donors hold images they
+//!   installed from a peer: no restart makes an origin scan or falls back.
 
 use crate::common;
 
@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use common::fleet::{Counts, Pod, free_tcp_port, mem_pod_node, serves_locally, trace_decisions};
 use common::{Origin, counter, delete, get, head, put, request};
-use groupnet::core::NodeId;
 use groupnet::transport::mem::Network;
 use s3cache::cache::proxy::CachingProxy;
 use s3cache::metrics::Metrics;
@@ -32,6 +31,8 @@ use s3cache::sync::coherence::WriteSync;
 use s3cache::sync::stop::SealOutcome;
 use s3s::S3;
 use s3s::dto::ListObjectsV2Input;
+
+mod rolling;
 
 /// About the production bucket's 793,000 rows.
 const ROWS: usize = 790_000;
@@ -43,11 +44,6 @@ const DEADLINE: Duration = Duration::from_mins(20);
 const SEAL_WAIT: Duration = Duration::from_secs(5);
 /// Writes the restarting node makes before it stops.
 const WRITTEN: usize = 4;
-/// A replacement pod's start, from its predecessor's stop to its gossip: on
-/// 2026-10-01 each replacement's gossip bound 32–34 s after its predecessor's
-/// `SIGTERM`, 25–31 s of it opening its warm tier, and its peer ran alone
-/// meanwhile.
-const POD_START: Duration = Duration::from_secs(30);
 
 /// A key the restarting node writes. It sorts after every synthetic row.
 fn written(n: usize) -> String {
@@ -665,99 +661,4 @@ async fn follower_serves_traffic_while_it_bootstraps_and_lists_nothing() {
         "fleet_production serving total_ms={}",
         started.elapsed().as_millis()
     );
-}
-
-/// Bring up the replacement of the stopped pod `index` the way a `StatefulSet`
-/// does. The survivor reaps the old member; its seed resolver relearns the
-/// name for the replacement's new address before the replacement gossips (on
-/// 2026-10-01 at 4.9 s after the `SIGTERM`, once the old member was reaped);
-/// and the new life starts [`POD_START`] after the stop.
-async fn replace(fleet: &Fleet, index: usize, survivor: &Node, stopped: Instant) -> Node {
-    let name = NodeId::new(fleet.names[index]);
-    let group = survivor.sync.group();
-    wait_until("the survivor reaps the stopped member", || {
-        group.status_held_for(&name).is_none()
-    })
-    .await;
-    group.add_peer(name);
-    tokio::time::sleep(POD_START.saturating_sub(stopped.elapsed())).await;
-    let node = fleet.node(index).await;
-    node.start(&fleet.bucket).await;
-    node
-}
-
-/// (e) A `StatefulSet` rolling update: the higher ordinal stops and its
-/// replacement installs its peer's image, then the other pod stops the moment
-/// that rejoiner serves locally (on 2026-10-01 the second `SIGTERM` came 0.3 s
-/// after the first rejoiner's index was ready) and its replacement installs
-/// the first rejoiner's image. Every life seals its feed, so no restart costs
-/// an origin scan, a LIST page or a recovery fallback. The second stop's
-/// other landings in the rejoiner's recovery, down to its millisecond peer
-/// proof stages and its Ready recapture, are groupnet's
-/// `volatile_recovery_rolling` simulation.
-async fn rolling_update(label: &str, names: [&'static str; 2]) {
-    let fleet = Fleet::new(label, names).await;
-    let cold = cold_start(&fleet).await;
-    let bucket = fleet.bucket.clone();
-    let [a, b] = cold.nodes;
-    write_through(&a, &b, &bucket, 0).await;
-    write_through(&b, &a, &bucket, WRITTEN).await;
-    let cold_lives = [a.life(), b.life()];
-    let before = fleet.counts();
-
-    // The higher ordinal first: `b` stops, and its replacement joins `a`.
-    let stopped = Instant::now();
-    let b_old = planned_stop(b).await.since(cold_lives[1]);
-    let b = replace(&fleet, 1, &a, stopped).await;
-    wait_until("the first rejoiner serves locally", || b.serves(&bucket)).await;
-    let b_ready = stopped.elapsed();
-    let keys = 2 * WRITTEN;
-
-    // Then `a`, whose replacement joins the first rejoiner.
-    let stopped = Instant::now();
-    let a_old = planned_stop(a).await.since(cold_lives[0]);
-    let a = replace(&fleet, 0, &b, stopped).await;
-    wait_until("both nodes serve locally", || {
-        a.serves(&bucket) && b.serves(&bucket)
-    })
-    .await;
-    let a_ready = stopped.elapsed();
-    let cost = fleet.counts().since(before);
-    let lives = [b_old, a_old, b.life(), a.life()];
-    println!(
-        "fleet_production {label} first_restart_ready_ms={} \
-         second_restart_ready_ms={} lives={lives:?} {cost:?}",
-        b_ready.as_millis(),
-        a_ready.as_millis(),
-    );
-    assert_eq!(
-        cost.list, 0,
-        "the rolling update listed the origin: {cost:?}"
-    );
-    for life in lives {
-        assert_eq!(life.scans, 0, "a restart scanned the origin: {lives:?}");
-        assert_eq!(life.fallbacks, 0, "a recovery fell back: {lives:?}");
-    }
-    cost.assert_no_writes();
-    let before_check = fleet.counts();
-    for node in [&a, &b] {
-        for n in 0..keys {
-            assert!(
-                lists(&node.proxy, &bucket, &written(n)).await,
-                "both lives' write {n} survives the update"
-            );
-        }
-        assert_eq!(node.count("index_objects"), (ROWS + keys) as u64);
-    }
-    assert_eq!(
-        fleet.counts().since(before_check).list,
-        0,
-        "both nodes answer from their own index"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "local MinIO and minutes of production-paced origin scans; run with --ignored --test-threads=1"]
-async fn rolling_update_lists_nothing() {
-    rolling_update("fleet-prod-rolling", ["prod-roll-a", "prod-roll-b"]).await;
 }
