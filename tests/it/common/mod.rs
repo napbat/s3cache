@@ -298,6 +298,9 @@ struct Interference {
     head_pause: ResponsePause,
     /// The only key whose HEAD the armed `head_pause` holds.
     head_pause_key: Mutex<String>,
+    /// The only client, by its `aws_sdk_s3` app name, whose HEAD the armed
+    /// `head_pause` holds; `None` holds any client's.
+    head_pause_client: Mutex<Option<String>>,
     /// Rows of the synthetic listing that answers bucket LISTs; zero forwards
     /// them to `MinIO`.
     synthetic_rows: AtomicUsize,
@@ -328,6 +331,22 @@ impl Interference {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         (z ^ (z >> 31)) % bound
+    }
+
+    /// Whether `req` is the HEAD the armed `head_pause` holds: of its key, from
+    /// its client when it names one, and the first such since it was armed.
+    fn claims_head_pause(&self, req: &Request<Incoming>, path: &str) -> bool {
+        req.method() == Method::HEAD
+            && path.split_once('/').is_some_and(|(_, key)| {
+                percent_decoded(key) == *self.head_pause_key.lock().unwrap()
+            })
+            && self
+                .head_pause_client
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_none_or(|client| sent_by(req, client))
+            && self.head_pause.claim()
     }
 
     /// How long to hold this object response, and whether to fail it after `MinIO`
@@ -381,7 +400,7 @@ impl Origin {
             .expect("MinIO's mapped port");
         let minio: SocketAddr = ([127, 0, 0, 1], port).into();
 
-        let direct = client_for(&format!("http://{minio}"));
+        let direct = client_for(&format!("http://{minio}"), None);
         direct
             .create_bucket()
             .bucket(bucket)
@@ -463,7 +482,19 @@ impl Origin {
     /// Hold the next origin HEAD response for `key` after `MinIO` returns it.
     /// HEADs of every other key pass.
     pub fn pause_next_head(&self, key: &str) {
+        self.arm_head_pause(key, None);
+    }
+
+    /// [`pause_next_head`](Self::pause_next_head) for one client only: the HEAD
+    /// of `key` sent through [`counted_client_named`](Self::counted_client_named)
+    /// `client`. Other nodes' HEADs of the same key pass.
+    pub fn pause_next_head_from(&self, key: &str, client: &str) {
+        self.arm_head_pause(key, Some(client));
+    }
+
+    fn arm_head_pause(&self, key: &str, client: Option<&str>) {
         key.clone_into(&mut self.interference.head_pause_key.lock().unwrap());
+        *self.interference.head_pause_client.lock().unwrap() = client.map(str::to_owned);
         self.interference.head_pause.arm();
     }
 
@@ -486,7 +517,14 @@ impl Origin {
     /// A client for the proxy under test: everything it sends is counted.
     #[must_use]
     pub fn counted_client(&self) -> aws_sdk_s3::Client {
-        client_for(&self.counted_endpoint)
+        client_for(&self.counted_endpoint, None)
+    }
+
+    /// [`counted_client`](Self::counted_client) whose requests carry `name` as
+    /// their app name, so an interference can single out one node.
+    #[must_use]
+    pub fn counted_client_named(&self, name: &str) -> aws_sdk_s3::Client {
+        client_for(&self.counted_endpoint, Some(name))
     }
 
     /// Exact endpoint used by the counted client and fleet scope binding.
@@ -707,7 +745,8 @@ async fn forward(
         list_delay_ms,
         get_pause,
         head_pause,
-        head_pause_key,
+        head_pause_key: _,
+        head_pause_client: _,
         synthetic_rows,
         overlay,
         object_jitter_ms: _,
@@ -719,11 +758,7 @@ async fn forward(
     let on_key = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
     let held_list = req.method() == Method::GET && !on_key && list_pause.claim();
     let held_get = req.method() == Method::GET && on_key && get_pause.claim();
-    let held_head = req.method() == Method::HEAD
-        && path
-            .split_once('/')
-            .is_some_and(|(_, key)| percent_decoded(key) == *head_pause_key.lock().unwrap())
-        && head_pause.claim();
+    let held_head = interference.claims_head_pause(&req, path);
     let (hold, applied_fault) = interference.object_plan(&req, on_key);
     if req.method() == Method::GET && !on_key && list_fault.load(Ordering::SeqCst) {
         return Response::builder()
@@ -877,10 +912,11 @@ async fn relay(
 }
 
 /// An `aws_sdk_s3` client for `endpoint` — the same shape `main.rs` builds (path style,
-/// static creds), without the ambient AWS environment.
+/// static creds), without the ambient AWS environment. `app` names the client in its
+/// user agent (see [`sent_by`]).
 #[must_use]
-fn client_for(endpoint: &str) -> aws_sdk_s3::Client {
-    let conf = aws_sdk_s3::config::Builder::new()
+fn client_for(endpoint: &str, app: Option<&str>) -> aws_sdk_s3::Client {
+    let mut conf = aws_sdk_s3::config::Builder::new()
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
         .credentials_provider(aws_sdk_s3::config::Credentials::new(
@@ -891,9 +927,24 @@ fn client_for(endpoint: &str) -> aws_sdk_s3::Client {
             "s3cache-tests",
         ))
         .endpoint_url(endpoint)
-        .force_path_style(true)
-        .build();
-    aws_sdk_s3::Client::from_conf(conf)
+        .force_path_style(true);
+    conf.set_app_name(app.map(|app| {
+        aws_sdk_s3::config::AppName::new(app.to_owned()).expect("a valid client app name")
+    }));
+    aws_sdk_s3::Client::from_conf(conf.build())
+}
+
+/// Whether `req` came from the client [`client_for`] named `app`.
+fn sent_by<B>(req: &Request<B>, app: &str) -> bool {
+    let marker = format!("app/{app}");
+    ["x-amz-user-agent", "user-agent"]
+        .into_iter()
+        .any(|header| {
+            req.headers()
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|agent| agent.split(' ').any(|part| part == marker))
+        })
 }
 
 /// A proxy over `client`, wired the way `main.rs` wires one: hot tier only, no warm

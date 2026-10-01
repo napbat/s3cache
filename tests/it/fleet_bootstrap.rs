@@ -925,12 +925,19 @@ async fn listing(proxy: &CachingProxy, bucket: &str) -> Vec<ListedRow> {
         .collect()
 }
 
+/// The app name of the client [`follower_serves_traffic_while_joining`]'s
+/// follower sends through, so [`uncertain_put`] can hold its HEAD alone.
+const FOLLOWER_CLIENT: &str = "fleet-follower";
+
 /// Commit a conditional PUT at the origin behind `node`'s back: `MinIO`
-/// applies it, `node` sees an injected 500 and fences the key, and its
-/// reconciling origin HEAD is held until [`Origin::release_paused_head`].
+/// applies it, `node` sees an injected 500 and fences the key, and the
+/// reconciling origin HEAD `node` sends through the client named `client` is
+/// held until [`Origin::release_paused_head`]. Every peer also fences the key
+/// on the unknown write `node` advertises; their own HEADs pass and resolve it.
 async fn uncertain_put(
     origin: &Origin,
     node: &CachingProxy,
+    client: &str,
     bucket: &str,
     key: &str,
     body: &'static [u8],
@@ -954,7 +961,7 @@ async fn uncertain_put(
         .await
     });
     origin.wait_for_faulted_put_to_apply().await;
-    origin.pause_next_head(key);
+    origin.pause_next_head_from(key, client);
     origin.release_faulted_put();
     assert!(
         write.await.expect("the write task joins").is_err(),
@@ -969,9 +976,11 @@ async fn uncertain_put(
 /// rows carry the writer's clock rather than the origin's mtime, and its own
 /// PUTs and DELETEs. With `uncertain`, one conditional PUT also commits at the
 /// origin behind a failed response, and the follower's reconciliation of that
-/// key is still open when it installs. The follower must install the donor's
-/// image without an origin LIST, keep the open reconciliation, and end with
-/// the donor's index.
+/// key is still open when it installs. The donor fences the key too, on the
+/// unknown write the follower advertises, and cannot capture an image until
+/// its own HEAD resolves it. The follower must install the donor's image
+/// without an origin LIST, keep the open reconciliation, and end with the
+/// donor's index.
 #[expect(
     clippy::too_many_lines,
     reason = "one client schedule through the joining follower and its final index comparison form one scenario"
@@ -1003,8 +1012,12 @@ async fn follower_serves_traffic_while_joining(label: &str, uncertain: bool) {
     }
 
     let b_sync = gossip_node(&b_name, b_udp, &[(a_name.as_str(), a_udp)]).await;
-    let b = proxy_over(&client, CAP, Some(Arc::clone(&b_sync)))
-        .with_fleet_config(fleet_config(&origin, &bucket, &b_name, &ports));
+    let b = proxy_over(
+        &origin.counted_client_named(FOLLOWER_CLIENT),
+        CAP,
+        Some(Arc::clone(&b_sync)),
+    )
+    .with_fleet_config(fleet_config(&origin, &bucket, &b_name, &ports));
     mutual_alive(&a_sync, &a_name, &b_sync, &b_name).await;
     let before_join = Counts::take(&origin);
     let join_started = Instant::now();
@@ -1043,6 +1056,7 @@ async fn follower_serves_traffic_while_joining(label: &str, uncertain: bool) {
         uncertain_put(
             &origin,
             &b,
+            FOLLOWER_CLIENT,
             &bucket,
             &document(7),
             b"committed behind a failure",
@@ -1497,6 +1511,26 @@ async fn bulk_book(
     }
 }
 
+/// Each node takes one Ready recapture after its index is complete, and at most
+/// one paced retry for a failed attempt or for each lease lapse the injected
+/// stalls cause; not one per suspicion and refutation. C holds the index lock
+/// for microseconds, so a capture does not lapse the lease itself, but a stall
+/// that does retires the capture, and its replacement waits out the backoff.
+/// The follower adopts the image it installed and offers it as a donor too, so
+/// the pod a rolling update stops next leaves a Ready image behind.
+fn assert_recaptures_paced(recaptures: [u64; 2], lapses: [u64; 2], follower: usize, report: &str) {
+    for (node, (taken, lapsed)) in recaptures.into_iter().zip(lapses).enumerate() {
+        assert!(
+            taken <= 1 + lapsed.max(PACED_RETRIES),
+            "node {node}'s Ready recapture is paced, not retried on every refutation: {report}"
+        );
+    }
+    assert!(
+        recaptures[follower] >= 1,
+        "the follower offers the image it adopted: {report}"
+    );
+}
+
 /// Run one loaded, production-paced concurrent start of the pair `names`
 /// over `rows` synthetic rows and assert that only the builder listed, that
 /// its scan outlasted `min_build`, and that the follower installed its image.
@@ -1580,17 +1614,7 @@ async fn paced_concurrent_start(
     );
     let builder = usize::from(scans[1] == 1);
     let follower = 1 - builder;
-    // One recapture after the scan, and at most one paced retry for a failed
-    // attempt or for each lease lapse the injected stalls cause; not one per
-    // suspicion and refutation. C holds the index lock for microseconds, so a
-    // capture does not lapse the lease itself, but a stall that does retires
-    // the capture, and its replacement waits out the backoff. The follower,
-    // which holds the builder's image under an unchanged membership, starts
-    // none.
-    assert!(
-        recaptures[builder] <= 1 + lapses[builder].max(PACED_RETRIES) && recaptures[follower] == 0,
-        "the builder's Ready recapture is paced, not retried on every refutation: {report}"
-    );
+    assert_recaptures_paced(recaptures, lapses, follower, &report);
     let built = seen[builder].ready.expect("the builder served locally");
     assert!(
         built > min_build,
