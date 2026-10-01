@@ -10,6 +10,12 @@ replicaCount: 1
 availability:
   minReadySeconds: 5
   podDisruptionBudget: true
+  # How long Kubernetes waits after SIGTERM before SIGKILL. A planned stop needs
+  # up to 10s to drain in-flight requests plus up to 5s to seal the write feed and
+  # wait for peers to acknowledge the seal, which is what lets them keep their
+  # index across this pod's restart. Keep it above 15s; below it a slow drain is
+  # killed before the seal, and peers rescan the origin as after a crash.
+  terminationGracePeriodSeconds: 30
 
 image:
   repository: ghcr.io/napbat/s3cache

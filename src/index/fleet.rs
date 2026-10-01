@@ -156,6 +156,19 @@ impl IndexCapture {
         };
         self.append_bytes(identity, effect);
     }
+
+    /// Journal a native writer's sealed renewal into `epoch`, as a no-op.
+    fn record_renewal(&mut self, sealed: &NativeCut, epoch: u64) {
+        let Ok(effect) = encode_delta(&IndexDelta::Noop, self.max_event_bytes, self.max_name_bytes)
+        else {
+            self.invalidate(Invalidation::Capacity);
+            return;
+        };
+        let now = self.clock.now();
+        let _ = self
+            .ingress
+            .with_journal(|journal| journal.renew(now, self.generation, sealed, epoch, effect));
+    }
 }
 
 impl KeyIndexState {
@@ -235,6 +248,53 @@ impl KeyIndexState {
             capture.invalidate(Invalidation::Membership);
         }
     }
+
+    /// Move a native writer whose life this index applied through its seal
+    /// at `sealed` into its next life, `epoch`, at sequence zero. The feed
+    /// proved that life ended at the seal, so nothing of it is missing, and
+    /// an open capture renews the writer in its journal rather than
+    /// withdrawing. A writer this index never applied stays absent, a quiet
+    /// feed, until its new life's first event. A cut anywhere but the seal
+    /// is not a renewal: the capture withdraws as after a gap, and the cut
+    /// still moves on so the new life's events stay contiguous.
+    fn renew_native_writer(&mut self, sealed: &NativeCut, epoch: u64) {
+        let Some(cut) = self.native_cuts.get_mut(&sealed.writer) else {
+            return;
+        };
+        if epoch <= cut.0 {
+            return;
+        }
+        let renewable = *cut == (sealed.epoch, sealed.sequence);
+        *cut = (epoch, 0);
+        if let Some(capture) = &mut self.capture {
+            if renewable {
+                capture.record_renewal(sealed, epoch);
+            } else {
+                capture.invalidate(Invalidation::Gap);
+            }
+        }
+    }
+
+    /// Move a native writer past a feed gap to `missed_through`, the
+    /// epoch-major position through which its writes were provably missed.
+    /// The index remediates the gap from the origin, so its cut no longer
+    /// stands anywhere earlier: a donor image that covers the writer from
+    /// that position aligns with it. An open capture withdraws, as it cannot
+    /// carry the missed writes. A writer this index never applied stays
+    /// absent.
+    fn skip_native_gap(&mut self, missed_through: &NativeCut) {
+        let Some(cut) = self.native_cuts.get_mut(&missed_through.writer) else {
+            return;
+        };
+        let through = (missed_through.epoch, missed_through.sequence);
+        if through <= *cut {
+            return;
+        }
+        *cut = through;
+        if let Some(capture) = &self.capture {
+            capture.invalidate(Invalidation::Gap);
+        }
+    }
 }
 
 impl super::KeyIndex {
@@ -247,6 +307,37 @@ impl super::KeyIndex {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .register_native_writer(cut);
+    }
+
+    /// Advance a native writer to its delivered seal, journaled as a no-op,
+    /// so its cut ends exactly where its life did.
+    pub(crate) fn note_native_seal(&self, cut: NativeCut) {
+        let mut index = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if index.note_native_cut(&cut)
+            && let Some(capture) = index.capture.as_mut()
+        {
+            capture.record_native_noop(DeltaIdentity::Native(cut));
+        }
+    }
+
+    /// Move a native writer into its next life after its delivered seal,
+    /// with no gap.
+    pub(crate) fn renew_native_writer(&self, sealed: &NativeCut, epoch: u64) {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .renew_native_writer(sealed, epoch);
+    }
+
+    /// Move a native writer past a delivered feed gap.
+    pub(crate) fn skip_native_gap(&self, missed_through: &NativeCut) {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .skip_native_gap(missed_through);
     }
 }
 

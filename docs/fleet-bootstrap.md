@@ -214,13 +214,14 @@ the journal lock alone; it never reaches back into the index lock.
 The follower remains origin-routed while its existing lease granter and feed
 applier run. Native delivery continues into its live `KeyIndex` throughout
 transfer. A peer install requires its live native writer cuts to align with
-B exactly (Groupnet's `align_cuts`). A cut behind or ahead of B in the same
-writer incarnation answers `NativePending`: the follower keeps its private
-stage and Groupnet samples a later barrier, replaying the further suffix,
-until the cuts align or the original transfer deadline expires. A changed
-writer incarnation, or a pair of versions coverage cannot order, aborts the
-peer candidate and keeps origin recovery available. The donor image and
-suffix through exact B are staged privately; B's cuts and membership are
+B exactly (Groupnet's `align_cuts`). Positions order epoch-major, so a cut
+behind or ahead of B, in the same writer life or another one, answers
+`NativePending`: the follower keeps its private stage and Groupnet samples a
+later barrier, replaying the further suffix, until the cuts align or the
+original transfer deadline expires. The refusal names the writer and both
+positions at debug. Unsorted cut lists, or a pair of versions coverage cannot
+order, abort the peer candidate and keep origin recovery available. The donor
+image and suffix through exact B are staged privately; B's cuts and membership are
 sampled in the same journal decision, so a delayed B response cannot borrow
 later cuts. Native events already covered by those exact writer cuts are
 represented by the donor image and suffix. Timestamp ties never silently
@@ -355,6 +356,52 @@ The walk runs under the index read lock at coverage and the write lock at
 install; if it causes fallback or latency regression under hot traffic, the
 next slice must bound it rather than weaken the classification.
 
+## Rejoin after a restart
+
+A restarted node is a new feed life of the same writer, and its peers cannot
+know from the feed alone what the old life wrote at the origin after its last
+published write. What each kind of stop costs follows from that.
+
+**Announcement.** A starting node advertises its new feed epoch before its
+recovery opens (`WriteSync::announce`), so every peer settles its restart at
+once rather than at the new life's first write.
+
+**Planned stop: seal.** On `SIGTERM` the binary retracts its serve-lease,
+drains HTTP connections for up to 10 s, and only if the drain completed seals
+its write feed (`CachingProxy::seal_writes`, then `WriteSync::seal`). The seal
+first waits for every PUT tail, the spawned origin-and-publish task a PUT runs
+so a client hang-up cannot strand an applied write, and then promises the peers
+that this life publishes nothing more. It waits up to 5 s for every peer a
+write waits on to acknowledge the seal. A drain that timed out, a PUT tail still
+running, or a crash leaves the feed unsealed: the restart stays an ordinary gap,
+which is always safe. The Helm chart's
+`availability.terminationGracePeriodSeconds` (default 30) must cover the
+drain plus the seal wait.
+
+**Survivor.** A survivor that delivered the seal crosses into the rejoiner's
+new life with `PeerWrite::Renewed` instead of a gap (`feed_renewals`): it
+keeps its index and bodies, its frontier and ledger move to the new epoch at
+sequence zero, and an open donor capture journals the crossing, so its
+capture stays a candidate. The index advances the writer's cut to the seal
+and then to the new life (`note_native_seal`, `renew_native_writer`); a
+renewal that does not continue the cut from its delivered seal withdraws the
+capture as a gap would. In `strong` the stopped node's frozen grants lapse
+the survivor's lease briefly; the lease-lapse recovery reports each sealed
+crossing as `Peer::renewal`, and Groupnet's barrier follows the writer into
+its new life instead of falling back, so the survivor re-affirms without an
+origin scan. It answers from the origin only for that moment.
+
+**Rejoiner.** The survivor's donor journal renews the rejoiner's old-life cut
+to the new epoch, so a barrier sampled after the crossing aligns with the
+rejoiner's own writer registered at its new life's start, and the rejoiner
+installs the survivor's image without an origin LIST. A barrier sampled
+before the crossing pends rather than conflicts.
+
+**Crash.** The dead life's tail is unknown, so the survivor takes the gap,
+serves from the origin, and rebuilds. Neither node knows more than the other,
+so the pair makes exactly one origin scan: whichever node builds, the other
+follows it and installs its image.
+
 ## Verification and rollout
 
 Default mode must retain zero Groupnet bootstrap writes and all existing
@@ -366,6 +413,15 @@ donor after its scan), one whose uncertain PUT's reconciliation is still open
 at its install, and an unreachable donor using native gossip and loopback
 TCP. They count actual origin request attempts and require bounded positive
 progress or fallback.
+`tests/fleet_production.rs` runs the production scenarios at production size
+and pace: two nodes gossiping on the in-memory transport, each on a
+one-worker runtime with the binary's recovery, claim and lease
+configuration, over a synthetic listing of 790,000 rows at 250 ms a page,
+merged with every object written through the proxy. A cold start makes one
+scan and the follower lists nothing; a planned rejoin lists nothing and the
+survivor takes no gap and no scan; a crash rejoin makes exactly one scan the
+other node follows; and a follower serving HEAD, GET, PUT and DELETE while it
+bootstraps installs with no LIST.
 The index unit tests cover each coverage clause, the covered and carried
 cases, and guarded publication refusal; Groupnet runtime tests cover capture
 retirement and its claim withdrawal. Partition, builder-death takeover,

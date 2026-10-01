@@ -17,6 +17,7 @@ mod copy;
 /// Cache configuration, proxy state, and core tier/index behavior.
 pub mod proxy;
 mod service;
+mod stop;
 
 #[cfg(test)]
 mod tests;

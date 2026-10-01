@@ -2,27 +2,27 @@
 
 mod common;
 
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use common::fleet::{
+    CAP, Counts, Pod, SERIAL_SCAN, fleet_config, free_tcp_port, pod_node, seed_rows,
+    serves_locally, trace_decisions,
+};
+use common::synthetic::synthetic_key;
 use common::{
     Origin, WarmDir, counter, delete, free_udp_port, get, gossip_node, head, list, list_entry,
-    proxy_over, proxy_over_with_metrics, put, put_conditional, request, synthetic_key,
-    wait_for_index, warm_proxy_over,
+    proxy_over, proxy_over_with_metrics, put, put_conditional, request, wait_for_index,
+    warm_proxy_over,
 };
-use futures::StreamExt;
-use groupnet::consistency::volatile_recovery::{RecoveryConfig, RecoveryStage};
+use groupnet::consistency::volatile_recovery::RecoveryConfig;
 use s3cache::cache::proxy::CachingProxy;
-use s3cache::index::ScanConfig;
 use s3cache::metrics::Metrics;
 use s3cache::sync::coherence::WriteSync;
-use s3cache::sync::fleet::config::FleetConfig;
 use s3s::S3;
 use s3s::dto::{ETag, ETagCondition, ListObjectsV2Input, Timestamp};
 
-const CAP: usize = 1024 * 1024;
 const READY_DEADLINE: Duration = Duration::from_secs(30);
 const JOIN_READ_DELAY: Duration = Duration::from_secs(8);
 const READ_VECTOR_DEADLINE: Duration = Duration::from_secs(10);
@@ -33,63 +33,6 @@ impl Drop for PausedListRelease {
     fn drop(&mut self) {
         self.0.release_paused_list();
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Counts {
-    list: u64,
-    get: u64,
-    head: u64,
-    successful_list: u64,
-    successful_get: u64,
-    successful_head: u64,
-    put: u64,
-    copy: u64,
-    delete: u64,
-}
-
-impl Counts {
-    fn take(origin: &Origin) -> Self {
-        Self {
-            list: origin.ops.list(),
-            get: origin.ops.get(),
-            head: origin.ops.head(),
-            successful_list: origin.ops.successful_list(),
-            successful_get: origin.ops.successful_get(),
-            successful_head: origin.ops.successful_head(),
-            put: origin.ops.put(),
-            copy: origin.ops.copy(),
-            delete: origin.ops.delete(),
-        }
-    }
-
-    fn since(self, before: Self) -> Self {
-        Self {
-            list: self.list - before.list,
-            get: self.get - before.get,
-            head: self.head - before.head,
-            successful_list: self.successful_list - before.successful_list,
-            successful_get: self.successful_get - before.successful_get,
-            successful_head: self.successful_head - before.successful_head,
-            put: self.put - before.put,
-            copy: self.copy - before.copy,
-            delete: self.delete - before.delete,
-        }
-    }
-
-    fn assert_no_writes(self) {
-        assert_eq!(self.put, 0, "fleet bootstrap wrote an origin object");
-        assert_eq!(self.copy, 0, "fleet bootstrap copied an origin object");
-        assert_eq!(self.delete, 0, "fleet bootstrap deleted an origin object");
-    }
-}
-
-fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("test TCP port")
-        .local_addr()
-        .expect("bound TCP port")
-        .port()
 }
 
 async fn mutual_alive(a: &WriteSync, a_name: &str, b: &WriteSync, b_name: &str) {
@@ -105,59 +48,12 @@ async fn mutual_alive(a: &WriteSync, a_name: &str, b: &WriteSync, b_name: &str) 
     .expect("both gossip views reach Alive before the healthy-donor join");
 }
 
-fn fleet_config(origin: &Origin, bucket: &str, name: &str, ports: &[(&str, u16)]) -> FleetConfig {
-    let port = ports
-        .iter()
-        .find_map(|(peer, port)| (*peer == name).then_some(*port))
-        .expect("node in the complete fleet address book");
-    fleet_config_bound(origin, bucket, name, port, ports)
-}
-
-/// `name` listens on `bind` but peers dial it at its `book` address, which a
-/// test relay may own.
-fn fleet_config_bound(
-    origin: &Origin,
-    bucket: &str,
-    name: &str,
-    bind: u16,
-    book: &[(&str, u16)],
-) -> FleetConfig {
-    let advertise = book
-        .iter()
-        .find_map(|(peer, port)| (*peer == name).then(|| format!("127.0.0.1:{port}")))
-        .expect("node in the complete fleet address book");
-    let book = book
-        .iter()
-        .map(|(peer, port)| format!("{peer}=127.0.0.1:{port}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    FleetConfig::parse(
-        Some(format!("127.0.0.1:{bind}")),
-        Some(advertise),
-        Some(book),
-        Some("minio-fleet-cost-fixture".to_owned()),
-        origin.counted_endpoint(),
-        "us-east-1",
-        name,
-        &[bucket.to_owned()],
-    )
-    .expect("valid explicit fleet configuration")
-    .expect("fleet opted in")
-}
-
 async fn ready(proxy: &CachingProxy, bucket: &str) -> Duration {
     ready_by(proxy, bucket, Instant::now() + READY_DEADLINE).await
 }
 
 async fn ready_by(proxy: &CachingProxy, bucket: &str, due: Instant) -> Duration {
     ready_all_by(&[proxy], bucket, due).await
-}
-
-fn serves_locally(proxy: &CachingProxy, bucket: &str) -> bool {
-    proxy
-        .recovery_status()
-        .is_some_and(|status| status.state.stage == RecoveryStage::Ready && status.may_serve)
-        && proxy.initially_ready(&[bucket.to_owned()])
 }
 
 async fn ready_all_by(nodes: &[&CachingProxy], bucket: &str, due: Instant) -> Duration {
@@ -1233,12 +1129,6 @@ async fn follower_keeps_an_open_reconciliation_across_the_install() {
     follower_serves_traffic_while_joining("fleet-uncertain", true).await;
 }
 
-/// Flat keys with one serial LIST chain: the scan is exactly `ceil(rows / 1000)`
-/// LIST pages, with no discovery requests, so a restarted scan is countable.
-const SERIAL_SCAN: ScanConfig = ScanConfig {
-    workers: 1,
-    discovery_budget: 0,
-};
 /// 12,345 rows are 13 LIST pages; at 1 s a page the scan takes about 13 s.
 const SLOW_ROWS: usize = 12_345;
 const SLOW_LIST: Duration = Duration::from_secs(1);
@@ -1257,15 +1147,6 @@ fn stall_bounds() -> RecoveryConfig {
         settle_ms: 3_000,
         poll_ms: 50,
     }
-}
-
-/// Seed `rows` flat keys straight into `MinIO`, concurrently and uncounted.
-async fn seed_rows(origin: &Origin, rows: usize) {
-    futures::stream::iter(0..rows)
-        .map(|n| async move { origin.seed(&format!("row-{n:07}"), b"x").await })
-        .buffer_unordered(64)
-        .collect::<()>()
-        .await;
 }
 
 fn indexed_rows(metrics: &Metrics) -> u64 {
@@ -1413,87 +1294,6 @@ const TRANSFER_LOAD: [u64; 3] = [500, 500, 10_000];
 struct Milestones {
     scanned: Option<Duration>,
     ready: Option<Duration>,
-}
-
-/// One node on a runtime of its own with one worker thread, as the binary's
-/// `#[tokio::main]` runs in a pod limited to one CPU.
-struct Pod(Option<tokio::runtime::Runtime>);
-
-impl Pod {
-    fn new(name: &str) -> Self {
-        Self(Some(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name(name)
-                .enable_all()
-                .build()
-                .expect("pod runtime"),
-        ))
-    }
-
-    fn handle(&self) -> tokio::runtime::Handle {
-        self.0.as_ref().expect("live pod runtime").handle().clone()
-    }
-
-    /// Hold the pod's only worker for `pause`: its timers, gossip and
-    /// bootstrap worker all run late, as on a throttled, overloaded node.
-    fn stall(&self, pause: Duration) {
-        drop(
-            self.handle()
-                .spawn(async move { std::thread::sleep(pause) }),
-        );
-    }
-}
-
-impl Drop for Pod {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.0.take() {
-            runtime.shutdown_background();
-        }
-    }
-}
-
-/// Build one fleet node on `pod`, so every task it spawns runs there. It
-/// listens for bulk transfers on `bind`; peers dial it at its `book` address.
-/// `None` keeps the binary's own recovery configuration.
-async fn pod_node(
-    pod: &Pod,
-    origin: &Arc<Origin>,
-    (name, udp, bind): (&str, u16, u16),
-    (peer, peer_udp): (&str, u16),
-    book: [(&'static str, u16); 2],
-    metrics: &Arc<Metrics>,
-    recovery: Option<RecoveryConfig>,
-) -> (Arc<WriteSync>, CachingProxy) {
-    let (origin, metrics) = (Arc::clone(origin), Arc::clone(metrics));
-    let (name, peer) = (name.to_owned(), peer.to_owned());
-    pod.handle()
-        .spawn(async move {
-            let sync = gossip_node(&name, udp, &[(peer.as_str(), peer_udp)]).await;
-            let proxy = proxy_over_with_metrics(
-                &origin.counted_client(),
-                CAP,
-                Some(Arc::clone(&sync)),
-                &metrics,
-            )
-            .with_index_scan(SERIAL_SCAN)
-            .with_fleet_config(fleet_config_bound(
-                &origin,
-                origin.bucket(),
-                &name,
-                bind,
-                &book,
-            ));
-            let proxy = match recovery {
-                Some(config) => proxy
-                    .with_recovery_config(config)
-                    .expect("finite paced recovery bounds"),
-                None => proxy,
-            };
-            (sync, proxy)
-        })
-        .await
-        .expect("pod node construction")
 }
 
 /// Record each node's first origin scan and first local service until both
@@ -1699,18 +1499,6 @@ async fn bulk_book(
     }
 }
 
-/// Print the fleet's info decisions, including transfer aborts and
-/// fallbacks, into the test output.
-fn trace_decisions() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "s3cache::sync::volatile=info".into()),
-        )
-        .with_test_writer()
-        .try_init();
-}
-
 /// Run one loaded, production-paced concurrent start of the pair `names`
 /// over `rows` synthetic rows and assert that only the builder listed, that
 /// its scan outlasted `min_build`, and that the follower installed its image.
@@ -1794,14 +1582,16 @@ async fn paced_concurrent_start(
     );
     let builder = usize::from(scans[1] == 1);
     let follower = 1 - builder;
-    // One recapture after the scan, and at most one paced retry if the load
-    // fails an attempt or lapses a lease; not one per suspicion and
-    // refutation, and not one per lapse: C holds the index lock for
-    // microseconds, so a capture no longer lapses the lease that retires it.
+    // One recapture after the scan, and at most one paced retry for a failed
+    // attempt or for each lease lapse the injected stalls cause; not one per
+    // suspicion and refutation. C holds the index lock for microseconds, so a
+    // capture does not lapse the lease itself, but a stall that does retires
+    // the capture, and its replacement waits out the backoff. The follower,
+    // which holds the builder's image under an unchanged membership, starts
+    // none.
     assert!(
-        recaptures[builder] <= 1 + PACED_RETRIES && recaptures[follower] == 0,
-        "the builder's Ready recapture is paced, not retried on every refutation or lapse: \
-         {report}"
+        recaptures[builder] <= 1 + lapses[builder].max(PACED_RETRIES) && recaptures[follower] == 0,
+        "the builder's Ready recapture is paced, not retried on every refutation: {report}"
     );
     let built = seen[builder].ready.expect("the builder served locally");
     assert!(

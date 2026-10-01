@@ -41,6 +41,8 @@ pub mod config;
 /// Durable, scoped control-source slots; not yet connected to serving or writes.
 pub mod control;
 pub mod fleet;
+/// Planned stop: lease retraction, the feed seal, and the survivors' renewal.
+pub mod stop;
 pub(crate) mod volatile;
 pub(crate) mod wire;
 

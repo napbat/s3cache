@@ -1,0 +1,97 @@
+//! The write path's half of a planned stop.
+//!
+//! A PUT's origin call and coherence tail run in a spawned task so that a client
+//! hanging up cannot strand an applied write outside the index. That same task
+//! outlives the HTTP drain: the connection is gone while the tail may still be
+//! about to publish. [`WriteTails`] counts those tasks, and
+//! [`CachingProxy::seal_writes`] seals the feed only once none is left — a seal
+//! promises the peers that this life publishes nothing more.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::watch;
+use tracing::warn;
+
+use crate::cache::proxy::CachingProxy;
+use crate::sync::stop::SealOutcome;
+
+/// The PUT tails still running on this node.
+#[derive(Clone)]
+pub(crate) struct WriteTails(Arc<watch::Sender<usize>>);
+
+impl Default for WriteTails {
+    fn default() -> Self {
+        Self(Arc::new(watch::Sender::new(0)))
+    }
+}
+
+/// One running tail; dropping it (the task finished, panicked, or was aborted)
+/// takes it off the count.
+pub(crate) struct TailGuard(Arc<watch::Sender<usize>>);
+
+impl Drop for TailGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|running| *running -= 1);
+    }
+}
+
+impl WriteTails {
+    /// Count a tail. Take it before the task is spawned, so no wait can observe
+    /// zero between the spawn and the task's first poll.
+    pub(crate) fn track(&self) -> TailGuard {
+        self.0.send_modify(|running| *running += 1);
+        TailGuard(Arc::clone(&self.0))
+    }
+
+    /// Whether every tail finished within `wait`.
+    async fn drained(&self, wait: Duration) -> bool {
+        let mut running = self.0.subscribe();
+        tokio::time::timeout(wait, running.wait_for(|running| *running == 0))
+            .await
+            .is_ok_and(|result| result.is_ok())
+    }
+}
+
+impl CachingProxy {
+    /// Seal this node's write feed for a planned stop, within `wait` in total.
+    ///
+    /// Call it only after the HTTP drain has completed, so no request can start a
+    /// write. It first waits for every PUT tail to finish, then seals and waits for
+    /// the peers to acknowledge the seal (see [`crate::sync::coherence::WriteSync::seal`]).
+    /// Returns `None` when nothing was sealed: no coherence is configured, or a tail
+    /// was still running at the deadline, in which case the restart stays an
+    /// ordinary gap for the peers — the only safe answer while a write may still
+    /// publish.
+    pub async fn seal_writes(&self, wait: Duration) -> Option<SealOutcome> {
+        let sync = self.sync.as_ref()?;
+        let started = Instant::now();
+        if !self.tails.drained(wait).await {
+            warn!("a PUT is still completing at the stop deadline; not sealing the write feed");
+            return None;
+        }
+        Some(sync.seal(wait.saturating_sub(started.elapsed())).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tails_drain_only_once_every_guard_is_gone() {
+        let tails = WriteTails::default();
+        assert!(tails.drained(Duration::ZERO).await, "no tail is running");
+        let first = tails.track();
+        let second = tails.track();
+        assert!(!tails.drained(Duration::from_millis(20)).await);
+        drop(first);
+        assert!(!tails.drained(Duration::from_millis(20)).await);
+        let waiting = tokio::spawn({
+            let tails = tails.clone();
+            async move { tails.drained(Duration::from_secs(5)).await }
+        });
+        drop(second);
+        assert!(waiting.await.unwrap(), "the last guard wakes the waiter");
+    }
+}

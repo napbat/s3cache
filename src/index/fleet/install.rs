@@ -16,7 +16,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use groupnet::core::volatile_bootstrap::journal::{
-    CutAlignment, Invalidation, NativeCut, align_cuts,
+    CutAlignment, CutDifference, Invalidation, NativeCut, align_cuts,
 };
 
 use crate::index::{IndexStats, KeyIndex, KeyIndexState, ObjEntry, account_replacement};
@@ -24,9 +24,10 @@ use crate::index::{IndexStats, KeyIndex, KeyIndexState, ObjEntry, account_replac
 /// Why a verified private stage cannot replace the live index now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InstallRefusal {
-    /// Live native positions differ from the barrier in either direction.
-    /// The stage is retained and a later barrier may align it.
-    Pending,
+    /// Live native positions differ from the barrier in either direction,
+    /// first at the named writer. The stage is retained and a later barrier
+    /// may align it.
+    Pending(Option<Box<CutPair>>),
     /// A structural difference, or a pair of versions no later barrier of
     /// this capture can order.
     Incompatible(Incompatibility),
@@ -39,13 +40,46 @@ impl InstallRefusal {
     }
 }
 
-/// The coverage clause that refused a stage, and the bucket and key it
-/// failed at where one is involved.
+/// One native writer's live and barrier positions, each `(epoch,
+/// sequence)` or `None` where that side holds no cut for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CutPair {
+    pub(crate) writer: String,
+    pub(crate) live: Option<(u64, u64)>,
+    pub(crate) barrier: Option<(u64, u64)>,
+}
+
+impl From<CutDifference<'_>> for CutPair {
+    fn from(difference: CutDifference<'_>) -> Self {
+        Self {
+            writer: String::from_utf8_lossy(difference.writer).into_owned(),
+            live: difference.live,
+            barrier: difference.covered,
+        }
+    }
+}
+
+impl fmt::Display for CutPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let side = |f: &mut fmt::Formatter<'_>, position: Option<(u64, u64)>| match position {
+            Some((epoch, sequence)) => write!(f, "epoch {epoch} sequence {sequence}"),
+            None => write!(f, "no cut"),
+        };
+        write!(f, "writer `{}`: live ", self.writer)?;
+        side(f, self.live)?;
+        write!(f, ", barrier ")?;
+        side(f, self.barrier)
+    }
+}
+
+/// The coverage clause that refused a stage, and the bucket and key, or the
+/// native writer, it failed at where one is involved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Incompatibility {
     pub(crate) clause: Clause,
     pub(crate) bucket: Option<String>,
     pub(crate) key: Option<String>,
+    pub(crate) cut: Option<Box<CutPair>>,
 }
 
 impl Incompatibility {
@@ -54,6 +88,7 @@ impl Incompatibility {
             clause,
             bucket: Some(bucket.to_owned()),
             key: Some(key.to_owned()),
+            cut: None,
         })
     }
 
@@ -62,6 +97,7 @@ impl Incompatibility {
             clause,
             bucket: Some(bucket.to_owned()),
             key: None,
+            cut: None,
         })
     }
 
@@ -70,6 +106,16 @@ impl Incompatibility {
             clause,
             bucket: None,
             key: None,
+            cut: None,
+        })
+    }
+
+    fn at_writer(clause: Clause, cut: Option<Box<CutPair>>) -> InstallRefusal {
+        InstallRefusal::Incompatible(Self {
+            clause,
+            bucket: None,
+            key: None,
+            cut,
         })
     }
 }
@@ -82,7 +128,8 @@ pub(crate) enum Clause {
     UniverseMismatch,
     /// A live bucket is being rebuilt by an origin scan.
     LiveRebuilding,
-    /// A live native writer's incarnation differs from the barrier's.
+    /// A live native writer's position cannot align with the barrier's, or
+    /// a cut list is not sorted by writer.
     CutConflict,
     /// A candidate bucket is not complete, or holds an unresolved key.
     CandidateUnsynced,
@@ -113,9 +160,13 @@ impl fmt::Display for Incompatibility {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self.clause)?;
         match (&self.bucket, &self.key) {
-            (Some(bucket), Some(key)) => write!(f, " at `{bucket}/{key}`"),
-            (Some(bucket), None) => write!(f, " in `{bucket}`"),
-            _ => Ok(()),
+            (Some(bucket), Some(key)) => write!(f, " at `{bucket}/{key}`")?,
+            (Some(bucket), None) => write!(f, " in `{bucket}`")?,
+            _ => {}
+        }
+        match &self.cut {
+            Some(cut) => write!(f, " for {cut}"),
+            None => Ok(()),
         }
     }
 }
@@ -243,15 +294,25 @@ fn check_candidate<'a>(
             return Err(Incompatibility::in_bucket(Clause::LiveRebuilding, name));
         }
     }
-    match align_cuts(
+    let alignment = align_cuts(
         live.native_cuts
             .iter()
             .map(|(writer, (epoch, sequence))| (writer.as_slice(), *epoch, *sequence)),
         cuts,
-    ) {
+    );
+    match alignment.verdict {
         CutAlignment::Exact => {}
-        CutAlignment::Pending => return Err(InstallRefusal::Pending),
-        CutAlignment::Conflict => return Err(Incompatibility::whole(Clause::CutConflict)),
+        CutAlignment::Pending => {
+            return Err(InstallRefusal::Pending(
+                alignment.deciding.map(|cut| Box::new(CutPair::from(cut))),
+            ));
+        }
+        CutAlignment::Conflict => {
+            return Err(Incompatibility::at_writer(
+                Clause::CutConflict,
+                alignment.deciding.map(|cut| Box::new(CutPair::from(cut))),
+            ));
+        }
     }
     for name in universe {
         let bucket = candidate
@@ -900,8 +961,9 @@ mod tests {
 
     /// A follower whose live feed is behind or ahead of the barrier keeps its
     /// stage for a later barrier; only the exact position installs, and the
-    /// follower keeps its own writer positions across the swap. A changed
-    /// writer incarnation refuses as a cut conflict.
+    /// follower keeps its own writer positions across the swap. Positions order
+    /// epoch-major, so a barrier in another writer life pends too: one side
+    /// still has to cross that restart, by a sealed renewal or by a gap.
     #[test]
     fn misaligned_native_positions_pend_without_consuming_the_stage() {
         let index = Arc::new(synced());
@@ -912,7 +974,8 @@ mod tests {
         };
         index.register_native_writer(&writer(2));
         let mut stage = Some(stage_of(&index));
-        for barrier in [writer(1), writer(3)] {
+        let other_life = |epoch| NativeCut { epoch, ..writer(2) };
+        for barrier in [writer(1), writer(3), other_life(3), other_life(5)] {
             assert_eq!(
                 index.install_fleet_candidate(
                     &mut stage,
@@ -920,18 +983,14 @@ mod tests {
                     &universe(),
                     1
                 ),
-                Err(InstallRefusal::Pending)
+                Err(InstallRefusal::Pending(Some(Box::new(CutPair {
+                    writer: "donor".to_owned(),
+                    live: Some((4, 2)),
+                    barrier: Some((barrier.epoch, barrier.sequence)),
+                }))))
             );
             assert!(stage.is_some());
         }
-        let changed = NativeCut {
-            epoch: 5,
-            ..writer(2)
-        };
-        assert_eq!(
-            index.install_fleet_candidate(&mut stage, &[changed], &universe(), 1),
-            Err(Incompatibility::whole(Clause::CutConflict))
-        );
         index
             .install_fleet_candidate(&mut stage, &[writer(2)], &universe(), 1)
             .unwrap();

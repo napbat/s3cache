@@ -153,7 +153,8 @@ impl FleetStatePort {
                     Ok(()) => {}
                     // Either side may still be applying the same feeds;
                     // Groupnet samples a later barrier for this stage.
-                    Err(InstallRefusal::Pending) => {
+                    Err(InstallRefusal::Pending(cut)) => {
+                        tracing::debug!(?cut, "fleet peer image pending native cuts");
                         return Ok(Some(
                             Self::event_charge(admission, false)?
                                 .hold(TransferEvent::NativePending { op }),
@@ -238,7 +239,8 @@ impl FleetStatePort {
                     }
                     // A live effect landed after the coverage check. Keep the
                     // stage; Groupnet samples a later barrier.
-                    Err(InstallRefusal::Pending) => {
+                    Err(InstallRefusal::Pending(cut)) => {
+                        tracing::debug!(?cut, "fleet peer image install pending native cuts");
                         return Ok(Some(
                             Self::event_charge(admission, false)?
                                 .hold(TransferEvent::NativePending { op }),

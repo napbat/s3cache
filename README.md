@@ -242,6 +242,15 @@ box is the long form):
   retracts its serve-lease before it drains, so there is no lapse to wait out. That is
   the write side only — the reader-side freeze above is unchanged either way, because
   the departing node's capability advertisement lives in every roster until the reap.
+- **A planned restart keeps the peers' index; a crash costs one origin scan.** After
+  its HTTP drain completes (10 s at most), a stopping node seals its write feed and
+  waits up to 5 s for peers to acknowledge the seal. A peer that saw it crosses the
+  restart without a gap (`feed_renewals`), and the returning node copies that peer's
+  index without an origin LIST. A crash, a drain that timed out, or a seal no peer saw
+  is an ordinary gap: the pair rebuilds with exactly one origin scan, which the other
+  node follows. Keep the pod's termination grace period (Helm
+  `availability.terminationGracePeriodSeconds`, default 30) above the 15 s the drain
+  and seal can take.
 - The absolute arbiter for conflicting writers remains the origin: conditional
   `If-Match`/`If-None-Match` writes pass through untouched (OCC — no lost updates,
   regardless of node), and the index heals from the origin (gap resync, startup

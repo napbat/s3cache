@@ -223,6 +223,7 @@ fn observe_group(
             grants_lease,
             old_nonlive: status != Status::Alive
                 && held >= (lease / 4).max(Duration::from_millis(25)),
+            renewal: sync.renewal_of(&node),
             node,
             grant,
             head,

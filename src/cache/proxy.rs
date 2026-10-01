@@ -383,6 +383,8 @@ pub struct CachingProxy {
     recovery_config: Option<groupnet::consistency::volatile_recovery::RecoveryConfig>,
     recovery_rearm: Option<groupnet::consistency::volatile_recovery::RecoveryRearm>,
     fleet: Option<crate::sync::fleet::config::FleetConfig>,
+    /// PUT tails still running, which a planned stop waits out before sealing.
+    pub(super) tails: super::stop::WriteTails,
     #[cfg(test)]
     pub(super) read_return_pause: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     pub(super) metrics: Arc<Metrics>,
@@ -426,6 +428,7 @@ impl CachingProxy {
             recovery_config: None,
             recovery_rearm: None,
             fleet: None,
+            tails: super::stop::WriteTails::default(),
             #[cfg(test)]
             read_return_pause: Arc::new(std::sync::Mutex::new(None)),
             metrics,
@@ -486,18 +489,25 @@ impl CachingProxy {
     /// Peer events update the LIST index and invalidate hot bodies. A gap, or
     /// an unprovable strong serve-lease lapse, closes local serving and starts
     /// a guarded origin rebuild. A no-op without gossip; the single-node
-    /// background warm-up remains separate.
+    /// background warm-up remains separate. This node's feed life is announced
+    /// first, so peers settle its restart (renewal or gap) without waiting for
+    /// its first write.
     pub fn start_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
+        let announcing = Arc::clone(sync);
+        tokio::spawn(async move { announcing.announce().await });
         sync.open_recovery(self.recovery_inputs(buckets));
         self.start_coherence_apply(sync);
     }
 
     /// Bind the optional TCP data plane before the recovery worker and native
     /// feed applier start. A failed bind opens ordinary guarded origin
-    /// recovery, leaving no peer-ready claim or origin control object.
+    /// recovery, leaving no peer-ready claim or origin control object. The feed
+    /// life is announced before recovery opens, as in
+    /// [`start_coherence`](Self::start_coherence).
     pub async fn start_fleet_coherence(&self, buckets: &[String]) {
         let Some(sync) = &self.sync else { return };
+        sync.announce().await;
         sync.open_fleet_recovery(self.recovery_inputs(buckets))
             .await;
         self.start_coherence_apply(sync);

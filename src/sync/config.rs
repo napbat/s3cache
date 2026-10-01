@@ -3,6 +3,7 @@ use std::time::Duration;
 use groupnet::consistency::LeaseConfig;
 use groupnet::core::{Config, NodeId};
 use groupnet::runtime::Node;
+use groupnet::transport::Transport;
 use groupnet::transport::udp::UdpTransport;
 use tracing::{info, warn};
 
@@ -105,19 +106,12 @@ impl WriteSync {
                 return None;
             }
         };
-        let lease = LeaseConfig::for_duration(Duration::from_millis(cfg.lease_ms));
-        debug_assert!(
-            lease.validate().is_ok(),
-            "S3CACHE_LEASE_MS outside the lease tier's envelope: {:?}",
-            lease.validate()
-        );
+        let lease = lease_config(cfg.lease_ms);
         let advertise = cfg
             .advertise
             .or_else(|| transport.local_addr().ok().map(|addr| addr.to_string()));
-        let mut builder = Node::builder(me.clone(), transport.clone()).config(Config {
-            dead_timeout_ms: cfg.lease_ms.max(DEAD_TIMEOUT_FLOOR_MS),
-            ..Config::default()
-        });
+        let mut builder =
+            Node::builder(me.clone(), transport.clone()).config(gossip_config(cfg.lease_ms));
         if let Some(advertise) = advertise {
             builder = builder.advertise_addr(advertise);
         }
@@ -162,9 +156,58 @@ impl WriteSync {
             me,
             cfg.consistency,
             lease,
-            Some(node),
+            Some(Box::new(node)),
         ))
     }
+
+    /// Join the cluster group as `node_id` over an already-built groupnet
+    /// `transport`, seeded with `seeds`, with exactly the membership tuning and
+    /// coherence lease [`WriteSync::new`] runs. `new` is this over UDP plus seed
+    /// address resolution; any other transport (the in-memory one, for a whole
+    /// fleet in one process) resolves its own peers.
+    ///
+    /// # Panics
+    /// Outside a Tokio runtime: the node spawns its tasks here.
+    pub fn over_transport<T: Transport>(
+        transport: T,
+        node_id: &str,
+        seeds: &[&str],
+        consistency: Consistency,
+        lease_ms: u64,
+    ) -> Self {
+        let me = NodeId::new(node_id);
+        let mut builder = Node::builder(me.clone(), transport).config(gossip_config(lease_ms));
+        for seed in seeds.iter().filter(|seed| **seed != node_id) {
+            builder = builder.seed(NodeId::new(*seed));
+        }
+        let node = builder.spawn();
+        let group = node.join_group("s3cache");
+        WriteSync::attach(
+            group,
+            me,
+            consistency,
+            lease_config(lease_ms),
+            Some(Box::new(node)),
+        )
+    }
+}
+
+/// The one tuned membership knob (see [`WriteSync::new`]).
+fn gossip_config(lease_ms: u64) -> Config {
+    Config {
+        dead_timeout_ms: lease_ms.max(DEAD_TIMEOUT_FLOOR_MS),
+        ..Config::default()
+    }
+}
+
+fn lease_config(lease_ms: u64) -> LeaseConfig {
+    let lease = LeaseConfig::for_duration(Duration::from_millis(lease_ms));
+    debug_assert!(
+        lease.validate().is_ok(),
+        "S3CACHE_LEASE_MS outside the lease tier's envelope: {:?}",
+        lease.validate()
+    );
+    lease
 }
 
 /// Build the gossip node and write feed from `S3CACHE_GOSSIP_*`, or `None`

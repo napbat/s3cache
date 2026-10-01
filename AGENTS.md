@@ -215,4 +215,11 @@ feed-frontier proof before falling back to a guarded origin scan. Groupnet's
 retry, and affirmation rules. The S3 adapter never treats a volatile feed as a
 durable source cursor. `LocalCache::flush` remains an escape hatch; no recovery path
 calls it. A planned stop calls `WriteSync::leave` from the binary's signal path so
-peers do not wait out a lease of a pod that is leaving on purpose.
+peers do not wait out a lease of a pod that is leaving on purpose, and after a
+completed drain seals the write feed (`CachingProxy::seal_writes`, `sync::stop`): the
+seal waits out every PUT tail (`cache::stop`), then promises peers this life publishes
+nothing more, so a peer that delivered it crosses the restart with
+`PeerWrite::Renewed` (`feed_renewals`) instead of a gap and keeps its index. Any
+other restart stays a gap. Never publish after the seal (it panics), and never seal
+while a request or PUT tail can still publish. `tests/fleet_production.rs` holds the
+production-sized cold-start, planned/crash rejoin and serving-follower scenarios.

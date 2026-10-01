@@ -2,15 +2,16 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use groupnet::consistency::volatile_recovery::{RecoveryError, RecoveryHandle, RecoveryStatus};
+use groupnet::consistency::volatile_recovery::{
+    RecoveryError, RecoveryHandle, RecoveryStatus, Renewal,
+};
 use groupnet::consistency::{
     AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, LeaseConfig, LeaseView, Leases,
     PeerWrite, PeerWrites, RenewalId, WriteFeed, WriteToken, advertised_head, applied_by_selected,
 };
 use groupnet::core::volatile_bootstrap::journal::NativeCut;
 use groupnet::core::{NodeId, Status};
-use groupnet::runtime::{Group, Node};
-use groupnet::transport::udp::UdpTransport;
+use groupnet::runtime::Group;
 use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
@@ -31,13 +32,18 @@ use crate::tier::LocalCache;
 /// of per-event application.
 pub(super) const FEED_CAPACITY: usize = 4096;
 
-fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: IndexEvent) {
-    let ts = from_micros(event.ts_us);
-    let cut = NativeCut {
+/// A peer feed position as the index's native writer cut.
+pub(super) fn native_cut(peer: &NodeId, token: WriteToken) -> NativeCut {
+    NativeCut {
         writer: peer.as_str().as_bytes().to_vec(),
         epoch: token.epoch,
         sequence: token.seq,
-    };
+    }
+}
+
+fn apply_feed_index(state: &KeyIndex, peer: &NodeId, token: WriteToken, event: IndexEvent) {
+    let ts = from_micros(event.ts_us);
+    let cut = native_cut(peer, token);
     match event.op {
         IndexOp::Put {
             size,
@@ -140,7 +146,7 @@ impl Consistency {
     /// [`AckLedger`] and waits on other participants' watermarks. Exhaustive
     /// on purpose: a mode added later has to answer this question rather than
     /// inherit an answer from a `!= Bounded`.
-    fn acks(self) -> bool {
+    pub(super) fn acks(self) -> bool {
         match self {
             Self::Strong | Self::StrongAcks => true,
             Self::Bounded => false,
@@ -348,7 +354,7 @@ impl WriteWait {
 
 /// The publishing half of the write feed, plus the barrier view.
 pub struct WriteSync {
-    feed: WriteFeed<IndexEvent>,
+    pub(super) feed: WriteFeed<IndexEvent>,
     pub(super) group: Group,
     pub(super) me: NodeId,
     pub(super) consistency: Consistency,
@@ -364,6 +370,10 @@ pub struct WriteSync {
     /// `strong` mode, and a lock-free borrow plus one compare per request.
     lease_view: Option<LeaseView>,
     recovery: OnceLock<RecoveryHandle<CacheRecoveryAdapter>>,
+    /// Each peer's latest restart this node crossed through a delivered seal, cleared
+    /// by any later gap: the volatile recovery's evidence that a head which left its
+    /// life is a progression (see [`observe_renewal`](Self::observe_renewal)).
+    pub(super) renewals: std::sync::Mutex<std::collections::HashMap<NodeId, Renewal>>,
     /// The peer-bootstrap TCP listener lives with this exact recovery handle; a
     /// dropped node cannot keep accepting requests for a retired claim.
     pub(crate) fleet_listener: OnceLock<crate::sync::volatile::fleet::FleetListenerGuard>,
@@ -371,8 +381,9 @@ pub struct WriteSync {
     /// silent holder's lapse can take) plus [`WRITE_WAIT_SLACK`].
     write_wait: Duration,
     /// Keeps the gossip node (receive loop, group actors) alive for the
-    /// process lifetime. `None` when a test drives a raw group directly.
-    _node: Option<Node<UdpTransport>>,
+    /// process lifetime, whatever its transport. `None` when a test drives a raw
+    /// group directly.
+    _node: Option<Box<dyn Send + Sync>>,
 }
 
 impl WriteSync {
@@ -397,7 +408,7 @@ impl WriteSync {
         me: NodeId,
         consistency: Consistency,
         lease: LeaseConfig,
-        node: Option<Node<UdpTransport>>,
+        node: Option<Box<dyn Send + Sync>>,
     ) -> Self {
         debug_assert!(
             lease.validate().is_ok(),
@@ -420,6 +431,7 @@ impl WriteSync {
             leases,
             lease_view: lease_view.clone(),
             recovery: OnceLock::new(),
+            renewals: std::sync::Mutex::default(),
             fleet_listener: OnceLock::new(),
             write_wait: lease.duration + WRITE_WAIT_SLACK,
             _node: node,
@@ -556,40 +568,6 @@ impl WriteSync {
             .as_ref()
             .map(Leases::holders)
             .unwrap_or_default()
-    }
-
-    /// Retract this node's serve-lease: the graceful counterpart to the process dying,
-    /// for a stop that was planned (`SIGTERM` from a rolling deploy, a scale-in, an
-    /// operator's `ctrl_c`).
-    ///
-    /// A dropped lease set deliberately leaves the `~lease` entry behind, because a
-    /// crash must cost a writer the lapse this tier is built on. A planned stop is the
-    /// one case where that bound is pure waste: this node is going away on purpose and
-    /// will serve nothing, so retracting the entry spares every peer's *first* write
-    /// after the stop the up-to-`D` wait it would otherwise spend proving what this
-    /// node already knows.
-    ///
-    /// It does **not** shorten the reader-side freeze, and must not be sold as if it
-    /// did: this node's `~caps` advertisement lives in every peer's roster until
-    /// membership reaps it, so every other reader's confirmation stays frozen for the
-    /// reap horizon exactly as it would after a crash. That half is `watch_lapses`'
-    /// business — it ends the freeze with a remediation, not with a shorter wait — and
-    /// the two are complements: `leave` is the write side, the watcher is the read side.
-    ///
-    /// A no-op in every mode but `strong`, and never an error: a rejected retraction
-    /// (a full actor inbox on the way out) just means the entry expires by TTL instead,
-    /// which is where it started.
-    pub fn leave(&self) {
-        let Some(leases) = &self.leases else {
-            return;
-        };
-        match leases.leave() {
-            Ok(()) => info!("retracted this node's serve-lease for a planned stop"),
-            Err(error) => warn!(
-                "could not retract this node's serve-lease ({error}); a peer's first \
-                 write after this stop waits it out instead"
-            ),
-        }
     }
 
     /// Index this node's own put and advertise it to peers: everything the entry
@@ -910,6 +888,24 @@ impl WriteSync {
             while let Some(event) = peers.next().await {
                 let Some(sync) = weak.upgrade() else { return };
                 match event {
+                    PeerWrite::Sealed { peer, token } => {
+                        state.note_native_seal(native_cut(&peer, token));
+                        frontier.advance(&peer, token);
+                        if let Some(ledger) = &ledger {
+                            ledger.record(&peer, token).await;
+                        }
+                    }
+                    PeerWrite::Renewed {
+                        peer,
+                        sealed,
+                        epoch,
+                    } => {
+                        let start = sync.observe_renewal(&state, &peer, sealed, epoch, &metrics);
+                        frontier.advance(&peer, start);
+                        if let Some(ledger) = &ledger {
+                            ledger.record(&peer, start).await;
+                        }
+                    }
                     PeerWrite::Wrote {
                         peer,
                         token,
@@ -942,6 +938,8 @@ impl WriteSync {
                         missed_through,
                     } => {
                         warn!("write-feed gap from `{peer}`: distrusting bodies, resyncing index");
+                        sync.forget_renewal(&peer);
+                        state.skip_native_gap(&native_cut(&peer, missed_through));
                         // The public signal fences serving before returning; the
                         // recovery worker distrusts bodies and guards every origin
                         // scan page with that exact operation's permit. Frontier

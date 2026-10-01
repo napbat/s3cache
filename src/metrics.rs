@@ -264,6 +264,9 @@ counters! {
     feed_applied => feed_applied,
     /// Record a feed gap (missed writes): every local body distrusted, index resynced.
     feed_gaps => feed_gap,
+    /// Record a peer's planned restart crossed without a gap: its previous life was
+    /// delivered through its seal, so nothing was missed and nothing is remediated.
+    feed_renewals => feed_renewal,
     /// Record a write that ended with **no** coherence guarantee: peers still live and
     /// still behind when the wait's deadline passed. In `strong` that is the lease
     /// tier's one unbounded shape — a holder renewing but not applying, whose remedy is

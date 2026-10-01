@@ -24,7 +24,9 @@
 #![allow(dead_code)] // each test binary drives a different subset of the harness
 
 pub mod diff;
+pub mod fleet;
 mod response_pause;
+pub mod synthetic;
 
 use bytes::Bytes;
 use http::{Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -44,7 +46,6 @@ use s3s::dto::{
     HeadObjectOutput, ListObjectsV2Input, PutObjectInput, Range, StreamingBlob,
 };
 use s3s::{S3, S3Request, S3Result};
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -301,6 +302,9 @@ struct Interference {
     /// Rows of the synthetic listing that answers bucket LISTs; zero forwards
     /// them to `MinIO`.
     synthetic_rows: AtomicUsize,
+    /// What tests wrote and deleted through the forwarder, merged into the
+    /// synthetic listing.
+    overlay: synthetic::Overlay,
 }
 
 impl Origin {
@@ -379,10 +383,11 @@ impl Origin {
     }
 
     /// Answer every bucket LIST from a synthetic listing of `rows` keys
-    /// ([`synthetic_key`]) instead of `MinIO`, still counted. It stands in for a
+    /// ([`synthetic::synthetic_key`]) instead of `MinIO`, still counted. It stands in for a
     /// production-sized bucket whose objects would take far too long to PUT
-    /// one at a time. Only LIST sees these rows: their bodies do not exist,
-    /// so a test must never GET or HEAD them.
+    /// one at a time. Objects written or deleted through the forwarder from here on
+    /// are merged into it, so a scan still sees what a client wrote; the
+    /// synthetic rows' bodies do not exist, so a test must never GET or HEAD them.
     pub fn serve_synthetic_listing(&self, rows: usize) {
         self.interference
             .synthetic_rows
@@ -629,6 +634,7 @@ async fn forward(
         head_pause,
         head_pause_key,
         synthetic_rows,
+        overlay,
     } = interference;
     let faulted = put_fault.claim(&req);
     let path = req.uri().path().trim_start_matches('/');
@@ -661,9 +667,20 @@ async fn forward(
     if req.method() == Method::GET && !on_key && synthetic > 0 {
         let query = req.uri().query().unwrap_or_default();
         if query.split('&').any(|pair| pair == "list-type=2") {
-            return synthetic_list(path, query, synthetic);
+            return overlay.list(path, query, synthetic);
         }
     }
+    // A single-object write the synthetic listing has to reflect.
+    let written = (synthetic > 0 && on_key).then(|| {
+        (
+            req.method().clone(),
+            path.split_once('/')
+                .map(|(_, key)| key.to_owned())
+                .unwrap_or_default(),
+            req.uri().query().unwrap_or_default().to_owned(),
+            req.headers().clone(),
+        )
+    });
     match relay(upstream, req).await {
         Ok(resp) if faulted && resp.status().is_success() => {
             put_fault.origin_applied();
@@ -681,6 +698,11 @@ async fn forward(
                 .expect("an injected 500 is well-formed")
         }
         Ok(resp) => {
+            if let Some((method, key, query, request)) = &written
+                && resp.status().is_success()
+            {
+                overlay.observe(method, key, query, request, resp.headers());
+            }
             if held_list {
                 list_pause.hold().await;
             }
@@ -703,37 +725,6 @@ async fn forward(
     }
 }
 
-/// Key `n` of a synthetic listing. Fixed width, so lexicographic order is
-/// numeric order, and as long as a production document key, so a synthetic
-/// row encodes to about the measured production image row.
-#[must_use]
-pub fn synthetic_key(n: usize) -> String {
-    format!("tenants/acme/documents/{n:08}/{:032x}.json", mix(n, 1))
-}
-
-/// The `ETag` a synthetic listing reports for key `n`, quoted as on the wire.
-#[must_use]
-pub fn synthetic_etag(n: usize) -> String {
-    format!("\"{:032x}\"", mix(n, 2))
-}
-
-fn synthetic_size(n: usize) -> u64 {
-    1_024 + u64::try_from(n % 65_536).expect("small size")
-}
-
-/// A fixed 128-bit mix of `n`: realistic, uncorrelated hex for keys and tags.
-fn mix(n: usize, lane: u64) -> u128 {
-    let mut z = u64::try_from(n).expect("row fits u64") ^ lane.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut next = || {
-        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut x = z;
-        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        x ^ (x >> 31)
-    };
-    (u128::from(next()) << 64) | u128::from(next())
-}
-
 fn percent_decoded(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -749,88 +740,6 @@ fn percent_decoded(value: &str) -> String {
         }
     }
     String::from_utf8(out).expect("UTF-8 query value")
-}
-
-/// One `ListObjectsV2` page of the synthetic listing. The continuation token is
-/// the next row's number; `start-after` finds its row by binary search.
-/// Prefix and delimiter listings are not modelled and fail loudly.
-fn synthetic_list(
-    bucket: &str,
-    query: &str,
-    rows: usize,
-) -> Response<BoxBody<Bytes, std::io::Error>> {
-    let mut from = 0;
-    let mut max_keys = 1_000;
-    let mut token = None;
-    for pair in query.split('&') {
-        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match name {
-            "max-keys" => max_keys = value.parse::<usize>().expect("max-keys").clamp(1, 1_000),
-            "continuation-token" => {
-                from = value.parse().expect("a synthetic continuation token");
-                token = Some(value.to_owned());
-            }
-            "start-after" => {
-                let after = percent_decoded(value);
-                let (mut low, mut high) = (0, rows);
-                while low < high {
-                    let mid = low + (high - low) / 2;
-                    if synthetic_key(mid) <= after {
-                        low = mid + 1;
-                    } else {
-                        high = mid;
-                    }
-                }
-                from = low;
-            }
-            "prefix" | "delimiter" if !value.is_empty() => {
-                return Response::builder()
-                    .status(StatusCode::NOT_IMPLEMENTED)
-                    .body(
-                        Full::new(Bytes::from_static(b"synthetic listing: no prefix scans"))
-                            .map_err(|never| match never {})
-                            .boxed(),
-                    )
-                    .expect("a 501 is well-formed");
-            }
-            _ => {}
-        }
-    }
-    let end = from.saturating_add(max_keys).min(rows);
-    let truncated = end < rows;
-    let mut xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult \
-         xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{bucket}</Name><Prefix></Prefix>\
-         <KeyCount>{}</KeyCount><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
-        end.saturating_sub(from),
-    );
-    if let Some(token) = token {
-        write!(xml, "<ContinuationToken>{token}</ContinuationToken>").expect("to a String");
-    }
-    if truncated {
-        write!(xml, "<NextContinuationToken>{end}</NextContinuationToken>").expect("to a String");
-    }
-    for n in from..end {
-        write!(
-            xml,
-            "<Contents><Key>{}</Key><LastModified>2026-09-30T00:00:00.000Z</LastModified>\
-             <ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
-            synthetic_key(n),
-            synthetic_etag(n).replace('"', "&quot;"),
-            synthetic_size(n),
-        )
-        .expect("to a String");
-    }
-    xml.push_str("</ListBucketResult>");
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/xml")
-        .body(
-            Full::new(Bytes::from(xml))
-                .map_err(|never| match never {})
-                .boxed(),
-        )
-        .expect("a synthetic LIST page is well-formed")
 }
 
 async fn relay(

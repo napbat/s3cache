@@ -174,6 +174,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     cp.spawn_background_sync(cfg.buckets.clone());
     metrics::spawn_stats(cp.metrics(), cfg.stats_secs);
     let readiness = spawn_readiness(&cp, &cfg).await?;
+    // Kept for the shutdown path too: a drained stop seals the write feed through it.
+    let stopping_proxy = cp.clone();
 
     let service = {
         let mut b = S3ServiceBuilder::new(cp);
@@ -222,12 +224,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         sync.leave();
     }
 
-    tokio::select! {
-        () = graceful.shutdown() => info!("graceful shutdown complete"),
-        () = tokio::time::sleep(std::time::Duration::from_secs(10)) => info!("shutdown timed out"),
+    let drained = tokio::select! {
+        () = graceful.shutdown() => {
+            info!("graceful shutdown complete");
+            true
+        }
+        () = tokio::time::sleep(DRAIN_WAIT) => {
+            info!("shutdown timed out");
+            false
+        }
+    };
+    // Seal only a drained stop. A request still running could publish after the
+    // seal, and the seal would promise peers a tail this life did not end at; the
+    // restart then stays an ordinary gap, which is always safe.
+    if drained {
+        stopping_proxy.seal_writes(SEAL_WAIT).await;
+    } else {
+        warn!("requests were still running at the drain deadline; not sealing the write feed");
     }
     Ok(())
 }
+
+/// How long a planned stop lets in-flight requests finish.
+const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a drained stop waits for PUT tails and for peers to acknowledge the feed
+/// seal. With [`DRAIN_WAIT`] it must fit inside the pod's termination grace period
+/// (the Helm chart's `terminationGracePeriodSeconds`).
+const SEAL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Resolves on the first signal that means "stop": `SIGTERM` or `ctrl_c`.
 ///

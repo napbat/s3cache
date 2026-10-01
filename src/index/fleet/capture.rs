@@ -670,6 +670,81 @@ mod tests {
         });
     }
 
+    fn peer_at(epoch: u64, sequence: u64) -> NativeCut {
+        NativeCut {
+            writer: b"peer".to_vec(),
+            epoch,
+            sequence,
+        }
+    }
+
+    /// A peer's delivered seal and its renewal into the next life reach an open
+    /// capture as the exact continuation of the peer's cut, so the capture
+    /// stays a candidate and the new life's writes continue it.
+    #[test]
+    fn a_delivered_seal_and_renewal_carry_a_peer_across_its_restart() {
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        index.register_native_writer(&peer_at(3, 1));
+        let budget = admission();
+        let pending = pending(&index, &budget, 1);
+        index.note_native_seal(peer_at(3, 2));
+        index.renew_native_writer(&peer_at(3, 2), 4);
+        crate::index::apply_put_native(&index, "bucket", "new-life", object(2), peer_at(4, 1));
+        pending.ingress.with_journal(|journal| {
+            assert_eq!(journal.image_cuts(), &[peer_at(3, 1)]);
+            assert_eq!(journal.covered_cuts(), &[peer_at(4, 1)]);
+            assert_eq!(journal.invalidation(), None);
+            assert_eq!(journal.state(), JournalState::Capturing);
+        });
+        assert_eq!(
+            index.inner.read().unwrap().native_cuts[b"peer".as_slice()],
+            (4, 1)
+        );
+    }
+
+    /// A renewal that does not continue the cut from its delivered seal is a
+    /// restart the capture cannot cover: it withdraws, while the live index
+    /// still moves the writer into its new life so later writes stay contiguous.
+    #[test]
+    fn a_renewal_without_its_seal_withdraws_the_capture() {
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        index.register_native_writer(&peer_at(3, 1));
+        let budget = admission();
+        let pending = pending(&index, &budget, 1);
+        index.renew_native_writer(&peer_at(3, 2), 4);
+        pending.ingress.with_journal(|journal| {
+            assert_eq!(journal.invalidation(), Some(Invalidation::Gap));
+        });
+        assert_eq!(
+            index.inner.read().unwrap().native_cuts[b"peer".as_slice()],
+            (4, 0)
+        );
+    }
+
+    /// A gap over a peer's crashed life moves its cut to where the missed
+    /// span ends, so an image that covers the peer's new life from there
+    /// aligns; the open capture, which cannot carry the missed writes,
+    /// withdraws. A stale gap behind the cut moves nothing.
+    #[test]
+    fn a_gap_moves_the_cut_past_the_missed_life_and_withdraws_the_capture() {
+        let index = Arc::new(KeyIndex::default());
+        index.mark_bucket_synced("bucket");
+        index.register_native_writer(&peer_at(3, 4));
+        let budget = admission();
+        let pending = pending(&index, &budget, 1);
+        index.skip_native_gap(&peer_at(5, 0));
+        pending.ingress.with_journal(|journal| {
+            assert_eq!(journal.invalidation(), Some(Invalidation::Gap));
+        });
+        index.skip_native_gap(&peer_at(3, 9));
+        assert_eq!(
+            index.inner.read().unwrap().native_cuts[b"peer".as_slice()],
+            (5, 0)
+        );
+    }
+
     #[test]
     fn cancelled_capture_cannot_finish_or_retain_a_publication_sink() {
         let index = Arc::new(KeyIndex::default());

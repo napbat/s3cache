@@ -206,9 +206,11 @@ impl s3s::S3 for CachingProxy {
         // client times out. Once the mutation starts, its origin result and coherence tail
         // must outlive that future or an applied write can leave the local index behind.
         let worker = self.clone();
+        let tail_guard = self.tails.track();
         let reconcile_bucket = bucket.clone();
         let reconcile_key = key.clone();
         let tail = tokio::spawn(async move {
+            let _tail_guard = tail_guard;
             let mut resp = match worker.inner.put_object(req).await {
                 Ok(resp) => resp,
                 Err(error) => {
