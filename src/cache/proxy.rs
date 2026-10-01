@@ -385,6 +385,8 @@ pub struct CachingProxy {
     fleet: Option<crate::sync::fleet::config::FleetConfig>,
     /// PUT tails still running, which a planned stop waits out before sealing.
     pub(super) tails: super::stop::WriteTails,
+    /// The `/index-ready` latch (see [`index_ready`](Self::index_ready)).
+    pub(super) index_ready: super::readiness::IndexReady,
     #[cfg(test)]
     pub(super) read_return_pause: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
     pub(super) metrics: Arc<Metrics>,
@@ -431,6 +433,7 @@ impl CachingProxy {
             recovery_rearm: None,
             fleet: None,
             tails: super::stop::WriteTails::default(),
+            index_ready: super::readiness::IndexReady::default(),
             #[cfg(test)]
             read_return_pause: Arc::new(std::sync::Mutex::new(None)),
             metrics,
@@ -500,6 +503,7 @@ impl CachingProxy {
         tokio::spawn(async move { announcing.announce().await });
         sync.open_recovery(self.recovery_inputs(buckets));
         self.start_coherence_apply(sync);
+        self.watch_index_ready(buckets);
     }
 
     /// Bind the optional TCP data plane before the recovery worker and native
@@ -513,6 +517,7 @@ impl CachingProxy {
         sync.open_fleet_recovery(self.recovery_inputs(buckets))
             .await;
         self.start_coherence_apply(sync);
+        self.watch_index_ready(buckets);
     }
 
     fn recovery_inputs(&self, buckets: &[String]) -> crate::sync::volatile::RecoveryInputs {
@@ -863,6 +868,7 @@ impl CachingProxy {
             }
             return;
         }
+        self.watch_index_ready(&buckets);
         let full_sync = self.full_sync_owner.claim();
         let index_scan = self.index_scan;
         for bucket in buckets {

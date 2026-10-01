@@ -17,6 +17,7 @@ mod copy;
 mod origin;
 /// Cache configuration, proxy state, and core tier/index behavior.
 pub mod proxy;
+mod readiness;
 mod service;
 mod stop;
 

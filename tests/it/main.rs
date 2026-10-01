@@ -15,6 +15,7 @@ mod idle_origin;
 mod metrics_endpoint;
 mod no_control_writes;
 mod origin_requests;
+mod readiness_probe;
 mod startup;
 mod startup_readiness;
 mod tier_cache;

@@ -12,7 +12,8 @@ spec:
   serviceName: s3cache-gossip
   podManagementPolicy: Parallel
   # A new ordinal must remain ready before a rolling update advances to the next
-  # one. This gives the Service and gossip feed a stable overlap window.
+  # one. With the metrics listener, ready means the pod holds an index or no live
+  # peer does, so the rollout cannot stop the last index-holding pod first.
   minReadySeconds: {{ .Values.availability.minReadySeconds | int64 }}
   selector:
     matchLabels:
@@ -146,25 +147,34 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.auth.existingSecret }}
-          # Admit cold pods once their S3 listener can forward to the origin.
-          # Index completion has a separate /index-ready diagnostic endpoint.
-          # A slow origin sync must not remove all pods from the Service.
+          # The S3 listener binds only after the warm tier opens and gossip and peer
+          # recovery start, which takes tens of seconds. Liveness and readiness wait
+          # for it instead of failing against a closed port.
+          startupProbe:
+            tcpSocket:
+              port: s3
+            periodSeconds: {{ .Values.availability.startupProbe.periodSeconds | int64 }}
+            failureThreshold: {{ .Values.availability.startupProbe.failureThreshold | int64 }}
+          # GET /ready admits a pod that holds an index, and a cold pod while no
+          # live peer holds one: a cold fleet stays in the Service, forwarding to
+          # the origin while one pod builds, and a replacement beside an index
+          # holder stays out of it, holding the rollout, until it has an index.
+          # /index-ready is the separate diagnostic of this pod's own index.
           readinessProbe:
             {{- if .Values.metrics.enabled }}
             httpGet:
               path: /ready
               port: metrics
             {{- else }}
-            # Without the metrics listener, startup readiness is only a TCP check.
+            # Without the metrics listener, readiness is only a TCP check, and a
+            # rollout does not wait for indexes.
             tcpSocket:
               port: s3
             {{- end }}
-            initialDelaySeconds: 3
-            periodSeconds: 10
+            periodSeconds: {{ .Values.availability.readinessPeriodSeconds | int64 }}
           livenessProbe:
             tcpSocket:
               port: s3
-            initialDelaySeconds: 10
             periodSeconds: 30
           resources: {{- toYaml .Values.resources | nindent 12 }}
           {{- if .Values.diskCache.enabled }}

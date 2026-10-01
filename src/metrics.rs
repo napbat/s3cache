@@ -3,7 +3,7 @@
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -19,36 +19,14 @@ use tracing::info;
 
 use crate::index::{IndexStats, KeyIndex};
 
-/// Listener readiness and initial index completion are separate states.
-/// A listening cold proxy can forward requests while its index warms.
-#[derive(Default)]
-pub struct StartupReady {
-    serving: AtomicBool,
-    indexed: AtomicBool,
-}
+/// What the metrics listener's readiness routes report.
+/// [`CachingProxy`](crate::cache::proxy::CachingProxy) is the binary's source.
+pub trait Readiness: Send + Sync + 'static {
+    /// `GET /ready`: the predicate the pod's readiness probe serves.
+    fn probe_ready(&self) -> bool;
 
-impl StartupReady {
-    /// Mark the S3 listener ready to accept requests.
-    pub fn mark_ready(&self) {
-        self.serving.store(true, Ordering::Release);
-    }
-
-    /// Whether the S3 listener can accept requests, including cold requests.
-    #[must_use]
-    pub fn is_ready(&self) -> bool {
-        self.serving.load(Ordering::Acquire)
-    }
-
-    /// Record completion of the initial index and coherence warm-up.
-    pub fn mark_index_ready(&self) {
-        self.indexed.store(true, Ordering::Release);
-    }
-
-    /// Whether the initial index and coherence warm-up completed.
-    #[must_use]
-    pub fn is_index_ready(&self) -> bool {
-        self.indexed.load(Ordering::Acquire)
-    }
+    /// `GET /index-ready`: whether the initial index and coherence warm-up completed.
+    fn index_ready(&self) -> bool;
 }
 
 /// Declares the event-counter set once: the fields, a bump method per counter, the stats
@@ -348,7 +326,7 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
     });
 }
 
-/// Bind `listen` and serve counters at `GET /metrics`, listener readiness at
+/// Bind `listen` and serve counters at `GET /metrics`, the readiness probe at
 /// `GET /ready`, and initial index completion at `GET /index-ready`.
 /// Other paths return 404. The 60s stats line cannot be graphed
 /// or alerted on; this is the same data in a form Prometheus can scrape.
@@ -362,7 +340,7 @@ pub fn spawn_stats(metrics: Arc<Metrics>, interval_secs: u64) {
 /// silently leaving the fleet unscraped.
 pub async fn spawn_exporter(
     metrics: Arc<Metrics>,
-    readiness: Arc<StartupReady>,
+    readiness: Arc<dyn Readiness>,
     listen: &str,
 ) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(listen).await?;
@@ -391,7 +369,7 @@ pub async fn spawn_exporter(
                         async move {
                             Ok::<_, Infallible>(scrape(
                                 &metrics,
-                                &readiness,
+                                &*readiness,
                                 req.method(),
                                 req.uri().path(),
                             ))
@@ -410,7 +388,7 @@ pub async fn spawn_exporter(
 /// One metrics scrape or readiness probe. Other routes return 404.
 fn scrape(
     metrics: &Metrics,
-    readiness: &StartupReady,
+    readiness: &dyn Readiness,
     method: &Method,
     path: &str,
 ) -> Response<Full<Bytes>> {
@@ -422,9 +400,9 @@ fn scrape(
             .unwrap_or_else(|_| Response::new(Full::default()))
     } else if method == Method::GET && matches!(path, "/ready" | "/index-ready") {
         let ready = if path == "/ready" {
-            readiness.is_ready()
+            readiness.probe_ready()
         } else {
-            readiness.is_index_ready()
+            readiness.index_ready()
         };
         Response::builder()
             .status(if ready {
@@ -444,12 +422,30 @@ fn scrape(
 
 #[cfg(test)]
 mod tests {
-    use super::{Metrics, StartupReady, scrape};
+    use super::{Metrics, Readiness, scrape};
     use crate::index::{KeyIndex, ObjEntry, apply_put, standard_class};
     use http::{Method, StatusCode};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::SystemTime;
     use tierstore_mmap::MmapDiskStats;
+
+    /// Readiness the test sets by hand.
+    #[derive(Default)]
+    struct Flags {
+        probe: AtomicBool,
+        index: AtomicBool,
+    }
+
+    impl Readiness for Flags {
+        fn probe_ready(&self) -> bool {
+            self.probe.load(Ordering::SeqCst)
+        }
+
+        fn index_ready(&self) -> bool {
+            self.index.load(Ordering::SeqCst)
+        }
+    }
 
     #[test]
     fn the_stats_line_reports_every_counter() {
@@ -571,7 +567,7 @@ mod tests {
     #[test]
     fn metrics_and_readiness_routes_are_distinct() {
         let metrics = Metrics::default();
-        let readiness = StartupReady::default();
+        let readiness = Flags::default();
         let ok = scrape(&metrics, &readiness, &Method::GET, "/metrics");
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(
@@ -584,7 +580,7 @@ mod tests {
             scrape(&metrics, &readiness, &Method::GET, "/ready").status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        readiness.mark_ready();
+        readiness.probe.store(true, Ordering::SeqCst);
         assert_eq!(
             scrape(&metrics, &readiness, &Method::GET, "/ready").status(),
             StatusCode::OK
@@ -593,7 +589,7 @@ mod tests {
             scrape(&metrics, &readiness, &Method::GET, "/index-ready").status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        readiness.mark_index_ready();
+        readiness.index.store(true, Ordering::SeqCst);
         assert_eq!(
             scrape(&metrics, &readiness, &Method::GET, "/index-ready").status(),
             StatusCode::OK

@@ -395,7 +395,8 @@ node's head disappear and the node leave the roster, and follows it into its
 new life, instead of falling back: the survivor re-affirms without an origin
 scan. It answers from the origin only for that moment. A rolling update
 therefore stops the second pod as soon as the first has installed its image
-without either restart costing a scan.
+(see [Rollout readiness](#rollout-readiness)) without either restart costing
+a scan.
 
 **Rejoiner.** The survivor's donor journal renews the rejoiner's old-life cut
 to the new epoch, so a barrier sampled after the crossing aligns with the
@@ -407,6 +408,50 @@ before the crossing pends rather than conflicts.
 serves from the origin, and rebuilds. Neither node knows more than the other,
 so the pair makes exactly one origin scan: whichever node builds, the other
 follows it and installs its image.
+
+## Rollout readiness
+
+A StatefulSet rollout stops the next pod once the replacement is ready for
+`minReadySeconds`. If readiness meant only "the S3 listener is bound", the
+controller could stop the last index-holding pod while its replacement had no
+index yet, and the pair would rebuild from the origin: on 2026-10-01 the old
+`s3cache-0` was stopped 8 s after the new `s3cache-1`'s gossip bound, while
+`s3cache-1` was following a pending recapture, and `s3cache-1` then scanned the
+origin for 8 minutes.
+
+`GET /ready` (`CachingProxy::probe_ready`) therefore answers: this node is
+index-ready (`GET /index-ready`), or no peer that may hold an index is live.
+Each node declares `s3cache:indexed` in its gossip capability set once its
+initial index and coherence warm-up complete; a peer counts while this node
+sees it `Alive` or `Suspect` and it declares that capability or nothing yet,
+and a configured seed counts until it first appears in the roster (or its
+address fails to resolve), because a starting pod's roster is empty until then.
+
+- A cold fleet has no index anywhere: every pod is ready and forwards to the
+  origin while one builds.
+- A replacement beside an index holder stays not ready until it installs the
+  holder's image or builds its own index, so the rollout waits for it.
+- `Suspect` counts because the kubelet marks a pod ready on one success: a
+  momentary suspicion of a slow index holder must not release the rollout. A
+  peer that is alive but has no index does not count.
+- A `Dead` or reaped peer never counts, whatever it last declared. A crash or a
+  single remaining pod is ready once the membership detection window passes,
+  and a replacement whose donor died is ready from then on and scans: no
+  deadlock.
+- During an origin outage a replacement that must scan stays not ready, so the
+  rollout stalls and the index holder keeps serving.
+
+Gossip capabilities are the mechanism because they already carry each
+node's participation and are rewritten whole by every new life, so a restarted
+node's previous `s3cache:indexed` is buried at its first declaration. A dead
+peer's declaration can outlive its death in a roster, which is why the
+membership status, not the declaration, decides whether it counts. The
+bootstrap claim is not used: a Ready capture is retired on any membership
+change, exactly when a rollout needs the answer. A serve-lease is not used
+either: it lapses on a gap or a peer's stop while the index is still held.
+`tests/it/readiness_probe.rs` covers a cold pair, a
+replacement beside an index holder, a node left alone, and a live peer without
+an index on the in-memory transport.
 
 ## Verification and rollout
 

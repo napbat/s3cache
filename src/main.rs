@@ -73,33 +73,17 @@ async fn start_coherence(
 }
 
 /// Optional Prometheus text endpoint on its own port, so the counters can be graphed
-/// and alerted on instead of diffed out of the stats line by hand. Off by default;
+/// and alerted on instead of diffed out of the stats line by hand, plus the pod's
+/// readiness probe (see [`cache::proxy::CachingProxy::probe_ready`]). Off by default;
 /// a bad `S3CACHE_METRICS_LISTEN` fails startup rather than leaving a silent blind spot.
-async fn spawn_readiness(
+async fn spawn_exporter(
     cp: &cache::proxy::CachingProxy,
     cfg: &Config,
-) -> Result<Arc<metrics::StartupReady>, Box<dyn Error + Send + Sync + 'static>> {
-    let readiness = Arc::new(metrics::StartupReady::default());
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     if let Some(listen) = &cfg.metrics_listen {
-        let probe = cp.clone();
-        let buckets = cfg.buckets.clone();
-        let latch = Arc::clone(&readiness);
-        tokio::spawn(async move {
-            loop {
-                if probe.initially_ready(&buckets) {
-                    latch.mark_index_ready();
-                    info!(
-                        "initial index ready for {} configured buckets",
-                        buckets.len()
-                    );
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        });
-        metrics::spawn_exporter(cp.metrics(), Arc::clone(&readiness), listen).await?;
+        metrics::spawn_exporter(cp.metrics(), Arc::new(cp.clone()), listen).await?;
     }
-    Ok(readiness)
+    Ok(())
 }
 
 #[tokio::main]
@@ -172,8 +156,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // fails to sync just stays in passthrough (safe).
     cp.spawn_background_sync(cfg.buckets.clone());
     metrics::spawn_stats(cp.metrics(), cfg.stats_secs);
-    let readiness = spawn_readiness(&cp, &cfg).await?;
-    // Kept for the shutdown path too: a drained stop seals the write feed through it.
+    // Kept for the readiness probe and the shutdown path: a drained stop seals the
+    // write feed through it.
     let stopping_proxy = cp.clone();
 
     let service = {
@@ -191,9 +175,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     };
 
     let listener = TcpListener::bind(&cfg.listen).await?;
-    // Origin forwarding is available before the index is complete. Do not remove
-    // every cold pod from the Service during overlapping rollouts or a cold start.
-    readiness.mark_ready();
+    // The probe is served only once the S3 listener is bound. It admits a cold pod,
+    // which forwards to the origin while its index warms, unless a live peer holds an
+    // index this pod lacks: never drop every cold pod from the Service during a cold
+    // start, never let a rollout stop the last index-holding pod.
+    spawn_exporter(&stopping_proxy, &cfg).await?;
     let http_server = ConnBuilder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     let mut stopping = std::pin::pin!(stop_signal());

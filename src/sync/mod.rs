@@ -34,6 +34,8 @@
 //! recovery protocol. `volatile` supplies S3 origin and local-lease facts;
 //! Groupnet owns the retry, generation, and affirmation decisions.
 
+/// The `~caps` declaration: coherence participation and index readiness.
+pub(crate) mod advertise;
 /// Consistency modes and the gossip write-feed coherence engine.
 pub mod coherence;
 /// Gossip environment/config parsing and node construction.
@@ -41,6 +43,8 @@ pub mod config;
 /// Durable, scoped control-source slots; not yet connected to serving or writes.
 pub mod control;
 pub mod fleet;
+/// The gossip half of the pod readiness probe.
+pub(crate) mod readiness;
 /// Planned stop: lease retraction, the feed seal, and the survivors' renewal.
 pub mod stop;
 pub(crate) mod volatile;

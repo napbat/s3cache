@@ -162,9 +162,13 @@ documentation-only edit does not require an image build.
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval |
 | `S3CACHE_METRICS_LISTEN` | empty (disabled) | Bind address for the Prometheus text endpoint (`GET /metrics`) |
 
-`GET /ready` on the metrics listener reports whether the S3 listener can accept
-requests. Cold requests can go to the origin. `GET /index-ready` separately
-reports completion of the initial index and coherence warm-up.
+`GET /ready` on the metrics listener is the pod readiness probe
+(`CachingProxy::probe_ready`): ready once this node's index is complete, or while
+no live (`Alive`/`Suspect`) peer declares the `s3cache:indexed` gossip capability or
+has declared nothing yet. A cold fleet stays ready and forwards to the origin; a
+replacement beside an index holder holds the rollout until it has an index. It is
+served only after the S3 listener binds. `GET /index-ready` separately reports
+completion of the initial index and coherence warm-up.
 
 ## Helm chart knobs (deploy/helm/s3cache/values.yaml)
 
@@ -181,7 +185,11 @@ reports completion of the initial index and coherence warm-up.
 - `recovery.rearm` — opt in to capped automatic full recovery after an
   exhausted episode; no S3 coordination metadata is written.
 - `metrics.enabled` / `metrics.port` — the Prometheus text endpoint
-  (`S3CACHE_METRICS_LISTEN`) on a named `metrics` container port.
+  (`S3CACHE_METRICS_LISTEN`) on a named `metrics` container port, which also serves
+  the `GET /ready` probe; disabled, readiness is a TCP check with no rollout gate.
+- `availability.minReadySeconds` / `readinessPeriodSeconds` /
+  `startupProbe.{periodSeconds,failureThreshold}` — the rollout overlap, the probe
+  period, and the startup budget (TCP on the S3 port) for the warm-tier open.
 - `gossip.consistency` / `gossip.leaseMs` — the coherence mode
   (`S3CACHE_CONSISTENCY`) and the lease duration `D` (`S3CACHE_LEASE_MS`; empty renders
   no env var, so the binary's own 2000ms default applies).

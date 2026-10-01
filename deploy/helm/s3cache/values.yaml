@@ -4,11 +4,27 @@
 replicaCount: 1
 
 # Rollout and voluntary-disruption safety. StatefulSet updates already replace
-# ordinals one at a time; minReadySeconds keeps the survivor/new peer overlap long
-# enough for endpoint programming and gossip convergence. The PDB is rendered only
-# for replicated releases, where maxUnavailable=1 cannot deadlock a singleton.
+# ordinals one at a time, and advance only once the new one is ready. With the
+# metrics listener, ready (GET /ready) means the pod holds an index or no live
+# peer does: a cold fleet stays in the Service, and a replacement beside an
+# index-holding peer holds the rollout until it has installed or built its own,
+# so the last index is never stopped first. minReadySeconds keeps the
+# survivor/new peer overlap long enough for endpoint programming and gossip
+# convergence. The PDB is rendered only for replicated releases, where
+# maxUnavailable=1 cannot deadlock a singleton.
 availability:
   minReadySeconds: 5
+  # How often the kubelet asks GET /ready: the delay between a replacement
+  # installing its index and the rollout moving on.
+  readinessPeriodSeconds: 5
+  # The S3 listener binds only after the warm tier opens (about 38s for the
+  # production tier on 2026-10-01) and gossip and peer recovery start. Until the
+  # listener accepts, the startup probe holds liveness and readiness off, for at
+  # most periodSeconds × failureThreshold (5 minutes); past that the kubelet
+  # restarts the container. Raise it with diskCache.bytes.
+  startupProbe:
+    periodSeconds: 5
+    failureThreshold: 60
   podDisruptionBudget: true
   # How long Kubernetes waits after SIGTERM before SIGKILL. A planned stop needs
   # up to 10s to drain in-flight requests plus up to 5s to seal the write feed and
@@ -96,9 +112,9 @@ fleet:
   port: 7950
   originId: ""
 
-# Metrics (GET /metrics), listener readiness (GET /ready), and initial index
-# completion (GET /index-ready). Cold pods can forward requests to the origin.
-# Disabling this listener uses TCP readiness.
+# Metrics (GET /metrics), the readiness probe (GET /ready), and initial index
+# completion (GET /index-ready). Disabling this listener uses a TCP readiness
+# check, and rollouts then no longer wait for a replacement's index.
 metrics:
   enabled: true
   port: 9090

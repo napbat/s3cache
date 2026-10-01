@@ -18,6 +18,8 @@ use crate::index::{
     standard_class,
 };
 use crate::metrics::Metrics;
+use crate::sync::advertise::Advertisement;
+use crate::sync::readiness::UnmetSeeds;
 use crate::sync::stop::Crossing;
 use crate::sync::volatile::CacheRecoveryAdapter;
 use crate::sync::wire::{
@@ -162,7 +164,7 @@ impl Consistency {
     }
 
     /// What this node advertises to the group about its participation.
-    /// Non-empty in every mode — see [`advertise`].
+    /// Non-empty in every mode — see [`Advertisement::declare`].
     ///
     /// [`CAP_LEASE`] is advertised **only** by a mode that constructs a
     /// [`Leases`], and the two are wired together in [`WriteSync::attach`] for
@@ -218,52 +220,6 @@ pub(crate) const WRITE_TOKEN_HEADER: &str = "x-s3cache-write-token";
 /// Request header echoing a [`WRITE_TOKEN_HEADER`] value: the read barriers
 /// on that specific write having been applied locally.
 pub(crate) const READ_TOKEN_HEADER: &str = "x-s3cache-read-token";
-
-/// Attempts to get the capability advertisement enqueued after a rejection. A rejection
-/// is a full actor inbox at startup, which drains in milliseconds; the advertisement is
-/// state and the last call wins, so re-trying the same set costs nothing.
-const ADVERTISE_RETRIES: u32 = 30;
-
-/// How long between those attempts.
-const ADVERTISE_RETRY_DELAY: Duration = Duration::from_millis(100);
-
-/// Declare this node's coherence participation to the group. Every attach path goes
-/// through [`WriteSync::attach`], which is where this is called, so no mode can reach a
-/// group without saying what it is.
-///
-/// Two things make the call unconditional — including for `bounded`, whose whole point
-/// is *not* participating:
-///
-/// * The declaration must be **non-empty**. Never-advertised and advertised-empty are
-///   indistinguishable to a reader (`node_capabilities` answers both with an empty set),
-///   and the transition rule in [`waits_on`] keys on exactly that distinction: an empty
-///   set means "unknown, assume the old contract and wait". A bounded node that
-///   advertised nothing would therefore be waited on by every strong writer — the
-///   timeout-per-write this whole mechanism exists to remove.
-/// * The **call itself** must happen regardless of mode. groupnet's restart recovery
-///   re-adopts un-authored entries from peers' echoes, so a node that comes back without
-///   authoring `~caps` this life inherits its previous life's set. A pod redeployed from
-///   strong to bounded would keep advertising `acks` and haunt every writer in the
-///   cluster until it was reaped; authoring the entry is what buries the ghost.
-fn advertise(group: &Group, consistency: Consistency) {
-    let caps = consistency.capabilities();
-    if group.advertise_capabilities(caps).is_ok() {
-        return;
-    }
-    // Rejection is backpressure, not refusal. Retry off the startup path: serving must
-    // not wait on the advertisement, and the advertisement must not be dropped because
-    // an inbox was briefly full.
-    let group = group.clone();
-    tokio::spawn(async move {
-        for _ in 0..ADVERTISE_RETRIES {
-            tokio::time::sleep(ADVERTISE_RETRY_DELAY).await;
-            if group.advertise_capabilities(caps).is_ok() {
-                return;
-            }
-        }
-        warn!("could not advertise coherence capabilities; peers will read this node as unknown");
-    });
-}
 
 /// Whether a write's cluster-wide ack wait has to include `node`: iff it advertises
 /// [`CAP_ACKS`], **or** it advertises nothing at all.
@@ -383,6 +339,10 @@ pub struct WriteSync {
     /// process lifetime, whatever its transport. `None` when a test drives a raw
     /// group directly.
     _node: Option<Box<dyn Send + Sync>>,
+    /// This node's `~caps` declaration; [`WriteSync::advertise_indexed`] extends it.
+    pub(super) advertisement: Arc<Advertisement>,
+    /// Seeds not in the roster yet (see [`WriteSync::expect_seeds`]).
+    pub(super) unmet_seeds: Arc<UnmetSeeds>,
 }
 
 impl WriteSync {
@@ -391,8 +351,8 @@ impl WriteSync {
     ///
     /// Both ways into a group land here — [`WriteSync::new`] (the gossip node it just
     /// spawned) and a caller handing over a group it drives itself (the tests) — so this
-    /// is where the node declares what it participates in (see [`advertise`]) and, in
-    /// `strong`, where it joins the lease set.
+    /// is where the node declares what it participates in (see [`Advertisement::declare`])
+    /// and, in `strong`, where it joins the lease set.
     ///
     /// The lease set is constructed **before** the advertisement, and the order is the
     /// contract rather than a style: [`CAP_LEASE`] says "I grant your leases and I block
@@ -420,7 +380,7 @@ impl WriteSync {
             .leases()
             .then(|| Leases::new(group.clone(), me.clone(), lease));
         let lease_view = leases.as_ref().map(Leases::view);
-        advertise(&group, consistency);
+        let advertisement = Advertisement::declare(group.clone(), consistency);
         Self {
             feed,
             group,
@@ -433,6 +393,8 @@ impl WriteSync {
             crossings: std::sync::Mutex::default(),
             fleet_listener: OnceLock::new(),
             write_wait: lease.duration + WRITE_WAIT_SLACK,
+            advertisement,
+            unmet_seeds: Arc::default(),
             _node: node,
         }
     }

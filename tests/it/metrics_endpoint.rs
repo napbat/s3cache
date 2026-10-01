@@ -5,12 +5,30 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioIo;
-use s3cache::metrics::{Metrics, StartupReady, spawn_exporter};
+use s3cache::metrics::{Metrics, Readiness, spawn_exporter};
 use tokio::net::TcpStream;
+
+/// Readiness the test sets by hand.
+#[derive(Default)]
+struct Flags {
+    probe: AtomicBool,
+    index: AtomicBool,
+}
+
+impl Readiness for Flags {
+    fn probe_ready(&self) -> bool {
+        self.probe.load(Ordering::SeqCst)
+    }
+
+    fn index_ready(&self) -> bool {
+        self.index.load(Ordering::SeqCst)
+    }
+}
 
 /// One scrape over the wire.
 async fn scrape(addr: SocketAddr, path: &str) -> (StatusCode, String) {
@@ -35,10 +53,14 @@ async fn scrape(addr: SocketAddr, path: &str) -> (StatusCode, String) {
 #[tokio::test]
 async fn the_exporter_serves_the_counters_as_prometheus_text() {
     let metrics = Arc::new(Metrics::default());
-    let readiness = Arc::new(StartupReady::default());
-    let addr = spawn_exporter(Arc::clone(&metrics), Arc::clone(&readiness), "127.0.0.1:0")
-        .await
-        .expect("the exporter binds");
+    let readiness = Arc::new(Flags::default());
+    let addr = spawn_exporter(
+        Arc::clone(&metrics),
+        Arc::<Flags>::clone(&readiness),
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("the exporter binds");
 
     assert_eq!(
         scrape(addr, "/ready").await.0,
@@ -63,13 +85,13 @@ async fn the_exporter_serves_the_counters_as_prometheus_text() {
     }
 
     assert_eq!(scrape(addr, "/").await.0, StatusCode::NOT_FOUND);
-    readiness.mark_ready();
+    readiness.probe.store(true, Ordering::SeqCst);
     assert_eq!(scrape(addr, "/ready").await.0, StatusCode::OK);
     assert_eq!(
         scrape(addr, "/index-ready").await.0,
         StatusCode::SERVICE_UNAVAILABLE,
-        "a cold proxy can serve through the origin before its index is complete"
+        "the probe and index completion are separate routes"
     );
-    readiness.mark_index_ready();
+    readiness.index.store(true, Ordering::SeqCst);
     assert_eq!(scrape(addr, "/index-ready").await.0, StatusCode::OK);
 }

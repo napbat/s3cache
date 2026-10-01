@@ -116,14 +116,55 @@ writes and stalled waits never retire history because neither is an all-readers 
 With the feed on, **multiple replicas are safe** — this lifts the historical
 single-replica constraint with zero extra services.
 
-The Helm chart admits a pod after its S3 listener can accept requests.
-Cold requests go to the origin while the index warms. The `GET /ready` check
-is on the metrics port. Index completion is a separate `GET /index-ready`
-diagnostic. This separation keeps cold pods available during overlapping rollouts.
+### Readiness and rollouts
+
+The pod's readiness probe is `GET /ready` on the metrics port
+(`CachingProxy::probe_ready`). A pod is ready when it holds a complete index of
+its own, or when no live peer may hold one. Each node adds the
+`s3cache:indexed` gossip capability once its initial index and coherence
+warm-up complete (the `GET /index-ready` latch), and a peer *may hold an index*
+when this node sees it `Alive` or `Suspect` and it declares that capability or
+has declared nothing yet.
+
+- **Cold start.** No peer holds an index, so every pod is ready and forwards to
+  the origin while one builds. Once one declares its index, a pod still without
+  one reads not ready until it installs that image; the kubelet marks it
+  unready only after `failureThreshold` failed probes, so a quick install keeps
+  it in the Service throughout.
+- **Rolling update.** A replacement beside an index-holding peer is not ready
+  until it installs or builds its own index, so the StatefulSet controller does
+  not stop the next pod, the last index holder, first.
+- **A peer without an index** (alive, still building) does not hold a pod back.
+- **A momentarily lapsed peer.** A `Suspect` peer still counts. The kubelet
+  marks a pod ready on one successful probe, so reading a slow peer as gone
+  could let a rollout stop the last index holder; a peer that really died turns
+  `Dead` within the membership detection window (a few seconds at the default
+  `S3CACHE_LEASE_MS`). A lapsed serve-lease or a gap does not clear the latch:
+  the peer still holds that index and rebuilds it.
+- **Crash, single pod left.** A `Dead` or reaped peer never counts, whatever it
+  last declared, so the remaining pod is ready and forwards to the origin while
+  it builds. A replacement whose donor died is ready from then on as well, so
+  nothing waits on a dead peer.
+- **Origin outage.** A replacement that has to scan the origin stays not ready
+  and the rollout stalls, while the index holder keeps serving: the last index
+  is not stopped.
+- **Unknown peers.** A starting pod's roster is empty until its seed resolver
+  registers each gossip seed, and a seed then has no declaration until the
+  first gossip with it. A seed counts as possibly indexed until it appears in
+  the roster (or its address fails to resolve within the resolver's first
+  round, about 30 s), and a peer until its declaration arrives. Every node
+  declares a non-empty set when it joins, and a restarted node's new
+  declaration replaces its previous life's.
+
+The probe is served only once the S3 listener is bound. The chart's startup
+probe (TCP on the S3 port, `availability.startupProbe`) holds liveness and
+readiness off while the warm tier opens. Disabling the metrics listener selects
+a TCP readiness check, and rollouts then no longer wait for indexes.
 The headless gossip Service publishes not-ready addresses so peers can connect
-during startup. Disabling the metrics listener selects a TCP readiness check.
-The chart renders a `PodDisruptionBudget` with `maxUnavailable: 1`. Each ordinal
-owns its own warm PVC, so rollout availability does not require sharing cache files.
+during startup. The chart renders a `PodDisruptionBudget` with
+`maxUnavailable: 1`; a not-ready replacement counts as unavailable, so an
+eviction cannot take the index holder either. Each ordinal owns its own warm
+PVC, so rollout availability does not require sharing cache files.
 
 ### Index startup
 
@@ -457,11 +498,12 @@ Every counter is logged as one `s3cache stats:` line each `S3CACHE_STATS_SECS`, 
 when `S3CACHE_METRICS_LISTEN` is set — served as Prometheus text at `GET /metrics` on
 that address, `s3cache_`-prefixed (`metrics.enabled` in the chart). Both are generated
 from one declaration, so a counter cannot exist in one and not the other.
-The same listener returns 503 at `GET /ready` until the S3 listener is bound.
-It then returns 200, including while the index warms or a read lease is absent.
-`GET /index-ready` returns 503 until the configured indexes and initial coherence
-warm-up complete. It then stays at 200. The S3 read barrier still routes reads
-to the origin whenever local state cannot safely answer them.
+The same listener serves the readiness probe at `GET /ready` (see
+[Readiness and rollouts](#readiness-and-rollouts)): 200 once this node's index is
+complete or while no live peer may hold one, 503 otherwise. It is bound only after
+the S3 listener. `GET /index-ready` returns 503 until the configured indexes and
+initial coherence warm-up complete. It then stays at 200. The S3 read barrier still
+routes reads to the origin whenever local state cannot safely answer them.
 
 What they attribute: LIST (`list_from_index` vs `list_passthrough`), GET
 (`get_hit` / `get_miss` / `get_bypass`, `range_*`), HEAD (`head_hit` from a cached body,

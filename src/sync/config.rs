@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use groupnet::consistency::LeaseConfig;
@@ -117,15 +118,31 @@ impl WriteSync {
         }
         let node = builder.spawn();
         let group = node.join_group("s3cache");
+        let (bind, node_id, mode) = (&cfg.bind, &cfg.node_id, cfg.consistency.label());
+        let lease_ms = cfg.lease_ms;
+        info!(
+            "gossip coherence bound on `{bind}` as `{node_id}` (consistency: {mode}, lease: {lease_ms}ms)"
+        );
+        let sync = WriteSync::attach(
+            group.clone(),
+            me,
+            cfg.consistency,
+            lease,
+            Some(Box::new(node)),
+        );
+        let seeds: Vec<(String, String)> = cfg
+            .seeds
+            .into_iter()
+            .filter(|(id, _)| *id != cfg.node_id) // a pod seeding itself (uniform config) is a no-op
+            .collect();
+        let unmet = sync.expect_seeds(seeds.iter().map(|(id, _)| NodeId::new(id.as_str())));
         // Seeds resolve off the startup path (DNS for a just-starting peer may
         // lag, and a slow resolver must not delay serving): each one registers
         // with the transport and joins via `add_peer` once its address is known.
-        for (id, addr) in cfg.seeds {
-            if id == cfg.node_id {
-                continue; // a pod seeding itself (uniform config) is a no-op
-            }
-            let (transport, group) = (transport.clone(), group.clone());
+        for (id, addr) in seeds {
+            let (transport, group, unmet) = (transport.clone(), group.clone(), Arc::clone(&unmet));
             tokio::spawn(async move {
+                let seed = NodeId::new(id.as_str());
                 let mut registered: Option<std::net::SocketAddr> = None;
                 loop {
                     match resolve_seed(&addr).await {
@@ -133,12 +150,13 @@ impl WriteSync {
                             if registered.is_some() {
                                 info!("gossip seed `{id}` moved to {sock}; re-registering");
                             }
-                            transport.register_peer(NodeId::new(id.as_str()), sock);
-                            group.add_peer(NodeId::new(id.as_str()));
+                            transport.register_peer(seed.clone(), sock);
+                            group.add_peer(seed.clone());
                             registered = Some(sock);
                         }
                         None if registered.is_none() => {
                             warn!("gossip seed `{id}={addr}` not resolving yet; will keep trying");
+                            unmet.give_up(&seed);
                         }
                         Some(_) | None => {}
                     }
@@ -146,18 +164,7 @@ impl WriteSync {
                 }
             });
         }
-        let (bind, node_id, mode) = (&cfg.bind, &cfg.node_id, cfg.consistency.label());
-        let lease_ms = cfg.lease_ms;
-        info!(
-            "gossip coherence bound on `{bind}` as `{node_id}` (consistency: {mode}, lease: {lease_ms}ms)"
-        );
-        Some(WriteSync::attach(
-            group,
-            me,
-            cfg.consistency,
-            lease,
-            Some(Box::new(node)),
-        ))
+        Some(sync)
     }
 
     /// Join the cluster group as `node_id` over an already-built groupnet
@@ -182,13 +189,20 @@ impl WriteSync {
         }
         let node = builder.spawn();
         let group = node.join_group("s3cache");
-        WriteSync::attach(
+        let sync = WriteSync::attach(
             group,
             me,
             consistency,
             lease_config(lease_ms),
             Some(Box::new(node)),
-        )
+        );
+        sync.expect_seeds(
+            seeds
+                .iter()
+                .filter(|seed| **seed != node_id)
+                .map(|seed| NodeId::new(*seed)),
+        );
+        sync
     }
 
     /// The gossip group this node's feed, leases and membership ride on: a

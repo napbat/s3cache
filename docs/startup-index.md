@@ -2,9 +2,10 @@
 
 ## Serving while cold
 
-Listener readiness and index completion are separate states.
-`GET /ready` becomes successful when the S3 listener is bound.
-Requests can then reach the origin while the index is incomplete.
+Pod readiness and index completion are separate states.
+`GET /ready` is served once the S3 listener is bound. It succeeds while this
+node's index is incomplete unless a live peer may hold an index, so requests can
+reach the origin from a cold fleet (see the README's *Readiness and rollouts*).
 `GET /index-ready` separately reports initial index and coherence readiness.
 
 In gossip mode, Groupnet owns one initial origin scan per node and keeps the local
