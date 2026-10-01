@@ -332,12 +332,21 @@ impl super::KeyIndex {
             .renew_native_writer(sealed, epoch);
     }
 
-    /// Move a native writer past a delivered feed gap.
-    pub(crate) fn skip_native_gap(&self, missed_through: &NativeCut) {
-        self.inner
+    /// A delivered feed gap: this index missed native effects through
+    /// `missed_through` and can no longer order its rows against them. The
+    /// writer's cut moves past the gap, so a donor image covering it from
+    /// there aligns, and every bucket is discarded to origin-serving state as
+    /// an origin rebuild discards it. Without the discard an install would
+    /// carry pre-gap rows the donor no longer holds — a key the missed writes
+    /// deleted, whose tombstone the donor's own rebuild forgot — as if they
+    /// were this node's own later effects.
+    pub(crate) fn discard_for_gap(&self, missed_through: &NativeCut) {
+        let mut index = self
+            .inner
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .skip_native_gap(missed_through);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        index.skip_native_gap(missed_through);
+        index.discard_buckets();
     }
 }
 

@@ -720,6 +720,45 @@ mod tests {
         );
     }
 
+    /// A feed gap means the follower missed native effects it can no longer
+    /// order its rows against. Here the missed span deleted `deleted`, and the
+    /// donor then rebuilt from the origin, so its image holds neither the key
+    /// nor a tombstone: the follower's pre-gap row must not cross the install
+    /// as if it were this node's own later effect.
+    #[test]
+    fn a_gap_leaves_no_pre_gap_row_for_an_install_to_carry() {
+        let peer = |sequence| NativeCut {
+            writer: b"peer".to_vec(),
+            epoch: 7,
+            sequence,
+        };
+        let local = synced();
+        assert!(crate::index::apply_put_native(
+            &local,
+            "bucket",
+            "deleted",
+            row(Some("v1"), at(10, 0)),
+            peer(1)
+        ));
+        local.discard_for_gap(&peer(5));
+        let donor = synced();
+        assert!(apply_put(
+            &donor,
+            "bucket",
+            "kept",
+            row(Some("k1"), at(12, 0))
+        ));
+        local
+            .install_fleet_candidate(&mut Some(stage_of(&donor)), &[peer(5)], &universe(), 8)
+            .unwrap();
+        assert!(
+            live_row(&local, "deleted").is_none(),
+            "a row the gap may have deleted was carried into the install"
+        );
+        assert!(live_row(&local, "kept").is_some());
+        assert_eq!(local.stats().objects, 1);
+    }
+
     /// An open reconciliation crosses the swap with its token: its HEAD
     /// resolves the key in the installed index, and later fences never
     /// reuse the token.

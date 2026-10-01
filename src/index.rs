@@ -180,7 +180,8 @@ pub(crate) fn entry_matches_body(entry: &ObjEntry, obj: &CachedObject) -> bool {
 }
 
 /// What an origin response adds to an already-indexed entry (see [`complete_entry`]).
-/// Only absent fields are filled, so a completion can never overwrite a fresher write.
+/// Only absent fields are filled, and only from a response about the same version, so a
+/// completion can never overwrite a fresher write nor dress one in another's fields.
 pub(crate) struct EntryFill {
     pub(crate) size: Option<i64>,
     pub(crate) etag: Option<ETag>,
@@ -197,6 +198,9 @@ pub(crate) enum Completion {
     AlreadyComplete,
     /// Fields the entry lacked were filled in from the response.
     Completed,
+    /// The response describes another version of the key than the entry does, so
+    /// nothing was taken from it.
+    OtherVersion,
 }
 
 /// What the index can say about a key on a synced bucket.
@@ -534,16 +538,50 @@ fn apply_put_with_authority(
 /// snapshot, synced state, or aggregate accounting. Returns a bucket-local token that
 /// is never reused by a later fence.
 pub(crate) fn fence_uncertain_key(state: &KeyIndex, bucket: &str, key: &str) -> u64 {
+    state.inner.write().unwrap().fence_key(bucket, key)
+}
+
+/// Fence a key a peer's feed event could not describe (see
+/// [`IndexOp::unknown`](crate::sync::wire::IndexOp::unknown)), under the lock that
+/// notes the event's native cut. `None` for a duplicate the cut already covers.
+pub(crate) fn fence_uncertain_key_native(
+    state: &KeyIndex,
+    bucket: &str,
+    key: &str,
+    cut: &NativeCut,
+) -> Option<u64> {
     let mut index = state.inner.write().unwrap();
-    index.invalidate_capture_for_rebuild();
-    let bucket = index.buckets.entry(bucket.to_owned()).or_default();
-    let token = bucket
-        .uncertainty_epoch
-        .checked_add(1)
-        .expect("per-bucket uncertainty token exhausted");
-    bucket.uncertainty_epoch = token;
-    bucket.uncertain_keys.insert(key.to_owned(), token);
-    token
+    index
+        .note_native_cut(cut)
+        .then(|| index.fence_key(bucket, key))
+}
+
+/// Fence this node's own write it cannot describe, under the index lock that assigns
+/// its feed position, as [`apply_own_put`] indexes a describable one.
+pub(crate) fn fence_own_uncertain_key<R>(
+    state: &KeyIndex,
+    bucket: &str,
+    key: &str,
+    assign: impl FnOnce() -> (R, NativeCut),
+) -> (u64, R) {
+    let mut index = state.inner.write().unwrap();
+    let (value, position) = assign();
+    index.note_native_cut(&position);
+    (index.fence_key(bucket, key), value)
+}
+
+impl KeyIndexState {
+    fn fence_key(&mut self, bucket: &str, key: &str) -> u64 {
+        self.invalidate_capture_for_rebuild();
+        let bucket = self.buckets.entry(bucket.to_owned()).or_default();
+        let token = bucket
+            .uncertainty_epoch
+            .checked_add(1)
+            .expect("per-bucket uncertainty token exhausted");
+        bucket.uncertainty_epoch = token;
+        bucket.uncertain_keys.insert(key.to_owned(), token);
+        token
+    }
 }
 
 /// Whether `token` still owns reconciliation of this exact key.
@@ -634,6 +672,26 @@ pub(crate) fn begin_bucket_resync(state: &KeyIndex, bucket: &str) -> u64 {
     };
     buckets.insert(bucket.to_owned(), replacement);
     generation
+}
+
+impl KeyIndexState {
+    /// Reset every bucket to origin-serving state: rows and tombstones go, the
+    /// generation moves on so an older rebuild's pages cannot publish into it, and
+    /// per-key fences keep their tokens, as [`begin_bucket_resync`] keeps them.
+    fn discard_buckets(&mut self) {
+        self.invalidate_capture_for_rebuild();
+        let Self { buckets, stats, .. } = self;
+        for bucket in buckets.values_mut() {
+            let previous = std::mem::take(bucket);
+            stats.replace(previous.stats, IndexStats::default());
+            *bucket = BucketState {
+                sync_generation: previous.sync_generation.wrapping_add(1),
+                uncertainty_epoch: previous.uncertainty_epoch,
+                uncertain_keys: previous.uncertain_keys,
+                ..BucketState::default()
+            };
+        }
+    }
 }
 
 /// Discard a failed rebuild's partial rows and advance to a clean retry, but only while
@@ -824,7 +882,8 @@ fn apply_del_with_identity(
 /// Completes an indexed entry from an origin response: fills the fields it does not
 /// carry and leaves everything else — including the last-writer-wins stamp — alone. This
 /// *observes* what is already indexed, it does not write, so it can neither reorder
-/// against a concurrent write nor resurrect a deleted key.
+/// against a concurrent write nor resurrect a deleted key. A response describing another
+/// version of the key lends the entry nothing.
 pub(crate) fn complete_entry(
     state: &KeyIndex,
     bucket: &str,
@@ -842,8 +901,21 @@ pub(crate) fn complete_entry(
     let Some(bucket) = buckets.get_mut(bucket) else {
         return Completion::NotIndexed;
     };
-    let Some((previous, current)) = bucket.keys.update(key, |entry| {
+    let Some(outcome) = bucket.keys.update(key, |entry| {
         let previous = IndexStats::for_entry(entry);
+        // An answer about another version must not lend this one its fields: a HEAD
+        // that left before a write was applied here, or one that saw a write this node
+        // has not applied yet. An entry with an `ETag` is completed only by an answer
+        // carrying the same one; any entry, only by an answer of its size.
+        let same_version =
+            match (&entry.etag, &fill.etag) {
+                (Some(indexed), Some(answered)) => indexed == answered,
+                (Some(_), None) => false,
+                (None, _) => true,
+            } && (entry.size.is_none() || fill.size.is_none() || entry.size == fill.size);
+        if !same_version {
+            return None;
+        }
         let mut filled = false;
         if entry.size.is_none() {
             entry.size = fill.size;
@@ -861,11 +933,14 @@ pub(crate) fn complete_entry(
             entry.meta = Some(Box::new(fill.meta));
             filled = true;
         }
-        (previous, filled.then(|| IndexStats::for_entry(entry)))
+        Some((previous, filled.then(|| IndexStats::for_entry(entry))))
     }) else {
         return Completion::NotIndexed;
     };
-    let Some(current) = current else {
+    let Some((previous, filled)) = outcome else {
+        return Completion::OtherVersion;
+    };
+    let Some(current) = filled else {
         return Completion::AlreadyComplete;
     };
     account_replacement(bucket, stats, previous, current);
@@ -2001,28 +2076,54 @@ mod tests {
         );
     }
 
-    /// Completion fills gaps and nothing else: a key nobody indexed is not created by
-    /// one, and a field the entry already holds is not overwritten by a response that
-    /// may describe an older version.
+    /// Completion fills gaps and nothing else, and only from an answer about the
+    /// version the entry describes: a key nobody indexed is not created by one, an
+    /// answer naming another `ETag` or size — a HEAD that left before a write was
+    /// applied here, or one that saw a write not applied yet — lends the entry nothing,
+    /// and a field the entry already holds is never overwritten.
     #[test]
-    fn completion_only_fills_what_is_missing() {
+    fn completion_only_fills_what_is_missing_from_the_same_version() {
         let state = Index::default();
         assert_eq!(
             complete_entry(&state, "b", "ghost", fill()),
             Completion::NotIndexed,
             "completion never creates a key"
         );
-        let mut seeded = entry(3, 10);
+        let mut seeded = entry(12, 10);
         seeded.etag = Some(ETag::Strong("original".to_owned()));
         apply_put(&state, "b", "k", seeded);
         assert_eq!(
             complete_entry(&state, "b", "k", fill()),
+            Completion::OtherVersion,
+            "an answer about another ETag"
+        );
+        let resized = EntryFill {
+            size: Some(3),
+            etag: Some(ETag::Strong("original".to_owned())),
+            ..fill()
+        };
+        assert_eq!(
+            complete_entry(&state, "b", "k", resized),
+            Completion::OtherVersion,
+            "an answer about another size"
+        );
+        {
+            let g = state.read().unwrap();
+            let entry = &g["b"].keys["k"];
+            assert!(entry.content_type.is_none() && entry.meta.is_none());
+        }
+        let same = EntryFill {
+            etag: Some(ETag::Strong("original".to_owned())),
+            ..fill()
+        };
+        assert_eq!(
+            complete_entry(&state, "b", "k", same),
             Completion::Completed
         );
         let g = state.read().unwrap();
         let entry = &g["b"].keys["k"];
         assert_eq!(entry.etag, Some(ETag::Strong("original".to_owned())));
-        assert_eq!(entry.size, Some(3), "the indexed size stands");
+        assert_eq!(entry.size, Some(12), "the indexed size stands");
         assert_eq!(entry.content_type.as_deref(), Some("text/x-fixture"));
     }
 

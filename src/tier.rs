@@ -518,9 +518,9 @@ struct Core {
     /// The warm disk store, kept for whole-cache flushes (`clear`).
     warm_disk: Option<Arc<MmapDiskTier>>,
     fills: SingleFlight<CacheKey>,
-    /// Only keys with an active origin fill occupy this map. Mutations mark the
-    /// corresponding fill stale before they invalidate its cached body.
-    active_fills: Arc<Mutex<HashMap<CacheKey, Arc<FillFence>>>>,
+    /// Only keys with an active origin fill or observation occupy this map. Mutations
+    /// mark every such fence on the key stale before they invalidate its cached body.
+    active_fills: ActiveFills,
     metrics: Arc<Metrics>,
     has_warm: bool,
     /// The generation a copy must carry to be served without proving itself first.
@@ -538,20 +538,61 @@ struct FillFence {
     commit: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Every key's registered fill and observation fences.
+type ActiveFills = Arc<Mutex<HashMap<CacheKey, Vec<Arc<FillFence>>>>>;
+
+/// One registered fence, removed from the key's set when dropped.
 struct ActiveFill {
     key: CacheKey,
     fence: Arc<FillFence>,
-    active: Arc<Mutex<HashMap<CacheKey, Arc<FillFence>>>>,
+    active: ActiveFills,
+}
+
+impl ActiveFill {
+    fn register(active: &ActiveFills, key: &CacheKey) -> Self {
+        let fence = Arc::new(FillFence {
+            stale: AtomicBool::new(false),
+            commit: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        active
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .push(Arc::clone(&fence));
+        Self {
+            key: key.clone(),
+            fence,
+            active: Arc::clone(active),
+        }
+    }
 }
 
 impl Drop for ActiveFill {
     fn drop(&mut self) {
         let mut active = self.active.lock().unwrap();
-        if active
-            .get(&self.key)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.fence))
-        {
-            active.remove(&self.key);
+        if let Some(fences) = active.get_mut(&self.key) {
+            fences.retain(|fence| !Arc::ptr_eq(fence, &self.fence));
+            if fences.is_empty() {
+                active.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// An origin answer about one key, registered before its request left: a mutation of
+/// the key applied meanwhile marks it stale, and [`commit`](Self::commit) then folds
+/// nothing from it.
+pub(crate) struct ObservationFence(ActiveFill);
+
+impl ObservationFence {
+    /// Run `fold` only if no mutation of the key was applied since the fence was
+    /// registered, under the lock a mutation takes before it changes the key.
+    pub(crate) async fn commit(self, fold: impl FnOnce()) {
+        let fence = &self.0.fence;
+        let _commit = fence.commit.lock().await;
+        if !fence.stale.load(Ordering::Acquire) {
+            fold();
         }
     }
 }
@@ -597,18 +638,31 @@ impl Core {
         self.observe_warm();
     }
 
+    /// Mark every fill and observation of `key` in flight stale, then wait out any
+    /// commit already under way: once this returns, none of them can still land
+    /// anything about the key, until the returned guards drop.
+    async fn fence_key(&self, key: &CacheKey) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let fences = self
+            .active_fills
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        for fence in &fences {
+            fence.stale.store(true, Ordering::Release);
+        }
+        let mut held = Vec::with_capacity(fences.len());
+        for fence in fences {
+            held.push(Arc::clone(&fence.commit).lock_owned().await);
+        }
+        held
+    }
+
     /// Drop an object from every local tier. A tier that fails to delete is counted; its
     /// copy lingers only until eviction and is never authoritative.
     async fn invalidate(&self, key: &CacheKey) {
-        let fence = self.active_fills.lock().unwrap().get(key).cloned();
-        if let Some(fence) = &fence {
-            fence.stale.store(true, Ordering::Release);
-        }
-        let _commit = if let Some(fence) = &fence {
-            Some(fence.commit.lock().await)
-        } else {
-            None
-        };
+        let _commits = self.fence_key(key).await;
         if self.cache.invalidate(key).await.is_err() {
             self.metrics.warm_error();
         }
@@ -619,15 +673,7 @@ impl Core {
     /// applied frontier only after a stale hot body is unservable; warm disk I/O is kept
     /// off that acknowledgement path.
     async fn invalidate_hot(&self, key: &CacheKey) {
-        let fence = self.active_fills.lock().unwrap().get(key).cloned();
-        if let Some(fence) = &fence {
-            fence.stale.store(true, Ordering::Release);
-        }
-        let _commit = if let Some(fence) = &fence {
-            Some(fence.commit.lock().await)
-        } else {
-            None
-        };
+        let _commits = self.fence_key(key).await;
         self.hot.inner().invalidate(key).await;
     }
 
@@ -807,22 +853,10 @@ impl TieredCache {
             drop(gate);
             return Ok(valid);
         }
-        let fence = Arc::new(FillFence {
-            stale: AtomicBool::new(false),
-            commit: Arc::new(tokio::sync::Mutex::new(())),
-        });
-        self.core
-            .active_fills
-            .lock()
-            .unwrap()
-            .insert(key.clone(), Arc::clone(&fence));
-        let active = ActiveFill {
-            key: key.clone(),
-            fence: Arc::clone(&fence),
-            active: Arc::clone(&self.core.active_fills),
-        };
+        let active = ActiveFill::register(&self.core.active_fills, key);
         let result = origin.await;
         if let Ok((obj, meta)) = &result {
+            let fence = &active.fence;
             let _commit = fence.commit.lock().await;
             if !fence.stale.load(Ordering::Acquire) && can_commit() {
                 on_commit(obj, meta);
@@ -832,6 +866,13 @@ impl TieredCache {
         drop(active);
         drop(gate);
         result.map(|(obj, _)| obj)
+    }
+
+    /// Register an origin answer about `key` before its request leaves (see
+    /// [`ObservationFence`]): a write applied here in the meantime keeps it out of the
+    /// index.
+    pub(crate) fn observation_fence(&self, key: &CacheKey) -> ObservationFence {
+        ObservationFence(ActiveFill::register(&self.core.active_fills, key))
     }
 }
 
@@ -843,15 +884,14 @@ pub struct LocalCache {
 }
 
 impl LocalCache {
-    /// Stop an active origin fill before a peer changes the index. Hold the
-    /// returned guard until the index mutation finishes, then invalidate hot.
+    /// Stop every active origin fill and observation of `key` before a peer changes the
+    /// index. Hold the returned guards until the index mutation finishes, then
+    /// invalidate hot.
     pub(crate) async fn fence_mutation(
         &self,
         key: &CacheKey,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        let fence = self.core.active_fills.lock().unwrap().get(key).cloned()?;
-        fence.stale.store(true, Ordering::Release);
-        Some(Arc::clone(&fence.commit).lock_owned().await)
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        self.core.fence_key(key).await
     }
 
     /// Drop a key from every node-local tier. Local writes and failed revalidation need

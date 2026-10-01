@@ -292,6 +292,22 @@ box is the long form):
   node follows. Keep the pod's termination grace period (Helm
   `availability.terminationGracePeriodSeconds`, default 30) above the 15 s the drain
   and seal can take.
+- **A write whose outcome the origin did not settle is fenced everywhere before its
+  error is answered.** A 5xx, a timeout, a missing response, a 412 against a
+  precondition the local index vouched for, a multipart completion whose upload is
+  gone, or a version-scoped delete leaves the key's state unknown. The writer fences the
+  key, advertises it as a put carrying neither `ETag` nor size, and holds the response
+  until every lease-holder has fenced it too (or lapsed); each node then answers the key
+  from the origin until one origin HEAD of its own resolves it. A node from before this
+  rule indexes that event skeletally, which also sends the key's reads to the origin.
+  Every mutation runs on a task of its own, so a client hanging up mid-write cannot
+  strand an applied DELETE, copy or completion outside the index.
+- **A feed gap discards the gapped node's index.** The node missed writes it can no
+  longer order its rows against, so it keeps nothing for a peer-image install to carry
+  forward; the install or the origin rebuild repopulates it.
+- **An origin answer only completes the version it describes.** A forwarded HEAD lends
+  an index entry its metadata only if the entry carries the same `ETag` and size and no
+  write of the key was applied while the HEAD was in flight.
 - The absolute arbiter for conflicting writers remains the origin: conditional
   `If-Match`/`If-None-Match` writes pass through untouched (OCC — no lost updates,
   regardless of node), and the index heals from the origin (gap resync, startup

@@ -1,6 +1,6 @@
 //! The write path's half of a planned stop.
 //!
-//! A PUT's origin call and coherence tail run in a spawned task so that a client
+//! A mutation's origin call and coherence tail run in a spawned task so that a client
 //! hanging up cannot strand an applied write outside the index. That same task
 //! outlives the HTTP drain: the connection is gone while the tail may still be
 //! about to publish. [`WriteTails`] counts those tasks, and
@@ -10,13 +10,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use s3s::S3Result;
 use tokio::sync::watch;
 use tracing::warn;
 
 use crate::cache::proxy::CachingProxy;
 use crate::sync::stop::SealOutcome;
 
-/// The PUT tails still running on this node.
+/// The mutation tails still running on this node.
 #[derive(Clone)]
 pub(crate) struct WriteTails(Arc<watch::Sender<usize>>);
 
@@ -54,10 +55,50 @@ impl WriteTails {
 }
 
 impl CachingProxy {
+    /// Run a mutation of `keys` — its origin call and its coherence tail — on a task of
+    /// its own, counted for the planned stop's seal, and answer with its result. A
+    /// client that hangs up cancels only the wait; the task still records whatever the
+    /// origin did. A task that dies cannot say what it did, so every key it touched is
+    /// advertised as unknown before the failure is answered.
+    pub(super) async fn mutation_tail<T, W>(
+        &self,
+        bucket: &str,
+        keys: &[String],
+        work: W,
+    ) -> S3Result<T>
+    where
+        T: Send + 'static,
+        W: Future<Output = S3Result<T>> + Send + 'static,
+    {
+        let guard = self.tails.track();
+        let tail = tokio::spawn(async move {
+            let _guard = guard;
+            work.await
+        });
+        match tail.await {
+            Ok(result) => result,
+            Err(error) => {
+                let mut receipt = None;
+                for key in keys {
+                    receipt = self
+                        .announce_unknown(bucket, key, "the mutation task terminated")
+                        .await
+                        .or(receipt);
+                }
+                self.await_cluster(receipt, bucket, "<terminated mutation>")
+                    .await;
+                Err(s3s::s3_error!(
+                    InternalError,
+                    "s3cache: mutation task failed: {error}"
+                ))
+            }
+        }
+    }
+
     /// Seal this node's write feed for a planned stop, within `wait` in total.
     ///
     /// Call it only after the HTTP drain has completed, so no request can start a
-    /// write. It first waits for every PUT tail to finish, then seals and waits for
+    /// write. It first waits for every mutation tail to finish, then seals and waits for
     /// the peers to acknowledge the seal (see [`crate::sync::coherence::WriteSync::seal`]).
     /// Returns `None` when nothing was sealed: no coherence is configured, or a tail
     /// was still running at the deadline, in which case the restart stays an
@@ -67,7 +108,9 @@ impl CachingProxy {
         let sync = self.sync.as_ref()?;
         let started = Instant::now();
         if !self.tails.drained(wait).await {
-            warn!("a PUT is still completing at the stop deadline; not sealing the write feed");
+            warn!(
+                "a mutation is still completing at the stop deadline; not sealing the write feed"
+            );
             return None;
         }
         Some(sync.seal(wait.saturating_sub(started.elapsed())).await)

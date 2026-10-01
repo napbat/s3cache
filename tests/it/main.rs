@@ -18,4 +18,5 @@ mod origin_requests;
 mod readiness_probe;
 mod startup;
 mod startup_readiness;
+mod strong_rw;
 mod tier_cache;
