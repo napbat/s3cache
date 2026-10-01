@@ -404,6 +404,33 @@ rejoiner's own writer registered at its new life's start, and the rejoiner
 installs the survivor's image without an origin LIST. A barrier sampled
 before the crossing pends rather than conflicts.
 
+**Donor timing.** The survivor offers the rejoiner a fresh Ready capture on its
+first maintenance turn after the join's lease lapse, about 2.5 s after the
+rejoiner's gossip, and the transfer starts about 1 s later. Groupnet's
+recapture backoff counts only the failures taken under the participants a
+failed attempt named, so the retirements the restart itself caused (the leave
+lapse, the reap, the join lapse) cannot delay the capture for the rejoiner's
+new life. Before groupnet 8f8f1e6 they did: an origin-built survivor offered
+its image 7.7 s after the gossip. The rejoiner is a donor too:
+once its recovery is Ready on the installed image, groupnet adopts that image,
+advertises it under a Building claim at once, and captures it on the next
+verified cut. The pod a rolling update stops next therefore leaves behind a
+node whose image is already Ready or advertised, whichever node first built
+the index, and every later update's donor is such an adopted image.
+
+A transfer operation that fails without a verdict on the image does not cost
+a scan either. Each bulk request is one TCP connection, about 1,700 for a
+108 MB image, and on 2026-10-01 a Windows test host refused one of them
+because it reused a local port still in `TIME_WAIT` toward the same donor
+(Tcpip event 4227). Before groupnet f945950 the follower then excluded that
+donor attempt, waited out the 30 s donor wait while the healthy donor kept
+renewing it, and scanned the origin: 791 LISTs, index-ready 277 s after the
+stop. Now it samples again one observation interval later and transfers from
+the same live Ready attempt; refusals and verification failures still exclude
+it. `tests/it/fleet_production/rolling.rs` prices one and two updates at
+production pace, with the second stop at `minReadySeconds`, while the first
+rejoiner's recapture is pending, and while it runs: each restart lists nothing.
+
 **Crash.** The dead life's tail is unknown, so the survivor takes the gap,
 serves from the origin, and rebuilds. Neither node knows more than the other,
 so the pair makes exactly one origin scan: whichever node builds, the other
