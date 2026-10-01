@@ -1210,7 +1210,7 @@ impl CachingProxy {
     ///
     /// * **Single node** — no write feed, so this proxy is the sole writer and its own
     ///   tiers cannot have missed anything, restart included. Served as-is, which is the
-    ///   warm tier's whole value proposition and what `tests/tier_cache.rs` asserts.
+    ///   warm tier's whole value proposition and what `tests/it/tier_cache.rs` asserts.
     /// * **Already proved** — one relaxed load ([`CachedObject::trusted`]). The steady
     ///   state, and it costs nothing.
     /// * **Suspect, synced bucket** — guarded origin or peer recovery has made

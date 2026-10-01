@@ -2,7 +2,7 @@
 
 ## Controlled local origin
 
-Run `cargo test --locked --test idle-origin -j 2 -- --ignored --nocapture`
+Run `cargo test --locked --test it -j 2 -- idle_origin:: --ignored --nocapture`
 after building the pinned MinIO image. This test runs locally. CI does not
 run the MinIO tests.
 

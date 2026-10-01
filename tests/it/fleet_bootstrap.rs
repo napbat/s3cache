@@ -1,6 +1,6 @@
 //! Origin cost and liveness of peer index bootstrap against real `MinIO`.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

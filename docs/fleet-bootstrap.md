@@ -413,7 +413,7 @@ donor after its scan), one whose uncertain PUT's reconciliation is still open
 at its install, and an unreachable donor using native gossip and loopback
 TCP. They count actual origin request attempts and require bounded positive
 progress or fallback.
-`tests/fleet_production.rs` runs the production scenarios at production size
+`tests/it/fleet_production.rs` runs the production scenarios at production size
 and pace: two nodes gossiping on the in-memory transport, each on a
 one-worker runtime with the binary's recovery, claim and lease
 configuration, over a synthetic listing of 790,000 rows at 250 ms a page,

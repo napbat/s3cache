@@ -57,7 +57,7 @@ src/
     wire.rs      # write-event and session-token codec
     tests.rs     # coherence unit tests
   metrics.rs    # counters, warm-residency gauges, and periodic stats logging
-tests/          # integration tests (link against the library crate)
+tests/it/       # one integration-test binary; each module is a suite (links the library crate)
 deploy/helm/s3cache/   # Helm chart
 scripts/
 Dockerfile
@@ -119,14 +119,14 @@ After dependency, Dockerfile/`.dockerignore`, or release changes, verify the con
 docker build --tag s3cache:check .
 ```
 
-`tests/e2e.rs` and `tests/coherence.rs` start **MinIO** through testcontainers (one
+`tests/it/e2e.rs` and `tests/it/coherence.rs` start **MinIO** through testcontainers (one
 container per test, torn down on drop), so the locked workspace test command needs a
 reachable Docker daemon. Build the pinned source image first with
 `bash scripts/build-minio-test-image.sh`. The proxy reaches MinIO through a transparent
-counting forwarder in `tests/common/mod.rs`, which lets a test measure origin requests.
+counting forwarder in `tests/it/common/mod.rs`, which lets a test measure origin requests.
 Run the MinIO integration tests locally. CI runs unit tests and the Docker-free
-`metrics_endpoint`, `tier_cache`, and `startup-readiness` integration targets.
-The `startup` target uses MinIO to verify early cache hits during index warm-up.
+`metrics_endpoint`, `tier_cache`, and `startup_readiness` integration modules.
+The `startup` module uses MinIO to verify early cache hits during index warm-up.
 Chart and production container checks are conditional on the changes above; an unrelated
 documentation-only edit does not require an image build.
 
@@ -221,5 +221,5 @@ seal waits out every PUT tail (`cache::stop`), then promises peers this life pub
 nothing more, so a peer that delivered it crosses the restart with
 `PeerWrite::Renewed` (`feed_renewals`) instead of a gap and keeps its index. Any
 other restart stays a gap. Never publish after the seal (it panics), and never seal
-while a request or PUT tail can still publish. `tests/fleet_production.rs` holds the
+while a request or PUT tail can still publish. `tests/it/fleet_production.rs` holds the
 production-sized cold-start, planned/crash rejoin and serving-follower scenarios.

@@ -4,7 +4,7 @@
 //! finishes. An incomplete index still forwards LIST and cannot license a
 //! retained warm body from an earlier process.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

@@ -1,6 +1,6 @@
 //! Conditional control-slot behavior against the real S3 adapter and `MinIO`.
 
-mod common;
+use crate::common;
 
 use s3cache::sync::control::{
     AppendResult, Journal, JournalConfig, Limits, Mutation, Record, S3SlotStore, SourceId,

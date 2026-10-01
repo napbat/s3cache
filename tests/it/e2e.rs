@@ -9,7 +9,7 @@
 //! error-code assertions mean anything: those are the origin's semantics, and the claim
 //! under test is that the proxy does not alter them.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

@@ -1,6 +1,6 @@
 //! The default proxy never stores its coordination state in the user's S3 origin.
 
-mod common;
+use crate::common;
 
 use bytes::Bytes;
 use common::{

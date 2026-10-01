@@ -6,7 +6,7 @@
 //! strong mode — and every request that reaches the origin is counted, so "node B knew
 //! without asking" is a fact rather than a hope.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

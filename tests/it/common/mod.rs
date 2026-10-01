@@ -21,8 +21,6 @@
 //! what is under test, and the inbound HTTP hop would only re-test signing and parsing
 //! that `s3s` already covers. The *outbound* hop is real all the way to `MinIO`.
 
-#![allow(dead_code)] // each test binary drives a different subset of the harness
-
 pub mod diff;
 pub mod fleet;
 mod response_pause;
@@ -68,7 +66,7 @@ const SECRET_KEY: &str = "minioadmin";
 /// Room for anything a test caches, so the hot tier is never the thing under test.
 const HOT_BYTES: u64 = 32 * 1024 * 1024;
 /// The same for the warm tier: a test that opts into disk is testing what survives on it,
-/// never its budget (`tests/tier_cache.rs` owns that).
+/// never its budget (`tests/it/tier_cache.rs` owns that).
 const WARM_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Polls `$cond` (an expression that may `.await`) until it holds or the deadline

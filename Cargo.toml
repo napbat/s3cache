@@ -95,6 +95,10 @@ time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[profile.dev]
+# Backtraces keep file:line; only debugger variable info is dropped, for faster links.
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 2
 

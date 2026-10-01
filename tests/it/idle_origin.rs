@@ -1,9 +1,9 @@
 //! Local-only measurement of origin requests during an idle two-node cluster.
 //!
-//! Run with `cargo test --locked --test idle-origin -- --ignored --nocapture` after
+//! Run with `cargo test --locked --test it -- idle_origin:: --ignored --nocapture` after
 //! building the pinned `MinIO` test image. The seed writes bypass the counter.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

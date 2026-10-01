@@ -14,7 +14,7 @@
 //! * a follower serves HEAD, GET, PUT and DELETE traffic while it bootstraps,
 //!   and installs its donor's image without one origin LIST.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -1,6 +1,6 @@
 //! The differential harness: one request, two legs, one comparison.
 //!
-//! Every row in `tests/differential.rs` issues the same request through the
+//! Every row in `tests/it/differential.rs` issues the same request through the
 //! [`CachingProxy`] under test **and** straight at the origin, then asserts the two
 //! answers agree on a named set of fields. The reference leg is a plain
 //! `s3s_aws::Proxy` over the uncounted client — the very translation layer the cache
@@ -18,8 +18,6 @@
 //! * **Exclusions are named, not silent.** A row states its [`Fields`] mask, and every
 //!   field a mask leaves out is either compared by a dedicated test of its own or
 //!   documented at the call site.
-
-#![allow(dead_code)] // each test binary drives a different subset of the harness
 
 use std::collections::BTreeMap;
 
@@ -74,8 +72,6 @@ impl Fields {
     /// The storage class LIST reports per key.
     pub const STORAGE_CLASS: Self = Self(1 << 14);
 
-    /// Everything this harness models.
-    pub const ALL: Self = Self((1 << 17) - 1);
     /// Everything a client can observe about a GET or HEAD answer.
     pub const OBJECT: Self = Self(
         Self::STATUS.0
@@ -179,12 +175,6 @@ pub struct Answer {
 }
 
 impl Answer {
-    /// Whether this leg failed — the shape assertions read better than `status >= 400`.
-    #[must_use]
-    pub fn is_error(&self) -> bool {
-        self.error_code.is_some()
-    }
-
     fn from_error(err: &S3Error) -> Self {
         Self {
             status: err.status_code().map(|status| status.as_u16()),

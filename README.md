@@ -347,20 +347,20 @@ bypass the cache and the *origin* arbitrates, so no update is ever lost:
   startup tests cover origin fallback, body distrust, guarded retry pages, and
   explicit restart after a prolonged outage.
 - **Integration tests** (`cargo test --locked --workspace --all-features`, needs a
-  Docker daemon): `tests/e2e.rs` and `tests/coherence.rs` run the real `CachingProxy`
+  Docker daemon): `tests/it/e2e.rs` and `tests/it/coherence.rs` run the real `CachingProxy`
   against a **real MinIO origin** (testcontainers) reached through a transparent
   request counter, so every claim is asserted twice — what the client saw, and what the
   origin was asked for. LIST/HEAD from the index cost the origin nothing; a GET misses
   once; over-cap objects bypass; ranges slice the cached body; conditional writes
   (`If-None-Match: *`, `If-Match`) keep the origin's 412 semantics and leave the index
-  and cache consistent with the outcome. `tests/coherence.rs` does the same with two
+  and cache consistent with the outcome. `tests/it/coherence.rs` does the same with two
   nodes gossiping over loopback UDP: a write on A is in B's index by the time it
   returns, an overwrite on A makes B validate/refetch only the changed body, replicated
   misses and deletes ask the origin rather than inventing a 404, an origin-routed whole
   GET cannot re-probe stale cache state, a contested create-if-absent is arbitrated by
   the origin, and 640 long-key writes prove acknowledged feed retirement keeps apply
   advancing past the old transport-envelope arrest point.
-- **Differential tests** (`tests/differential.rs`, same Docker origin): every row asks
+- **Differential tests** (`tests/it/differential.rs`, same Docker origin): every row asks
   one question twice — once through the proxy, once straight at MinIO — and asserts a
   client could not tell which answered, over the status, the body and the headers it
   branches on (`ETag`, `Content-Length`, `Content-Range`, `Last-Modified`,
@@ -408,7 +408,7 @@ bash scripts/build-minio-test-image.sh
 
 Set `RUNTIME=podman` to build the image with Podman. The shell end-to-end harness
 builds the image before it starts MinIO. CI runs unit tests and the Docker-free
-`metrics_endpoint` and `tier_cache` integration targets. Run the real MinIO tests
+`metrics_endpoint`, `tier_cache`, and `startup_readiness` integration modules. Run the real MinIO tests
 locally. After Helm chart changes, lint and render with the required upstream value:
 
 ```sh

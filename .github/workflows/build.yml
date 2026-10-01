@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   # Locked Rust lint/test/docs gate plus Helm lint/render. Run the real MinIO tests
-  # locally. CI runs unit tests and integration targets that do not need an origin.
+  # locally. CI runs unit tests and the integration modules that do not need an origin.
   test:
     runs-on: ubuntu-latest
     permissions:
@@ -44,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets --all-features
-      - run: cargo test --locked --workspace --all-features --lib --bins --test metrics_endpoint --test tier_cache --test startup-readiness
+      - run: cargo test --locked --workspace --all-features --lib --bins --test it -- metrics_endpoint:: tier_cache:: startup_readiness::
       - run: cargo doc --locked --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

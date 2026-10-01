@@ -17,7 +17,7 @@
 //! Where a field is left out of a row's mask it is either compared by a test of its own
 //! (so one divergence cannot blanket-ignore a matrix) or documented at the call site.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, SystemTime};
 
