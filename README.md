@@ -477,7 +477,8 @@ completed from a forwarded answer — see below), the warm tier (`warm_hit` / `w
 `warm_mapped_entries`, `warm_disk_bytes`, `warm_disk_budget_bytes`, `warm_evictions`, and
 `warm_evicted_bytes`), and the
 gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`,
-`recovery_origin_scans`, `recovery_ready_recaptures`, `unhealthy_bypasses`).
+`recovery_origin_scans`, `recovery_fallbacks`, `recovery_ready_recaptures`,
+`unhealthy_bypasses`).
 
 Origin requests are counted where they leave the process — an interceptor on the upstream
 client, below every forwarding, fill, probe, index-scan and recovery path — once per HTTP

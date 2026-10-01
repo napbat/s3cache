@@ -280,13 +280,14 @@ pub async fn mem_pod_node(
 }
 
 /// Print the fleet's info decisions, including transfer aborts and
-/// fallbacks, into the test output.
+/// fallbacks, into the test output, each under the pod thread that made it.
 pub fn trace_decisions() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "s3cache::sync::volatile=info".into()),
         )
+        .with_thread_names(true)
         .with_test_writer()
         .try_init();
 }

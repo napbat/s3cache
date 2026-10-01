@@ -6,9 +6,12 @@
 //! published (see [`crate::cache::proxy::CachingProxy::seal_writes`]), this life
 //! can publish nothing more, so [`WriteSync::seal`](crate::sync::coherence::WriteSync::seal)
 //! says so on the feed and waits
-//! for the peers to acknowledge it. A peer that delivered the seal crosses into
-//! the restarted node's next life with a renewal instead of a gap: it keeps its
-//! index and bodies, and its donor journal carries the writer across the restart.
+//! for the peers to acknowledge it. A peer that delivered the seal has applied
+//! that whole life: its recovery no longer needs the stopped node's head, so the
+//! node may leave the roster or come back empty without costing it a scan. It
+//! then crosses into the restarted node's next life with a renewal instead of a
+//! gap: it keeps its index and bodies, and its donor journal carries the writer
+//! across the restart.
 //!
 //! `WriteSync::announce` is the other end: a starting node advertises its new
 //! life at once, so an unsealed restart gaps on every peer immediately rather
@@ -35,6 +38,18 @@ pub enum SealOutcome {
     /// in `bounded`, no peer acknowledges anything). A peer that saw it still
     /// renews; one that did not takes the ordinary restart gap.
     Unconfirmed,
+}
+
+/// What this node delivered of one peer's planned stops since its last gap from
+/// that peer: the volatile recovery's evidence that the peer's head leaving a
+/// life lost nothing (`groupnet`'s `Peer::renewal` and `Peer::sealed`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Crossing {
+    /// The peer's latest restart this node crossed through a delivered seal.
+    pub(crate) renewal: Option<Renewal>,
+    /// The delivered seal of the peer's life this node is still in: set once that
+    /// life's every write is applied, cleared when its next life is crossed into.
+    pub(crate) sealed: Option<Mark>,
 }
 
 impl WriteSync {
@@ -114,6 +129,20 @@ impl WriteSync {
         }
     }
 
+    /// A peer sealed the life this node is in, and every write of it is applied:
+    /// kept as recovery evidence until this node crosses into the peer's next life.
+    pub(super) fn observe_seal(&self, peer: &NodeId, sealed: WriteToken) {
+        self.crossings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(peer.clone())
+            .or_default()
+            .sealed = Some(Mark {
+            epoch: sealed.epoch,
+            sequence: sealed.seq,
+        });
+    }
+
     /// A peer restarted after a seal this node delivered. Nothing was missed: the index
     /// renews the writer (and an open capture journals the crossing), and the renewal is
     /// kept as recovery evidence. Returns the new life's start, `(epoch, 0)`.
@@ -127,38 +156,41 @@ impl WriteSync {
     ) -> WriteToken {
         info!("`{peer}` restarted after a sealed stop; continuing into its epoch {epoch}");
         state.renew_native_writer(&native_cut(peer, sealed), epoch);
-        self.renewals
+        self.crossings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 peer.clone(),
-                Renewal {
-                    sealed: Mark {
-                        epoch: sealed.epoch,
-                        sequence: sealed.seq,
-                    },
-                    epoch,
+                Crossing {
+                    renewal: Some(Renewal {
+                        sealed: Mark {
+                            epoch: sealed.epoch,
+                            sequence: sealed.seq,
+                        },
+                        epoch,
+                    }),
+                    sealed: None,
                 },
             );
         metrics.feed_renewal();
         WriteToken { epoch, seq: 0 }
     }
 
-    /// A gap from `peer` supersedes any renewal it made before.
-    pub(super) fn forget_renewal(&self, peer: &NodeId) {
-        self.renewals
+    /// A gap from `peer` supersedes any seal or renewal it made before.
+    pub(super) fn forget_crossing(&self, peer: &NodeId) {
+        self.crossings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(peer);
     }
 
-    /// `peer`'s latest restart this node crossed through a delivered seal, if no gap
-    /// has followed it.
-    pub(crate) fn renewal_of(&self, peer: &NodeId) -> Option<Renewal> {
-        self.renewals
+    /// What this node delivered of `peer`'s planned stops, if no gap has followed.
+    pub(crate) fn crossing_of(&self, peer: &NodeId) -> Crossing {
+        self.crossings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(peer)
             .copied()
+            .unwrap_or_default()
     }
 }

@@ -386,10 +386,16 @@ capture stays a candidate. The index advances the writer's cut to the seal
 and then to the new life (`note_native_seal`, `renew_native_writer`); a
 renewal that does not continue the cut from its delivered seal withdraws the
 capture as a gap would. In `strong` the stopped node's frozen grants lapse
-the survivor's lease briefly; the lease-lapse recovery reports each sealed
-crossing as `Peer::renewal`, and Groupnet's barrier follows the writer into
-its new life instead of falling back, so the survivor re-affirms without an
-origin scan. It answers from the origin only for that moment.
+the survivor's lease briefly, and the lease-lapse recovery runs while the
+stopped node is reaped, relearned with no state by the seed resolver once its
+replacement's address appears, and only later gossips its new life. The
+recovery reports the seal the survivor delivered as `Peer::sealed` and each
+sealed crossing as `Peer::renewal`, so Groupnet's barrier lets the stopped
+node's head disappear and the node leave the roster, and follows it into its
+new life, instead of falling back: the survivor re-affirms without an origin
+scan. It answers from the origin only for that moment. A rolling update
+therefore stops the second pod as soon as the first has installed its image
+without either restart costing a scan.
 
 **Rejoiner.** The survivor's donor journal renews the rejoiner's old-life cut
 to the new epoch, so a barrier sampled after the crossing aligns with the

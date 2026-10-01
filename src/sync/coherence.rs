@@ -2,9 +2,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use groupnet::consistency::volatile_recovery::{
-    RecoveryError, RecoveryHandle, RecoveryStatus, Renewal,
-};
+use groupnet::consistency::volatile_recovery::{RecoveryError, RecoveryHandle, RecoveryStatus};
 use groupnet::consistency::{
     AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, LeaseConfig, LeaseView, Leases,
     PeerWrite, PeerWrites, RenewalId, WriteFeed, WriteToken, advertised_head, applied_by_selected,
@@ -20,6 +18,7 @@ use crate::index::{
     standard_class,
 };
 use crate::metrics::Metrics;
+use crate::sync::stop::Crossing;
 use crate::sync::volatile::CacheRecoveryAdapter;
 use crate::sync::wire::{
     IndexEvent, IndexOp, decode_event, encode_event, etag_to_wire, from_micros, parse_token,
@@ -370,10 +369,10 @@ pub struct WriteSync {
     /// `strong` mode, and a lock-free borrow plus one compare per request.
     lease_view: Option<LeaseView>,
     recovery: OnceLock<RecoveryHandle<CacheRecoveryAdapter>>,
-    /// Each peer's latest restart this node crossed through a delivered seal, cleared
-    /// by any later gap: the volatile recovery's evidence that a head which left its
-    /// life is a progression (see [`observe_renewal`](Self::observe_renewal)).
-    pub(super) renewals: std::sync::Mutex<std::collections::HashMap<NodeId, Renewal>>,
+    /// What this node delivered of each peer's planned stops, cleared by any later
+    /// gap: the volatile recovery's evidence that a head which left its life lost
+    /// nothing (see [`observe_seal`](Self::observe_seal)).
+    pub(super) crossings: std::sync::Mutex<std::collections::HashMap<NodeId, Crossing>>,
     /// The peer-bootstrap TCP listener lives with this exact recovery handle; a
     /// dropped node cannot keep accepting requests for a retired claim.
     pub(crate) fleet_listener: OnceLock<crate::sync::volatile::fleet::FleetListenerGuard>,
@@ -431,7 +430,7 @@ impl WriteSync {
             leases,
             lease_view: lease_view.clone(),
             recovery: OnceLock::new(),
-            renewals: std::sync::Mutex::default(),
+            crossings: std::sync::Mutex::default(),
             fleet_listener: OnceLock::new(),
             write_wait: lease.duration + WRITE_WAIT_SLACK,
             _node: node,
@@ -890,6 +889,7 @@ impl WriteSync {
                 match event {
                     PeerWrite::Sealed { peer, token } => {
                         state.note_native_seal(native_cut(&peer, token));
+                        sync.observe_seal(&peer, token);
                         frontier.advance(&peer, token);
                         if let Some(ledger) = &ledger {
                             ledger.record(&peer, token).await;
@@ -938,7 +938,7 @@ impl WriteSync {
                         missed_through,
                     } => {
                         warn!("write-feed gap from `{peer}`: distrusting bodies, resyncing index");
-                        sync.forget_renewal(&peer);
+                        sync.forget_crossing(&peer);
                         state.skip_native_gap(&native_cut(&peer, missed_through));
                         // The public signal fences serving before returning; the
                         // recovery worker distrusts bodies and guards every origin

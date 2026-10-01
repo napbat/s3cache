@@ -218,12 +218,14 @@ fn observe_group(
             sequence: grant.seq,
         });
         let grants_lease = group.node_has_capability(&node, CAP_LEASE) || grant.is_some();
+        let crossing = sync.crossing_of(&node);
         peers.push(Peer {
             alive: status == Status::Alive,
             grants_lease,
             old_nonlive: status != Status::Alive
                 && held >= (lease / 4).max(Duration::from_millis(25)),
-            renewal: sync.renewal_of(&node),
+            renewal: crossing.renewal,
+            sealed: crossing.sealed,
             node,
             grant,
             head,
@@ -244,6 +246,7 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
     }
 
     fn fell_back(&self, from: RecoveryStage, reason: RecoveryFallback) {
+        self.metrics.recovery_fallback();
         tracing::info!(?from, ?reason, "recovery fell back");
     }
 

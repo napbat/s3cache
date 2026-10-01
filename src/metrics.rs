@@ -309,6 +309,12 @@ counters! {
     /// Includes initial bootstrap, explicit gap recovery, and a full lapse
     /// fallback; retries are counted separately as additional attempts.
     recovery_origin_scans => recovery_origin_scan,
+    /// A Groupnet recovery episode abandoned its plan: a lapse proof that falls
+    /// back to a full rebuild, a peer image given up for the origin, or an
+    /// episode ending origin-only. The log line names the stage and the reason.
+    /// Movement outside a gap or a crash means a restart the fleet should have
+    /// crossed is costing an origin scan.
+    recovery_fallbacks => recovery_fallback,
     /// A Groupnet recovery generation began one Ready recapture: a guarded
     /// O(buckets) snapshot of this node's completed index at C, then an
     /// off-lock measure and encode of it for peers, CPU on the blocking pool

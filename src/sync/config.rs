@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use groupnet::consistency::LeaseConfig;
 use groupnet::core::{Config, NodeId};
-use groupnet::runtime::Node;
+use groupnet::runtime::{Group, Node};
 use groupnet::transport::Transport;
 use groupnet::transport::udp::UdpTransport;
 use tracing::{info, warn};
@@ -189,6 +189,14 @@ impl WriteSync {
             lease_config(lease_ms),
             Some(Box::new(node)),
         )
+    }
+
+    /// The gossip group this node's feed, leases and membership ride on: a
+    /// read of its roster, or a peer learned out of band the way the seed
+    /// resolver relearns a seed whose address moved.
+    #[must_use]
+    pub fn group(&self) -> &Group {
+        &self.group
     }
 }
 
