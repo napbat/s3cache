@@ -14,6 +14,7 @@
 //! copies; strict reads barrier on feed heads.
 
 mod copy;
+mod origin;
 /// Cache configuration, proxy state, and core tier/index behavior.
 pub mod proxy;
 mod service;

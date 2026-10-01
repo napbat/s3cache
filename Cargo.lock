@@ -3174,6 +3174,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-runtime-api",
  "base64 0.23.1",
  "bincode",
  "blake3",

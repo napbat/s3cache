@@ -800,8 +800,7 @@ pub fn proxy_over_with_metrics(
     metrics: &Arc<Metrics>,
 ) -> CachingProxy {
     CachingProxy::new(
-        s3s_aws::Proxy::builder(client.clone()).build(),
-        client.clone(),
+        client,
         CacheConfig {
             cache_bytes: HOT_BYTES,
             max_obj_bytes,
@@ -873,8 +872,7 @@ pub fn warm_proxy_over(
     let warm = open_warm(dir.path(), WARM_BYTES, max_obj_bytes, Arc::clone(metrics))
         .expect("the warm tier opens");
     CachingProxy::new(
-        s3s_aws::Proxy::builder(client.clone()).build(),
-        client.clone(),
+        client,
         CacheConfig {
             cache_bytes: HOT_BYTES,
             max_obj_bytes,

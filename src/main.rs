@@ -122,7 +122,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
             .force_path_style(true)
             .build(),
     );
-    let proxy = s3s_aws::Proxy::builder(client.clone()).build();
 
     // One counter set for the whole process: the tiers, the write feed, the proxy and
     // the stats task all report into it.
@@ -157,7 +156,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
 
     // Object-body cache: hot (node-local heap) in front of the optional disk tier (warm),
     // in front of the S3 origin (cold). Always layered — no mode to pick.
-    let cp = cache::proxy::CachingProxy::new(proxy, client, cfg.cache, disk, write_sync, counters)
+    let cp = cache::proxy::CachingProxy::new(&client, cfg.cache, disk, write_sync, counters)
         .with_index_scan(cfg.index_scan);
     let cp = configure_recovery_rearm(cp, cfg.recovery_rearm);
     let cp = start_coherence(

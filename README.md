@@ -479,6 +479,19 @@ completed from a forwarded answer — see below), the warm tier (`warm_hit` / `w
 gossip write feed (`feed_*`, `ack_timeouts`, `write_lease_lapses`,
 `recovery_origin_scans`, `recovery_ready_recaptures`, `unhealthy_bypasses`).
 
+Origin requests are counted where they leave the process — an interceptor on the upstream
+client, below every forwarding, fill, probe, index-scan and recovery path — once per HTTP
+attempt that got an answer (retries included, since the origin bills each), whatever the
+status. By R2/S3 billing class: `origin_class_a_requests` (`PutObject`, `CopyObject`,
+multipart create/upload/complete, every `List*`, bucket `Put*`/`Create*`),
+`origin_class_b_requests` (`GetObject`, `HeadObject`, every other `Get*`/`Head*`) and
+`origin_free_requests` (`Delete*`, `AbortMultipartUpload`); their sum is everything sent
+upstream. Paid answers that moved no data are broken out within those totals:
+`origin_get_not_found` and `origin_head_not_found` (absent keys a replicated index miss
+forwards — misses stay non-authoritative there, so these are the cost of that rule) and,
+for object writes, `origin_write_precondition_failed` (412: a conditional PUT/copy such as
+`If-None-Match: *` that lost) and `origin_write_refused` (any other 4xx/5xx).
+
 Those are the coherence tier's, and the split between lease lapses and timeouts is the one
 worth wiring an alert around: **`write_lease_lapses` is the guarantee working** — a peer
 stopped acknowledging, its serve-lease expired, and the write completed knowing that peer

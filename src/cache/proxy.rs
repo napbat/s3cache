@@ -400,23 +400,25 @@ impl CachingProxy {
             && self.sync.as_ref().is_none_or(|sync| sync.may_serve_local())
     }
 
-    /// Wire up the proxy. `cfg` sizes the hot tier; `warm` is the optional node-local
-    /// disk tier and `sync` the gossip write feed (both built by the caller). `metrics`
-    /// is shared so the tiers, the feed, and the stats task all report into it.
+    /// Wire up the proxy over the upstream `client`. `cfg` sizes the hot tier; `warm` is
+    /// the optional node-local disk tier and `sync` the gossip write feed (both built by
+    /// the caller). `metrics` is shared so the tiers, the feed, and the stats task all
+    /// report into it; every request any path sends through `client` is counted there
+    /// by origin billing class (`origin_*`).
     #[must_use]
     pub fn new(
-        inner: s3s_aws::Proxy,
-        client: aws_sdk_s3::Client,
+        client: &aws_sdk_s3::Client,
         cfg: CacheConfig,
         warm: Option<WarmPair>,
         sync: Option<Arc<WriteSync>>,
         metrics: Arc<Metrics>,
     ) -> Self {
+        let client = super::origin::counted_client(client, Arc::clone(&metrics));
         let copy_client = copy::conditioned_client(&client);
         let state = Arc::new(KeyIndex::default());
         metrics.register_index(Arc::clone(&state));
         Self {
-            inner: Arc::new(inner),
+            inner: Arc::new(s3s_aws::Proxy::builder(client.clone()).build()),
             copy_inner: Arc::new(s3s_aws::Proxy::builder(copy_client).build()),
             client,
             state,

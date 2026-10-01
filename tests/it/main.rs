@@ -14,6 +14,7 @@ mod fleet_production;
 mod idle_origin;
 mod metrics_endpoint;
 mod no_control_writes;
+mod origin_requests;
 mod startup;
 mod startup_readiness;
 mod tier_cache;

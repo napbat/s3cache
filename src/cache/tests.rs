@@ -84,8 +84,7 @@ fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
         .build();
     let client = aws_sdk_s3::Client::from_conf(conf);
     CachingProxy::new(
-        s3s_aws::Proxy::builder(client.clone()).build(),
-        client,
+        &client,
         CacheConfig {
             cache_bytes: 1024 * 1024,
             max_obj_bytes: 1024 * 1024,

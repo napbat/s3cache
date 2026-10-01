@@ -222,6 +222,30 @@ counters! {
     head_404 => head_404,
     /// Record a HEAD forwarded to the upstream.
     head_miss => head_miss,
+    /// Record one HTTP attempt sent to the origin for a Class A operation (`PutObject`,
+    /// `CopyObject`, multipart create/upload/complete, every `List*`, bucket
+    /// `Put*`/`Create*`), whatever the answer — retries and refusals included.
+    origin_class_a_requests => origin_class_a_request,
+    /// Record one HTTP attempt sent to the origin for a Class B operation (`GetObject`,
+    /// `HeadObject`, every other `Get*`/`Head*`), whatever the answer.
+    origin_class_b_requests => origin_class_b_request,
+    /// Record one HTTP attempt sent to the origin for an unbilled operation (`Delete*`,
+    /// `AbortMultipartUpload`).
+    origin_free_requests => origin_free_request,
+    /// Record an origin `GetObject` attempt answered 404 (a Class B request that moved
+    /// no data). Also counted in `origin_class_b_requests`.
+    origin_get_not_found => origin_get_not_found,
+    /// Record an origin `HeadObject` attempt answered 404. Also counted in
+    /// `origin_class_b_requests`.
+    origin_head_not_found => origin_head_not_found,
+    /// Record an origin object write (`PutObject`, `CopyObject`, `UploadPart*`,
+    /// `CompleteMultipartUpload`) refused with 412 — a conditional write whose
+    /// precondition (`If-None-Match: *`, `If-Match`) failed. Also counted in
+    /// `origin_class_a_requests`.
+    origin_write_precondition_failed => origin_write_precondition_failed,
+    /// Record an origin object write answered with any other 4xx/5xx. Also counted in
+    /// `origin_class_a_requests`.
+    origin_write_refused => origin_write_refused,
     /// Record a ranged GET served by slicing a cached body.
     range_hit => range_hit,
     /// Record a whole-object promotion driven by a ranged GET.
