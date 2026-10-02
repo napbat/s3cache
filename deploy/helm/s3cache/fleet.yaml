@@ -20,7 +20,7 @@ helm:
         cpu: "1"
         memory: 10Gi
     image:
-      tag: e62a4cbc374b053be85d3bc7a455790ea0bb82a9
+      tag: 1d925a5a6452b0aae0edeeee3cd546274aaa1e76
     upstream:
       endpoint: https://e340c486028724e7b58d09928fdf10e2.r2.cloudflarestorage.com
       buckets: docres
