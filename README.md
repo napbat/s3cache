@@ -292,15 +292,16 @@ box is the long form):
   held. A *planned* stop does not pay it: the departing node retracts its serve-lease
   before it drains, so there is no lapse to wait out. While an asymmetric partition
   lasts, every write pays it, because each ends on a lapse.
-- **A planned restart keeps the peers' index; a crash costs one origin scan.** After
-  its HTTP drain completes (10 s at most), a stopping node seals its write feed and
-  waits up to 5 s for peers to acknowledge the seal. A peer that saw it crosses the
-  restart without a gap (`feed_renewals`), and the returning node copies that peer's
-  index without an origin LIST. A crash, a drain that timed out, or a seal no peer saw
-  is an ordinary gap: the pair rebuilds with exactly one origin scan, which the other
-  node follows. Keep the pod's termination grace period (Helm
-  `availability.terminationGracePeriodSeconds`, default 30) above the 15 s the drain
-  and seal can take.
+- **A planned restart keeps the peers' index; a crash costs one origin scan.** On
+  `SIGTERM` a stopping node answers new writes 503 and, while its HTTP drain runs
+  (10 s at most), seals its write feed once its in-flight writes finish, waiting up
+  to 5 s for peers to acknowledge the seal. A slow read still draining does not delay
+  the seal. A peer that saw it crosses the restart without a gap (`feed_renewals`),
+  and the returning node copies that peer's index without an origin LIST. A crash, a
+  write still running after 5 s, or a seal no peer saw is an ordinary gap: the pair
+  rebuilds with exactly one origin scan, which the other node follows. Keep the pod's
+  termination grace period (Helm `availability.terminationGracePeriodSeconds`,
+  default 30) above the 10 s the stop can take.
 - **A write whose outcome the origin did not settle is fenced everywhere before its
   error is answered.** A 5xx, a timeout, a missing response, a 412 against a
   precondition the local index vouched for, a multipart completion whose upload is

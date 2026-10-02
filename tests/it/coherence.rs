@@ -16,8 +16,11 @@ use common::{
     put_typed, wait_for_index, warm_proxy_over,
 };
 use s3cache::cache::proxy::CachingProxy;
+use s3cache::cache::stop::DRAIN_WAIT;
 use s3cache::metrics::Metrics;
+use s3cache::sync::stop::SealOutcome;
 use s3s::S3;
+use s3s::S3ErrorCode;
 use s3s::dto::{ETag, ETagCondition, HeadObjectOutput, PutObjectInput};
 
 /// Nothing here is about the size cap; keep every object cacheable.
@@ -607,5 +610,62 @@ async fn a_contested_create_is_arbitrated_by_the_origin() {
         get(&node_b, bucket, "contested").await,
         &winner[..],
         "both nodes serve the winner's bytes"
+    );
+}
+
+/// A planned stop whose drain is held past [`DRAIN_WAIT`] by a read still seals the
+/// write feed: only mutation tails publish, and a write that arrives once the stop has
+/// begun is refused with a 503 before it reaches the origin, so nothing can publish
+/// after the seal. (Production, rollout of e62a4cb: a long GET on the stopping pod left
+/// its feed unsealed, and the survivor fell back to an origin scan.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_outliving_the_drain_still_seals_and_late_writes_are_refused() {
+    let origin = Origin::start("coherence-stop-held-read").await;
+    let bucket = origin.bucket();
+    origin.seed("held", b"read across the stop").await;
+    let (node_a, node_b) = two_nodes(&origin, ("stop-a", "stop-b")).await;
+    settle_cluster(&node_a, &node_b, bucket).await;
+
+    origin.pause_next_get();
+    let read = tokio::spawn({
+        let (node, bucket) = (node_a.clone(), bucket.to_owned());
+        async move { get(&node, &bucket, "held").await }
+    });
+    origin.wait_for_paused_get().await;
+
+    let stop = node_a.stop(async move {
+        let _ = read.await;
+    });
+    tokio::pin!(stop);
+    // One poll runs the stop up to its drain: the lease is retracted and admission closed.
+    tokio::select! {
+        biased;
+        stopped = &mut stop => panic!("the stop cannot finish while the read is held: {stopped:?}"),
+        () = std::future::ready(()) => {}
+    }
+    let puts = origin.ops.put();
+    let (stopped, late) = tokio::join!(
+        &mut stop,
+        put_conditional(&node_a, bucket, "late", b"after SIGTERM", None, None)
+    );
+    origin.release_paused_get();
+
+    let refused = late.expect_err("a write after the stop began is refused");
+    assert_eq!(refused.code(), &S3ErrorCode::ServiceUnavailable);
+    assert_eq!(
+        origin.ops.put(),
+        puts,
+        "the refused write never reached the origin"
+    );
+    assert_eq!(origin.etag("late").await, None);
+    assert!(!stopped.drained, "the held read outlived {DRAIN_WAIT:?}");
+    assert_eq!(
+        stopped.sealed,
+        Some(SealOutcome::Observed),
+        "the peer acknowledged the seal despite the held read"
+    );
+    assert!(
+        !list(&node_b, bucket).await.contains(&"late".to_owned()),
+        "nothing was published for the refused write"
     );
 }

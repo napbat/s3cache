@@ -2,9 +2,9 @@
 //!
 //! A crash leaves peers a gap: the dead life may have committed origin writes it
 //! never published, and only the origin knows which. A planned stop can prove
-//! that tail empty. Once the HTTP drain has finished and every mutation tail has
-//! published (see [`crate::cache::proxy::CachingProxy::seal_writes`]), this life
-//! can publish nothing more, so [`WriteSync::seal`](crate::sync::coherence::WriteSync::seal)
+//! that tail empty. Once mutation admission is closed and every admitted mutation
+//! tail has published (see [`crate::cache::proxy::CachingProxy::seal_writes`]), this
+//! life can publish nothing more, so [`WriteSync::seal`](crate::sync::coherence::WriteSync::seal)
 //! says so on the feed and waits
 //! for the peers to acknowledge it. A peer that delivered the seal has applied
 //! that whole life: its recovery no longer needs the stopped node's head, so the

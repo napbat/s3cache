@@ -375,19 +375,22 @@ published write. What each kind of stop costs follows from that.
 recovery opens (`WriteSync::announce`), so every peer settles its restart at
 once rather than at the new life's first write.
 
-**Planned stop: seal.** On `SIGTERM` the binary retracts its serve-lease,
-drains HTTP connections for up to 10 s, and only if the drain completed seals
-its write feed (`CachingProxy::seal_writes`, then `WriteSync::seal`). The seal
-first waits for every mutation tail, the spawned origin-and-publish task each
-PUT, DELETE, DeleteObjects, copy, and multipart completion runs
+**Planned stop: seal.** On `SIGTERM` the binary retracts its serve-lease and
+closes mutation admission: from then on a PUT, DELETE, DeleteObjects, copy, or
+multipart completion is answered 503 before it reaches the origin. It then
+drains HTTP connections for up to 10 s and, alongside the drain, seals its
+write feed (`CachingProxy::stop`, `CachingProxy::seal_writes`, then
+`WriteSync::seal`). The seal first waits for every admitted mutation tail, the
+spawned origin-and-publish task each of those writes runs
 (`CachingProxy::mutation_tail`) so a client hang-up cannot strand an applied
-write, and then promises the peers that this life publishes nothing more. It
-waits up to 5 s for every peer a write waits on to acknowledge the seal. A
-drain that timed out, a mutation tail still running, or a crash leaves the
-feed unsealed: the restart stays an ordinary gap,
-which is always safe. The Helm chart's
-`availability.terminationGracePeriodSeconds` (default 30) must cover the
-drain plus the seal wait.
+write, and then promises the peers that this life publishes nothing more. Only
+mutation tails publish, so a GET, UploadPart, or LIST still draining does not
+hold the seal back. It waits up to 5 s in total for the tails and for every
+peer a write waits on to acknowledge the seal. A mutation tail still running at
+that deadline, or a crash, leaves the feed unsealed: the restart stays an
+ordinary gap, which is always safe. The stop takes the longer of the drain and
+the seal wait (10 s), and the Helm chart's
+`availability.terminationGracePeriodSeconds` (default 30) must cover it.
 
 **Survivor.** A survivor that delivered the seal crosses into the rejoiner's
 new life with `PeerWrite::Renewed` instead of a gap (`feed_renewals`): it

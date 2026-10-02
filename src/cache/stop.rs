@@ -3,9 +3,11 @@
 //! A mutation's origin call and coherence tail run in a spawned task so that a client
 //! hanging up cannot strand an applied write outside the index. That same task
 //! outlives the HTTP drain: the connection is gone while the tail may still be
-//! about to publish. [`WriteTails`] counts those tasks, and
-//! [`CachingProxy::seal_writes`] seals the feed only once none is left — a seal
-//! promises the peers that this life publishes nothing more.
+//! about to publish. [`WriteTails`] counts those tasks and, once a planned stop
+//! closes it, admits no new one; [`CachingProxy::seal_writes`] seals the feed once
+//! none is left — a seal promises the peers that this life publishes nothing more.
+//! Only mutation tails publish, so the seal does not wait for reads, uploads of
+//! parts, or listings still draining.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,9 +22,10 @@ use crate::sync::stop::SealOutcome;
 /// How long a planned stop lets in-flight requests finish.
 pub const DRAIN_WAIT: Duration = Duration::from_secs(10);
 
-/// How long a drained stop waits for mutation tails and for peers to acknowledge the feed
-/// seal. With [`DRAIN_WAIT`] it must fit inside the pod's termination grace period
-/// (the Helm chart's `terminationGracePeriodSeconds`).
+/// How long a planned stop waits for mutation tails and for peers to acknowledge the
+/// feed seal. It runs alongside [`DRAIN_WAIT`], so the stop takes the longer of the two,
+/// which must fit inside the pod's termination grace period (the Helm chart's
+/// `terminationGracePeriodSeconds`).
 pub const SEAL_WAIT: Duration = Duration::from_secs(5);
 
 /// What a planned stop did.
@@ -34,38 +37,67 @@ pub struct Stopped {
     pub sealed: Option<SealOutcome>,
 }
 
-/// The mutation tails still running on this node.
+/// The mutation tails still running on this node, and whether new ones are admitted.
 #[derive(Clone)]
-pub(crate) struct WriteTails(Arc<watch::Sender<usize>>);
+pub(crate) struct WriteTails(Arc<watch::Sender<TailCount>>);
+
+#[derive(Default)]
+pub(crate) struct TailCount {
+    running: usize,
+    closed: bool,
+}
 
 impl Default for WriteTails {
     fn default() -> Self {
-        Self(Arc::new(watch::Sender::new(0)))
+        Self(Arc::new(watch::Sender::new(TailCount::default())))
     }
 }
 
 /// One running tail; dropping it (the task finished, panicked, or was aborted)
 /// takes it off the count.
-pub(crate) struct TailGuard(Arc<watch::Sender<usize>>);
+pub(crate) struct TailGuard(Arc<watch::Sender<TailCount>>);
+
+impl TailGuard {
+    /// Another hold on the same tail, counted even once admission is closed: the tail
+    /// it extends was admitted before.
+    fn share(&self) -> Self {
+        self.0.send_modify(|count| count.running += 1);
+        Self(Arc::clone(&self.0))
+    }
+}
 
 impl Drop for TailGuard {
     fn drop(&mut self) {
-        self.0.send_modify(|running| *running -= 1);
+        self.0.send_modify(|count| count.running -= 1);
     }
 }
 
 impl WriteTails {
-    /// Count a tail. Take it before the task is spawned, so no wait can observe
-    /// zero between the spawn and the task's first poll.
-    pub(crate) fn track(&self) -> TailGuard {
-        self.0.send_modify(|running| *running += 1);
-        TailGuard(Arc::clone(&self.0))
+    /// Count a tail, or `None` once a planned stop closed admission. Take it before the
+    /// task is spawned, so no wait can observe zero between the spawn and the task's
+    /// first poll.
+    pub(crate) fn track(&self) -> Option<TailGuard> {
+        let mut admitted = false;
+        self.0.send_if_modified(|count| {
+            admitted = !count.closed;
+            if admitted {
+                count.running += 1;
+            }
+            admitted
+        });
+        admitted.then(|| TailGuard(Arc::clone(&self.0)))
+    }
+
+    /// Admit no new tail; the check and the count share one lock, so after this returns
+    /// the count can only fall.
+    fn close(&self) {
+        self.0.send_modify(|count| count.closed = true);
     }
 
     /// Whether every tail finished within `wait`.
     async fn drained(&self, wait: Duration) -> bool {
         let mut running = self.0.subscribe();
-        tokio::time::timeout(wait, running.wait_for(|running| *running == 0))
+        tokio::time::timeout(wait, running.wait_for(|count| count.running == 0))
             .await
             .is_ok_and(|result| result.is_ok())
     }
@@ -76,7 +108,8 @@ impl CachingProxy {
     /// its own, counted for the planned stop's seal, and answer with its result. A
     /// client that hangs up cancels only the wait; the task still records whatever the
     /// origin did. A task that dies cannot say what it did, so every key it touched is
-    /// advertised as unknown before the failure is answered.
+    /// advertised as unknown before the failure is answered. Once a planned stop has
+    /// begun, the mutation is refused with a 503 before it reaches the origin.
     pub(super) async fn mutation_tail<T, W>(
         &self,
         bucket: &str,
@@ -87,7 +120,15 @@ impl CachingProxy {
         T: Send + 'static,
         W: Future<Output = S3Result<T>> + Send + 'static,
     {
-        let guard = self.tails.track();
+        let Some(guard) = self.tails.track() else {
+            return Err(s3s::s3_error!(
+                ServiceUnavailable,
+                "s3cache: this node is stopping; retry the write on another node"
+            ));
+        };
+        // The announcements of a terminated task publish too, so this wait holds the
+        // tail open until they are done.
+        let _announcing = guard.share();
         let tail = tokio::spawn(async move {
             let _guard = guard;
             work.await
@@ -114,13 +155,13 @@ impl CachingProxy {
 
     /// Seal this node's write feed for a planned stop, within `wait` in total.
     ///
-    /// Call it only after the HTTP drain has completed, so no request can start a
-    /// write. It first waits for every mutation tail to finish, then seals and waits for
-    /// the peers to acknowledge the seal (see [`crate::sync::coherence::WriteSync::seal`]).
-    /// Returns `None` when nothing was sealed: no coherence is configured, or a tail
-    /// was still running at the deadline, in which case the restart stays an
-    /// ordinary gap for the peers — the only safe answer while a write may still
-    /// publish.
+    /// Call it only once mutation admission is closed (as [`stop`](Self::stop) does), so
+    /// no new write can start. It first waits for every mutation tail to finish, then
+    /// seals and waits for the peers to acknowledge the seal (see
+    /// [`crate::sync::coherence::WriteSync::seal`]). Returns `None` when nothing was
+    /// sealed: no coherence is configured, or a tail was still running at the deadline,
+    /// in which case the restart stays an ordinary gap for the peers — the only safe
+    /// answer while a write may still publish.
     pub async fn seal_writes(&self, wait: Duration) -> Option<SealOutcome> {
         let sync = self.sync.as_ref()?;
         let started = Instant::now();
@@ -135,9 +176,11 @@ impl CachingProxy {
 }
 
 impl CachingProxy {
-    /// The binary's planned stop (`SIGTERM`): retract this node's serve-lease, let
-    /// `drain` — the HTTP server's graceful shutdown — finish within [`DRAIN_WAIT`],
-    /// and seal the write feed only if it did.
+    /// The binary's planned stop (`SIGTERM`): retract this node's serve-lease, refuse
+    /// new mutations, and then, side by side, let `drain` — the HTTP server's graceful
+    /// shutdown — finish within [`DRAIN_WAIT`] and seal the write feed within
+    /// [`SEAL_WAIT`]. The seal waits only for mutation tails, so a long read still
+    /// draining does not cost the peers their index.
     pub async fn stop(&self, drain: impl Future<Output = ()>) -> Stopped {
         // Announce the departure before draining, not after: the retraction is one gossip
         // entry and the drain can take seconds, and every one of them is a second a peer's
@@ -145,18 +188,18 @@ impl CachingProxy {
         if let Some(sync) = &self.sync {
             sync.leave();
         }
-        let drained = tokio::time::timeout(DRAIN_WAIT, drain).await.is_ok();
-        // Seal only a drained stop. A request still running could publish after the
-        // seal, and the seal would promise peers a tail this life did not end at; the
-        // restart then stays an ordinary gap, which is always safe.
-        let sealed = if drained {
+        // From here every new write is a 503 before it reaches the origin, so once the
+        // admitted tails finish nothing can publish after the seal.
+        self.tails.close();
+        let (drained, sealed) = tokio::join!(
+            async { tokio::time::timeout(DRAIN_WAIT, drain).await.is_ok() },
+            self.seal_writes(SEAL_WAIT),
+        );
+        if drained {
             info!("graceful shutdown complete");
-            self.seal_writes(SEAL_WAIT).await
         } else {
             info!("shutdown timed out");
-            warn!("requests were still running at the drain deadline; not sealing the write feed");
-            None
-        };
+        }
         Stopped { drained, sealed }
     }
 }
@@ -169,8 +212,8 @@ mod tests {
     async fn tails_drain_only_once_every_guard_is_gone() {
         let tails = WriteTails::default();
         assert!(tails.drained(Duration::ZERO).await, "no tail is running");
-        let first = tails.track();
-        let second = tails.track();
+        let first = tails.track().expect("admitted");
+        let second = tails.track().expect("admitted");
         assert!(!tails.drained(Duration::from_millis(20)).await);
         drop(first);
         assert!(!tails.drained(Duration::from_millis(20)).await);
@@ -180,5 +223,24 @@ mod tests {
         });
         drop(second);
         assert!(waiting.await.unwrap(), "the last guard wakes the waiter");
+    }
+
+    #[tokio::test]
+    async fn a_closed_count_admits_nothing_but_keeps_admitted_tails() {
+        let tails = WriteTails::default();
+        let admitted = tails.track().expect("admitted");
+        tails.close();
+        assert!(
+            tails.track().is_none(),
+            "a stopping node admits no new tail"
+        );
+        let announcing = admitted.share();
+        drop(admitted);
+        assert!(
+            !tails.drained(Duration::from_millis(20)).await,
+            "a shared hold keeps the tail open"
+        );
+        drop(announcing);
+        assert!(tails.drained(Duration::ZERO).await);
     }
 }

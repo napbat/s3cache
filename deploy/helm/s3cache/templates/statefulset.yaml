@@ -32,7 +32,7 @@ spec:
         prometheus.io/path: /metrics
       {{- end }}
     spec:
-      # SIGTERM to SIGKILL: the request drain plus the write-feed seal must fit.
+      # SIGTERM to SIGKILL: the request drain and the concurrent write-feed seal must fit.
       terminationGracePeriodSeconds: {{ .Values.availability.terminationGracePeriodSeconds | int64 }}
       {{- with .Values.imagePullSecret.existingSecret }}
       imagePullSecrets:

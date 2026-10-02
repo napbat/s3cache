@@ -50,8 +50,6 @@ const WARM: u64 = 8 * 1024 * 1024;
 const RUN: Duration = Duration::from_secs(14);
 /// The bound on any wait for the pair to serve locally.
 const SETTLE: Duration = Duration::from_secs(90);
-/// The binary's drained-stop seal wait (`SEAL_WAIT` in `main.rs`).
-const SEAL_WAIT: Duration = Duration::from_secs(5);
 /// The lease duration every node runs, as the binary defaults it.
 const LEASE: Duration = Duration::from_millis(DEFAULT_LEASE_MS);
 
@@ -178,7 +176,6 @@ struct Cluster {
 #[derive(Clone)]
 struct NodeHandle {
     proxy: CachingProxy,
-    sync: Arc<WriteSync>,
     metrics: Arc<Metrics>,
     runtime: tokio::runtime::Handle,
 }
@@ -240,7 +237,7 @@ impl Cluster {
         let client = self.origin.counted_client();
         let bucket = self.bucket.clone();
         let node_metrics = Arc::clone(&metrics);
-        let (sync, proxy) = pod
+        let proxy = pod
             .handle()
             .spawn(async move {
                 let sync = Arc::new(WriteSync::over_transport(
@@ -257,7 +254,7 @@ impl Cluster {
                         max_obj_bytes: CAP,
                     },
                     Some(warm),
-                    Some(Arc::clone(&sync)),
+                    Some(sync),
                     node_metrics,
                 )
                 .with_index_scan(SERIAL_SCAN)
@@ -265,7 +262,7 @@ impl Cluster {
                 proxy
                     .start_fleet_coherence(std::slice::from_ref(&bucket))
                     .await;
-                (sync, proxy)
+                proxy
             })
             .await
             .expect("node construction");
@@ -273,7 +270,6 @@ impl Cluster {
         self.pods.lock().unwrap()[index] = Some(pod);
         self.nodes.write().unwrap()[index] = Some(NodeHandle {
             proxy,
-            sync,
             metrics,
             runtime,
         });
@@ -294,19 +290,18 @@ impl Cluster {
             .expect("pod shutdown");
     }
 
-    /// The binary's `SIGTERM` path: retract the lease, drain, seal the feed, stop.
+    /// The binary's `SIGTERM` path ([`CachingProxy::stop`]): retract the lease, close
+    /// mutation admission, seal the feed, stop. No request is in flight to drain.
     async fn planned_stop(&self, index: usize) {
         let Some(node) = self.node(index) else { return };
         self.note(format!("{} stopping (leave + seal)", self.names[index]));
-        let (sync, proxy) = (Arc::clone(&node.sync), node.proxy.clone());
-        let sealed = node
+        let proxy = node.proxy.clone();
+        let stopped = node
             .runtime
-            .spawn(async move {
-                sync.leave();
-                proxy.seal_writes(SEAL_WAIT).await
-            })
+            .spawn(async move { proxy.stop(std::future::ready(())).await })
             .await
             .expect("planned stop");
+        let sealed = stopped.sealed;
         self.nodes.write().unwrap()[index] = None;
         let pod = self.pods.lock().unwrap()[index].take();
         self.note(format!("{} stopped; seal {sealed:?}", self.names[index]));
