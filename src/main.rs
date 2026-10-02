@@ -134,9 +134,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // comma-separated id=host:port pairs) to enable; single-node needs none of it.
     let write_sync = sync::config::from_env(&cfg.node_name).await.map(Arc::new);
     info!("gossip coherence (write feed): {}", write_sync.is_some());
-    // Kept for the shutdown path: a planned stop retracts this node's serve-lease
-    // instead of letting peers wait it out (see `WriteSync::leave`).
-    let leaving = write_sync.clone();
 
     // Object-body cache: hot (node-local heap) in front of the optional disk tier (warm),
     // in front of the S3 origin (cold). Always layered — no mode to pick.
@@ -156,8 +153,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     // fails to sync just stays in passthrough (safe).
     cp.spawn_background_sync(cfg.buckets.clone());
     metrics::spawn_stats(cp.metrics(), cfg.stats_secs);
-    // Kept for the readiness probe and the shutdown path: a drained stop seals the
-    // write feed through it.
+    // Kept for the readiness probe and the shutdown path: a planned stop retracts this
+    // node's serve-lease and seals the write feed through it.
     let stopping_proxy = cp.clone();
 
     let service = {
@@ -202,41 +199,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         });
     }
 
-    // Announce the departure before draining, not after: the retraction is one gossip
-    // entry and the drain can take seconds, and every one of them is a second a peer's
-    // next write might spend waiting out a lease this node has already stopped using.
-    if let Some(sync) = &leaving {
-        sync.leave();
-    }
-
-    let drained = tokio::select! {
-        () = graceful.shutdown() => {
-            info!("graceful shutdown complete");
-            true
-        }
-        () = tokio::time::sleep(DRAIN_WAIT) => {
-            info!("shutdown timed out");
-            false
-        }
-    };
-    // Seal only a drained stop. A request still running could publish after the
-    // seal, and the seal would promise peers a tail this life did not end at; the
-    // restart then stays an ordinary gap, which is always safe.
-    if drained {
-        stopping_proxy.seal_writes(SEAL_WAIT).await;
-    } else {
-        warn!("requests were still running at the drain deadline; not sealing the write feed");
-    }
+    stopping_proxy.stop(graceful.shutdown()).await;
     Ok(())
 }
-
-/// How long a planned stop lets in-flight requests finish.
-const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long a drained stop waits for mutation tails and for peers to acknowledge the feed
-/// seal. With [`DRAIN_WAIT`] it must fit inside the pod's termination grace period
-/// (the Helm chart's `terminationGracePeriodSeconds`).
-const SEAL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Resolves on the first signal that means "stop": `SIGTERM` or `ctrl_c`.
 ///

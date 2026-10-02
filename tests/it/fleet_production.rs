@@ -6,9 +6,9 @@
 //! listing). Every scenario records its timings.
 //!
 //! * a cold start makes one origin scan, and the follower lists nothing;
-//! * a planned stop seals the restarting node's feed: the survivor keeps its
-//!   index with no gap and no scan, and the rejoiner installs the survivor's
-//!   image without one origin LIST;
+//! * a planned stop, by the binary's own `SIGTERM` path, seals the restarting
+//!   node's feed: the survivor keeps its index with no gap and no scan, and the
+//!   rejoiner installs the survivor's image without one origin LIST;
 //! * a crash leaves the dead life's tail unknown: the pair makes exactly one
 //!   scan, and the other node follows it;
 //! * a follower serves HEAD, GET, PUT and DELETE traffic while it bootstraps,
@@ -26,11 +26,13 @@ use common::fleet::{Counts, Pod, free_tcp_port, mem_pod_node, serves_locally, tr
 use common::{Origin, counter, delete, get, head, put, request};
 use groupnet::transport::mem::Network;
 use s3cache::cache::proxy::CachingProxy;
+use s3cache::cache::stop::Stopped;
 use s3cache::metrics::Metrics;
 use s3cache::sync::coherence::WriteSync;
 use s3cache::sync::stop::SealOutcome;
 use s3s::S3;
 use s3s::dto::ListObjectsV2Input;
+use tokio::task::JoinHandle;
 
 mod rolling;
 
@@ -40,8 +42,6 @@ const ROWS: usize = 790_000;
 const PAGE: Duration = Duration::from_millis(250);
 /// Room for two paced scans and a transfer.
 const DEADLINE: Duration = Duration::from_mins(20);
-/// The binary's drained-stop seal wait (`SEAL_WAIT` in `main.rs`).
-const SEAL_WAIT: Duration = Duration::from_secs(5);
 /// Writes the restarting node makes before it stops.
 const WRITTEN: usize = 4;
 
@@ -363,26 +363,27 @@ async fn write_through(writer: &Node, reader: &Node, bucket: &str, first: usize)
     panic!("the survivor applied the restarting node's writes");
 }
 
-/// The binary's `SIGTERM` path after a completed drain: retract the lease, then
-/// seal the write feed and wait for the peer to acknowledge it. The pod is gone
-/// when this returns; what its life cost is returned.
-async fn planned_stop(node: Node) -> Life {
-    let (sync, proxy) = (Arc::clone(&node.sync), node.proxy.clone());
-    let sealed = node
+/// The binary's `SIGTERM` path ([`CachingProxy::stop`]): retract the lease, drain
+/// the node's in-flight requests — `in_flight`, a client request the pod is still
+/// serving, if any — and seal the write feed. The pod is gone when this returns;
+/// what its life cost is returned, with how the stop ended.
+async fn planned_stop(node: Node, in_flight: Option<JoinHandle<()>>) -> (Life, Stopped) {
+    let proxy = node.proxy.clone();
+    let stopped = node
         .pod
         .handle()
         .spawn(async move {
-            sync.leave();
-            proxy.seal_writes(SEAL_WAIT).await
+            proxy
+                .stop(async move {
+                    if let Some(request) = in_flight {
+                        let _ = request.await;
+                    }
+                })
+                .await
         })
         .await
         .expect("planned stop");
-    assert_eq!(
-        sealed,
-        Some(SealOutcome::Observed),
-        "the survivor acknowledged the seal"
-    );
-    node.life()
+    (node.life(), stopped)
 }
 
 /// Cold-start the pair, write through the `restart` node, stop it by `stop`,
@@ -413,7 +414,12 @@ async fn rejoin(label: &str, names: [&'static str; 2], stop: Stop, restart: Rest
     let renewals_before = survivor.count("feed_renewals");
     let before = fleet.counts();
     if stop == Stop::Planned {
-        planned_stop(restarting).await;
+        let (_, stopped) = planned_stop(restarting, None).await;
+        assert_eq!(
+            stopped.sealed,
+            Some(SealOutcome::Observed),
+            "the survivor acknowledged the seal: {stopped:?}"
+        );
     } else {
         drop(restarting);
     }

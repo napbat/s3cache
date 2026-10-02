@@ -20,7 +20,8 @@ mod origin;
 pub mod proxy;
 mod readiness;
 mod service;
-mod stop;
+/// The planned stop: the request drain and the write feed's seal.
+pub mod stop;
 
 #[cfg(test)]
 mod tests;

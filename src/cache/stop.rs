@@ -12,10 +12,27 @@ use std::time::{Duration, Instant};
 
 use s3s::S3Result;
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::cache::proxy::CachingProxy;
 use crate::sync::stop::SealOutcome;
+
+/// How long a planned stop lets in-flight requests finish.
+pub const DRAIN_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a drained stop waits for mutation tails and for peers to acknowledge the feed
+/// seal. With [`DRAIN_WAIT`] it must fit inside the pod's termination grace period
+/// (the Helm chart's `terminationGracePeriodSeconds`).
+pub const SEAL_WAIT: Duration = Duration::from_secs(5);
+
+/// What a planned stop did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stopped {
+    /// Every in-flight request finished within [`DRAIN_WAIT`].
+    pub drained: bool,
+    /// How the write feed's seal ended; `None` when nothing was sealed.
+    pub sealed: Option<SealOutcome>,
+}
 
 /// The mutation tails still running on this node.
 #[derive(Clone)]
@@ -114,6 +131,33 @@ impl CachingProxy {
             return None;
         }
         Some(sync.seal(wait.saturating_sub(started.elapsed())).await)
+    }
+}
+
+impl CachingProxy {
+    /// The binary's planned stop (`SIGTERM`): retract this node's serve-lease, let
+    /// `drain` — the HTTP server's graceful shutdown — finish within [`DRAIN_WAIT`],
+    /// and seal the write feed only if it did.
+    pub async fn stop(&self, drain: impl Future<Output = ()>) -> Stopped {
+        // Announce the departure before draining, not after: the retraction is one gossip
+        // entry and the drain can take seconds, and every one of them is a second a peer's
+        // next write might spend waiting out a lease this node has already stopped using.
+        if let Some(sync) = &self.sync {
+            sync.leave();
+        }
+        let drained = tokio::time::timeout(DRAIN_WAIT, drain).await.is_ok();
+        // Seal only a drained stop. A request still running could publish after the
+        // seal, and the seal would promise peers a tail this life did not end at; the
+        // restart then stays an ordinary gap, which is always safe.
+        let sealed = if drained {
+            info!("graceful shutdown complete");
+            self.seal_writes(SEAL_WAIT).await
+        } else {
+            info!("shutdown timed out");
+            warn!("requests were still running at the drain deadline; not sealing the write feed");
+            None
+        };
+        Stopped { drained, sealed }
     }
 }
 

@@ -23,10 +23,14 @@ use super::{
 };
 
 /// A replacement pod's start, from its predecessor's stop to its gossip: on
-/// 2026-10-01 each replacement's gossip bound 32–34 s after its predecessor's
-/// `SIGTERM`, 25–31 s of it opening its warm tier, and its peer ran alone
-/// meanwhile.
+/// 2026-10-01 each replacement of a `rollout restart` bound its gossip 32–34 s
+/// after its predecessor's `SIGTERM`, 25–31 s of it opening its warm tier, and
+/// its peer ran alone meanwhile.
 const POD_START: Duration = Duration::from_secs(30);
+
+/// The kubelet's readiness probe period: a pod turns ready at the first probe
+/// that passes after its index is ready, up to one period late.
+const PROBE_PERIOD: Duration = Duration::from_secs(5);
 
 /// The `StatefulSet`'s `minReadySeconds`: it stops the next pod once the
 /// replacement has reported ready for this long.
@@ -102,7 +106,9 @@ async fn restart(fleet: &Fleet, index: usize, member: Member, survivor: &Node) -
     let pod = fleet.names[index];
     let stopped = Instant::now();
     milestone("stop", pod);
-    let life = planned_stop(member.node).await.since(member.before);
+    let (life, outcome) = planned_stop(member.node, None).await;
+    milestone(&format!("stopped {outcome:?}"), pod);
+    let life = life.since(member.before);
     let node = replace(fleet, index, survivor, stopped).await;
     let (proxy, bucket) = (node.proxy.clone(), fleet.bucket.clone());
     let ready = tokio::spawn(async move {
@@ -124,16 +130,15 @@ async fn restart(fleet: &Fleet, index: usize, member: Member, survivor: &Node) -
 async fn next_stop(replacement: &Node, bucket: &str, next: NextStop) {
     match next {
         NextStop::StatefulSet => {
-            // `minReadySeconds` counts from the pod's last turn to ready.
-            let mut ready_since = None;
-            wait_until("the first replacement is ready for minReadySeconds", || {
-                if !replacement.proxy.probe_ready() {
-                    ready_since = None;
-                    return false;
+            let mut ticks = tokio::time::interval(PROBE_PERIOD);
+            loop {
+                ticks.tick().await;
+                if replacement.proxy.probe_ready() {
+                    break;
                 }
-                ready_since.get_or_insert_with(Instant::now).elapsed() >= MIN_READY
-            })
-            .await;
+            }
+            milestone("probe ready", "replacement");
+            tokio::time::sleep(MIN_READY).await;
         }
         NextStop::RecapturePending => {
             wait_until("the first replacement serves locally", || {
