@@ -3,8 +3,9 @@
 //! A mutation's origin call and coherence tail run in a spawned task so that a client
 //! hanging up cannot strand an applied write outside the index. That same task
 //! outlives the HTTP drain: the connection is gone while the tail may still be
-//! about to publish. [`WriteTails`] counts those tasks and, once a planned stop
-//! closes it, admits no new one; [`CachingProxy::seal_writes`] seals the feed once
+//! about to publish. `WriteTails` counts those tasks and, once a planned stop
+//! closes it, admits no new one; [`CachingProxy::seal_writes`](crate::cache::proxy::CachingProxy::seal_writes)
+//! seals the feed once
 //! none is left — a seal promises the peers that this life publishes nothing more.
 //! Only mutation tails publish, so the seal does not wait for reads, uploads of
 //! parts, or listings still draining.
