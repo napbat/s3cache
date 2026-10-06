@@ -138,7 +138,7 @@ impl Transport for FaultTransport {
         if let Some((tx, delay)) = self.net.route(&self.id, to) {
             let inbound = Inbound {
                 from: self.id.clone(),
-                msg: msg.to_vec(),
+                msg: msg.to_vec().into(),
             };
             if delay.is_zero() {
                 let _ = tx.send(inbound);
