@@ -20,6 +20,7 @@ use crate::index::{
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync};
+use crate::sync::config::RecoveryConfigRejected;
 use crate::sync::wire::wire_stamp;
 use crate::tier::{self, CachedObject, TieredCache, WarmPair};
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -410,45 +411,6 @@ impl IndexedWrite {
             Self::Put => metrics.write_indexed_put(),
             Self::Copy => metrics.write_indexed_copy(),
             Self::MultipartComplete => metrics.write_indexed_multipart(),
-        }
-    }
-}
-
-/// Why [`CachingProxy::with_recovery_config`] refused a recovery configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryConfigRejected {
-    /// Groupnet's own bounds refused it.
-    Invalid(groupnet::core::volatile_recovery::RecoveryConfigError),
-    /// The settle window is shorter than two gossip rounds of this node, so a
-    /// renewal could still be in flight when the window closes.
-    SettleBelowGossip {
-        /// The configured settle window.
-        settle_ms: u64,
-        /// Two of this node's gossip rounds.
-        floor_ms: u64,
-    },
-}
-
-impl std::fmt::Display for RecoveryConfigRejected {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Invalid(error) => error.fmt(f),
-            Self::SettleBelowGossip {
-                settle_ms,
-                floor_ms,
-            } => write!(
-                f,
-                "recovery settle_ms {settle_ms} is below two gossip rounds ({floor_ms} ms)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RecoveryConfigRejected {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Invalid(error) => Some(error),
-            Self::SettleBelowGossip { .. } => None,
         }
     }
 }
