@@ -1,8 +1,10 @@
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use groupnet::consistency::CAP_ACKS;
+use groupnet::consistency::lease::{CAP_LEASE, LeaseConfig};
 use groupnet::consistency::volatile_recovery::{RecoveryStage, RecoveryStatus};
-use groupnet::consistency::{CAP_ACKS, CAP_LEASE, LeaseConfig};
 use groupnet::core::volatile_recovery::RecoveryState;
 use groupnet::core::{Config, NodeId, Status};
 use groupnet::runtime::{NamedSeeds, ResolveFuture, SeedResolver, SystemResolver};
@@ -72,12 +74,11 @@ fn a_reopened_recovery_generation_cannot_authorize_an_old_local_answer() {
 /// reap-bounded behaviour is the same shape production gets, only faster.
 fn brisk() -> Config {
     Config {
-        gossip_interval_ms: 10,
+        gossip_interval_ms: 25,
         probe_interval_ms: 20,
         probe_timeout_ms: 10,
         suspect_timeout_ms: 50,
         dead_timeout_ms: 300,
-        anti_entropy_interval_ms: 25,
         ..Config::default()
     }
 }
@@ -200,7 +201,7 @@ fn env_spellings_parse_into_a_config() {
 const TEST_SEED_CADENCE: Duration = Duration::from_millis(20);
 
 /// Failed lookups before the test's unresolvable seed is reported.
-const TEST_STARTUP_ATTEMPTS: u32 = 3;
+const TEST_STARTUP_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 
 /// How long a loopback gossip pair may take to (re)meet.
 const TEST_REJOIN: Duration = Duration::from_secs(20);
@@ -261,9 +262,9 @@ async fn within(limit: Duration, what: &str, mut cond: impl FnMut() -> bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unresolvable_seed_releases_readiness_after_its_window() {
     let resolution = NamedSeeds::new(MovableSeed::default())
-        .retry_interval(TEST_SEED_CADENCE)
-        .startup_attempts(TEST_STARTUP_ATTEMPTS)
-        .refresh_interval(TEST_SEED_CADENCE);
+        .with_retry_interval(TEST_SEED_CADENCE)
+        .with_startup_attempts(TEST_STARTUP_ATTEMPTS)
+        .with_refresh_interval(TEST_SEED_CADENCE);
     let sync = WriteSync::bind(
         seed_config("seed-lone", loopback(), &[("seed-ghost", "ghost:1")]),
         resolution,
@@ -289,8 +290,8 @@ async fn a_moved_seed_is_relearned_and_rejoins() {
     let name_b = MovableSeed::default();
     name_b.point_at(Some(b_first));
     let resolution = NamedSeeds::new(name_b.clone())
-        .retry_interval(TEST_SEED_CADENCE)
-        .refresh_interval(TEST_SEED_CADENCE);
+        .with_retry_interval(TEST_SEED_CADENCE)
+        .with_refresh_interval(TEST_SEED_CADENCE);
     let node_a = WriteSync::bind(seed_config("seed-a", a, &[("seed-b", "b:1")]), resolution)
         .await
         .expect("binds loopback");

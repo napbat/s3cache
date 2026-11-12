@@ -139,6 +139,8 @@ impl Transport for FaultTransport {
             let inbound = Inbound {
                 from: self.id.clone(),
                 msg: msg.to_vec().into(),
+                // The fabric routes by identity and keeps no address book.
+                source: None,
             };
             if delay.is_zero() {
                 let _ = tx.send(inbound);

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use groupnet::consistency::{LeaseConfig, WriteFeed, advertised_head};
+use groupnet::consistency::lease::LeaseConfig;
+use groupnet::consistency::{WriteFeed, advertised_head};
 use groupnet::core::{Config, NodeId};
 use groupnet::network::RouterConfig;
 use groupnet::runtime::Node;
@@ -27,12 +28,11 @@ use crate::tier::CachedObject;
 /// warm-up window is milliseconds rather than a second.
 fn brisk() -> Config {
     Config {
-        gossip_interval_ms: 10,
+        gossip_interval_ms: 25,
         probe_interval_ms: 20,
         probe_timeout_ms: 10,
         suspect_timeout_ms: 50,
         dead_timeout_ms: 300,
-        anti_entropy_interval_ms: 25,
         ..Config::default()
     }
 }
@@ -401,7 +401,7 @@ async fn a_freshness_timeout_routes_to_origin_and_is_counted() {
         NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         |_value: &u8| vec![0],
     );
-    let token = feed.publish(&1).await;
+    let token = feed.publish(&1).await.expect("the feed is open");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if advertised_head(&b_group, &a_id) == Some(token) {

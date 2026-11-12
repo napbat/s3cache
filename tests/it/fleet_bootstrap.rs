@@ -2,6 +2,7 @@
 
 use crate::common;
 
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -718,9 +719,9 @@ async fn unreachable_donor_falls_back_to_origin_within_budget() {
             &broken_book,
         ))
         .with_recovery_config(RecoveryConfig {
-            max_members: 16,
-            max_member_bytes: 128,
-            max_barrier_rounds: 4,
+            max_members: NonZeroUsize::new(16).unwrap(),
+            max_member_bytes: NonZeroUsize::new(128).unwrap(),
+            max_barrier_rounds: NonZeroU32::new(4).unwrap(),
             total_ms: 20_000,
             attempt_ms: 3_000,
             settle_ms: 3_000,
@@ -1151,9 +1152,9 @@ const SLOW_READY_DEADLINE: Duration = Duration::from_secs(90);
 /// policy derived from it gives a builder a 4 s donor wait.
 fn stall_bounds() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 16,
-        max_member_bytes: 128,
-        max_barrier_rounds: 4,
+        max_members: NonZeroUsize::new(16).unwrap(),
+        max_member_bytes: NonZeroUsize::new(128).unwrap(),
+        max_barrier_rounds: NonZeroU32::new(4).unwrap(),
         total_ms: 8_000,
         attempt_ms: 3_000,
         settle_ms: 3_000,
@@ -1411,9 +1412,9 @@ async fn concurrent_start_follower_waits_out_a_production_paced_builder() {
 /// 30 s donor wait.
 fn short_episode() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 256,
-        max_member_bytes: 256,
-        max_barrier_rounds: 4,
+        max_members: NonZeroUsize::new(256).unwrap(),
+        max_member_bytes: NonZeroUsize::new(256).unwrap(),
+        max_barrier_rounds: NonZeroU32::new(4).unwrap(),
         total_ms: 60_000,
         attempt_ms: 30_000,
         settle_ms: 3_000,

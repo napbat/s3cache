@@ -336,24 +336,28 @@ mod tests {
 
     use super::*;
 
+    fn n(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
+
     fn config() -> JournalConfig {
         JournalConfig {
-            max_encoded_bytes: 2_048,
-            max_decoded_bytes: 8_192,
-            max_events: 4,
-            max_suffix_bytes: 1_024,
-            max_event_bytes: 128,
-            max_identity_bytes: 64,
-            max_followers: 1,
-            max_follower_id_bytes: 64,
-            max_cuts: 2,
-            max_cut_bytes: 128,
-            max_members: 2,
-            max_membership_bytes: 256,
-            max_scope_bytes: 128,
-            max_batch_events: 1,
-            max_batch_bytes: 128,
-            max_inflight_bytes: 256,
+            max_encoded_bytes: n(2_048),
+            max_decoded_bytes: n(8_192),
+            max_events: n(4),
+            max_suffix_bytes: n(1_024),
+            max_event_bytes: n(128),
+            max_identity_bytes: n(64),
+            max_followers: n(1),
+            max_follower_id_bytes: n(64),
+            max_cuts: n(2),
+            max_cut_bytes: n(128),
+            max_members: n(2),
+            max_membership_bytes: n(256),
+            max_scope_bytes: n(128),
+            max_batch_events: n(1),
+            max_batch_bytes: n(128),
+            max_inflight_bytes: n(256),
             max_total_ms: 100_000,
             max_follower_ms: 10_000,
         }
@@ -391,13 +395,13 @@ mod tests {
 
     fn admission() -> ByteAdmission {
         ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 1_000_000,
+            max_total_bytes: n(1_000_000),
             max_encoded_bytes: 16_384,
             max_decoded_bytes: 65_536,
             max_suffix_bytes: 900_000,
             max_native_overlap_bytes: 1,
             max_inflight_bytes: 1,
-            max_reservations: 16,
+            max_reservations: n(16),
         })
         .unwrap()
     }
@@ -483,7 +487,10 @@ mod tests {
             donor
                 .ingress()
                 .with_journal(|journal| journal.image_charge())
-                .map(|charge| (charge.encoded_bytes, charge.decoded_bytes)),
+                .map(|charge| (
+                    charge.image.encoded_bytes.get(),
+                    charge.image.decoded_bytes.get()
+                )),
             Some((size.encoded_bytes, size.decoded_bytes))
         );
     }
@@ -550,7 +557,7 @@ mod tests {
                 DonorJournal::storage_bound(config).unwrap(),
             )
             .unwrap();
-        let held = budget.reserve(AdmissionClass::Decoded, 65_536).unwrap();
+        let held = budget.reserve(AdmissionClass::Decoded, n(65_536)).unwrap();
         let before = budget.usage().0;
         let refused = index.begin_fleet_capture(
             journal,
@@ -886,18 +893,18 @@ mod tests {
             name_bytes: 64,
         };
         let config = JournalConfig {
-            max_encoded_bytes: caps.bytes,
-            max_decoded_bytes: caps.decoded_bytes,
+            max_encoded_bytes: n(caps.bytes),
+            max_decoded_bytes: n(caps.decoded_bytes),
             ..config()
         };
         let budget = ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 1 << 28,
+            max_total_bytes: n(1 << 28),
             max_encoded_bytes: caps.bytes,
             max_decoded_bytes: caps.decoded_bytes,
             max_suffix_bytes: 900_000,
             max_native_overlap_bytes: 1,
             max_inflight_bytes: 1,
-            max_reservations: 16,
+            max_reservations: n(16),
         })
         .unwrap();
         let suffix = budget

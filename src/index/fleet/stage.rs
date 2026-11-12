@@ -335,7 +335,7 @@ mod tests {
                 identity: DeltaIdentity::Local(b"repair".to_vec()),
                 effect,
             }],
-            bytes: 42,
+            bytes: std::num::NonZeroUsize::new(42).unwrap(),
         };
         stage.stage_batch(&batch).unwrap();
         assert_eq!(stage.through(), &through);
