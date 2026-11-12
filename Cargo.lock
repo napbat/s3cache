@@ -1308,7 +1308,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1541,7 +1541,7 @@ dependencies = [
 [[package]]
 name = "groupnet"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "groupnet-consistency",
  "groupnet-core",
@@ -1558,7 +1558,7 @@ dependencies = [
 [[package]]
 name = "groupnet-consistency"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1571,12 +1571,12 @@ dependencies = [
 [[package]]
 name = "groupnet-core"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 
 [[package]]
 name = "groupnet-messaging"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "groupnet-core",
@@ -1591,7 +1591,7 @@ dependencies = [
 [[package]]
 name = "groupnet-network"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1608,7 +1608,7 @@ dependencies = [
 [[package]]
 name = "groupnet-runtime"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "groupnet-core",
  "groupnet-messaging",
@@ -1622,7 +1622,7 @@ dependencies = [
 [[package]]
 name = "groupnet-streams"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1638,7 +1638,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1652,7 +1652,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport-mem"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "groupnet-core",
@@ -1664,7 +1664,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport-tcp"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "groupnet-core",
@@ -1677,7 +1677,7 @@ dependencies = [
 [[package]]
 name = "groupnet-transport-udp"
 version = "0.1.0"
-source = "git+https://github.com/napbat/groupnet?rev=30407c0bb057a7f12bf1520397f7398b38f97103#30407c0bb057a7f12bf1520397f7398b38f97103"
+source = "git+https://github.com/napbat/groupnet?rev=e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e#e7c7b38cde46d338d54e4a7bb978dd1052e6fc9e"
 dependencies = [
  "bytes",
  "groupnet-core",
@@ -2885,7 +2885,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3115,7 +3115,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3185,7 +3185,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4452,7 +4452,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
