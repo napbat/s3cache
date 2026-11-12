@@ -238,14 +238,18 @@ async fn sustained_writes_keep_the_coherence_feed_moving() {
             timeouts,
             "the coherence feed arrested at sustained write {seq}"
         );
+        // A strong write publishes its fence and then its outcome.
         assert_eq!(
             counter(&metrics_b, "feed_applied"),
-            applied + seq + 1,
+            applied + 2 * (seq + 1),
             "strong mode returned write {seq} before B applied it"
         );
     }
 
-    assert_eq!(counter(&metrics_a, "feed_published"), published + WRITES);
+    assert_eq!(
+        counter(&metrics_a, "feed_published"),
+        published + 2 * WRITES
+    );
     assert_eq!(
         counter(&metrics_a, "write_lease_lapses"),
         lapses,
