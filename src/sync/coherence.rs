@@ -871,7 +871,7 @@ impl WriteSync {
         // `retire_through` retains the current head as an anchor and re-advertises the
         // compacted window; a dropped advertisement is carried by the next publish.
         if retires_feed {
-            self.feed.retire_through(token).await;
+            let _ = self.feed.retire_through(token).await;
         }
         guaranteed
     }

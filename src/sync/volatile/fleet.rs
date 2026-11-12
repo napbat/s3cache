@@ -1,5 +1,6 @@
 //! S3 index facts supplied to Groupnet's one optional bootstrap worker.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -16,7 +17,7 @@ use groupnet::core::volatile_bootstrap::{
 
 use crate::index::fleet::FleetDonorImage;
 
-use super::{AdapterError, CacheRecoveryAdapter, RecoveryAdapter};
+use super::{AdapterError, AdapterErrorKind, CacheRecoveryAdapter, RecoveryAdapter, closed, fenced};
 
 mod capture;
 mod donor;
@@ -25,9 +26,9 @@ mod runtime;
 pub(crate) use runtime::FleetListenerGuard;
 pub(super) use runtime::open_recovery;
 
-const MAX_ROSTER: usize = 64;
-const MAX_ROSTER_ID_BYTES: usize = 256;
-const MAX_ROSTER_METADATA: usize = 64 << 10;
+const MAX_ROSTER: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+const MAX_ROSTER_ID_BYTES: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+const MAX_ROSTER_METADATA: NonZeroUsize = NonZeroUsize::new(64 << 10).unwrap();
 
 /// Consumer index/source evidence. Claim election, bulk retry, and lifetime
 /// decisions remain in the existing Groupnet recovery worker.
@@ -87,7 +88,7 @@ impl FleetStatePort {
             || universe.len() > capture::IMAGE_CAPS.buckets
             || universe.windows(2).any(|pair| pair[0] >= pair[1])
         {
-            return Err(AdapterError);
+            return Err(AdapterErrorKind::InvalidInput.into());
         }
         Ok(Self {
             adapter,
@@ -138,7 +139,7 @@ impl FleetStatePort {
         // cause a second origin LIST. Once local recovery reaches Ready, the
         // same Groupnet worker attempts one finite guarded index recapture.
         if !request.permit.valid() {
-            return Err(AdapterError);
+            return Err(fenced());
         }
         Ok(LocalCaptureOutcome::LocalOnly)
     }
@@ -174,7 +175,7 @@ impl FleetStatePort {
         request: ReadyCaptureRequest,
         admission: &ByteAdmission,
     ) -> Result<DonorCapture<FleetDonorImage>, AdapterError> {
-        let sync = self.adapter.sync.upgrade().ok_or(AdapterError)?;
+        let sync = self.adapter.sync.upgrade().ok_or_else(closed)?;
         if !self.listener_alive()
             || !self
                 .source_matches(
@@ -186,7 +187,7 @@ impl FleetStatePort {
                 .await
         {
             tracing::info!("fleet Ready recapture declined: source roster changed");
-            return Err(AdapterError);
+            return Err(fenced());
         }
         let started = Instant::now();
         let id = capture::next_id(
@@ -214,7 +215,7 @@ impl FleetStatePort {
                     || !sync.mode_allows_local()
                     || !self.listener_alive()
                 {
-                    return Err(AdapterError);
+                    return Err(fenced());
                 }
                 prepared.attach(
                     &self.adapter.state,
@@ -225,7 +226,7 @@ impl FleetStatePort {
                     request.wake,
                 )
             })
-            .ok_or(AdapterError)
+            .ok_or_else(fenced)
             .flatten()
             .inspect_err(|_| {
                 tracing::info!(
@@ -241,7 +242,7 @@ impl FleetStatePort {
             .await
         {
             tracing::info!("fleet Ready recapture declined: roster changed while encoding");
-            return Err(AdapterError);
+            return Err(fenced());
         }
         let captured = request
             .guard
@@ -250,11 +251,11 @@ impl FleetStatePort {
                     || !sync.mode_allows_local()
                     || !self.listener_alive()
                 {
-                    return Err(AdapterError);
+                    return Err(fenced());
                 }
                 capture::finish(pending)
             })
-            .ok_or(AdapterError)
+            .ok_or_else(fenced)
             .flatten();
         if captured.is_ok() {
             tracing::info!(

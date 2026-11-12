@@ -1,6 +1,7 @@
 //! Private follower staging and one guarded native-feed/index handoff.
 
 use std::mem::size_of;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -8,15 +9,16 @@ use groupnet::consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, Admitted, ByteAdmission, Reservation,
 };
 use groupnet::consistency::volatile_recovery::bootstrap::ports::{
-    StageResources, TransferContext, TransferResources,
+    EffectContext, StageResources, TransferResources,
 };
-use groupnet::consistency::volatile_recovery::{AdapterError, PublicationPermit};
+use groupnet::consistency::volatile_recovery::{AdapterError, AdapterErrorKind};
 use groupnet::core::volatile_bootstrap::journal::AttachToken;
 use groupnet::core::volatile_bootstrap::transfer::{
     NativeCoverageReceipt, NativeHandoffReceipt, TransferEffect, TransferEvent,
 };
 
 use crate::index::fleet::{FleetStage, IMAGE_SCHEMA, InstallRefusal};
+use crate::sync::volatile::fenced;
 
 use super::{FleetStatePort, capture};
 
@@ -31,16 +33,16 @@ impl FleetStatePort {
             // B, proven cuts, membership, and handoff metadata coexist with
             // the original effect and retained stage. Charge this physical
             // result copy separately from Groupnet's core event envelope.
-            (64_usize << 10)
-                .checked_mul(4)
+            NonZeroUsize::new(64_usize << 10)
+                .and_then(|n| n.checked_mul(NonZeroUsize::new(4)?))
                 .and_then(|n| n.checked_add(size_of::<TransferEvent>()))
-                .ok_or(AdapterError)?
+                .ok_or(AdapterErrorKind::Capacity)?
         } else {
-            size_of::<TransferEvent>().max(1)
+            NonZeroUsize::new(size_of::<TransferEvent>()).unwrap_or(NonZeroUsize::MIN)
         };
         admission
             .reserve(AdmissionClass::Inflight, bytes)
-            .map_err(|_| AdapterError)
+            .map_err(|error| AdapterError::with_source(AdapterErrorKind::Capacity, error))
     }
 
     #[expect(
@@ -49,15 +51,19 @@ impl FleetStatePort {
     )]
     pub(super) async fn execute_follower(
         &self,
-        context: &TransferContext,
         effect: TransferEffect,
         resources: &mut TransferResources<FleetStage, AttachToken, ()>,
-        admission: &ByteAdmission,
-        permit: Option<PublicationPermit>,
-        deadline: Instant,
+        context: EffectContext<'_>,
     ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
+        let EffectContext {
+            transfer: context,
+            admission,
+            permit,
+            deadline,
+            ..
+        } = context;
         if Instant::now() >= deadline {
-            return Err(AdapterError);
+            return Err(AdapterErrorKind::Expired.into());
         }
         match effect {
             TransferEffect::ReserveStage {
@@ -68,15 +74,15 @@ impl FleetStatePort {
                 decoded_bytes,
             } => {
                 if resources.stage.is_some()
-                    || encoded_bytes > capture::IMAGE_CAPS.bytes
-                    || decoded_bytes > capture::IMAGE_CAPS.decoded_bytes
+                    || encoded_bytes.get() > capture::IMAGE_CAPS.bytes
+                    || decoded_bytes.get() > capture::IMAGE_CAPS.decoded_bytes
                 {
                     tracing::debug!(
                         encoded_bytes,
                         decoded_bytes,
                         "fleet peer image declined: over the image codec ceilings"
                     );
-                    return Err(AdapterError);
+                    return Err(AdapterErrorKind::Capacity.into());
                 }
                 let reserved = admission
                     .reserve(AdmissionClass::Encoded, encoded_bytes)
@@ -85,30 +91,30 @@ impl FleetStatePort {
                             .reserve(AdmissionClass::Decoded, decoded_bytes)
                             .map(|decoded| (encoded, decoded))
                     });
-                let Ok((encoded, decoded)) = reserved else {
+                let (encoded, decoded) = reserved.map_err(|error| {
                     tracing::debug!(
                         encoded_bytes,
                         decoded_bytes,
                         "fleet peer image declined: memory admission"
                     );
-                    return Err(AdapterError);
-                };
+                    AdapterError::with_source(AdapterErrorKind::Capacity, error)
+                })?;
                 let stage = FleetStage::new(
-                    encoded_bytes,
-                    chunks,
+                    encoded_bytes.get(),
+                    chunks.get(),
                     image_cut,
-                    decoded_bytes,
+                    decoded_bytes.get(),
                     capture::IMAGE_CAPS,
-                    capture::JOURNAL_CONFIG.max_event_bytes,
+                    capture::JOURNAL_CONFIG.max_event_bytes.get(),
                 )
-                .map_err(|_| AdapterError)?;
+                .map_err(|_| AdapterError::new(AdapterErrorKind::InvalidInput))?;
                 resources.stage = Some(StageResources::new(stage, encoded, decoded)?);
                 Ok(Some(
                     Self::event_charge(admission, false)?.hold(TransferEvent::StageReserved { op }),
                 ))
             }
             TransferEffect::VerifyImage { op, commitment } => {
-                let mut stage = resources.stage.take().ok_or(AdapterError)?;
+                let mut stage = resources.stage.take().ok_or_else(fenced)?;
                 // Hash and full map decode are bounded but potentially large.
                 // The blocking task owns the stage and both permits until it
                 // exits, even if the recovery worker is cancelled.
@@ -116,11 +122,11 @@ impl FleetStatePort {
                     stage
                         .stage_mut()
                         .verify(commitment)
-                        .map_err(|_| AdapterError)?;
+                        .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))?;
                     Ok::<_, AdapterError>(stage)
                 })
                 .await
-                .map_err(|_| AdapterError)
+                .map_err(|error| AdapterError::with_source(AdapterErrorKind::Unavailable, error))
                 .flatten()
                 .inspect_err(|_| {
                     tracing::debug!("fleet peer image declined: commitment or decode failed");
@@ -142,9 +148,9 @@ impl FleetStatePort {
                         .source_matches(op, &receipt.members, admission, deadline)
                         .await
                 {
-                    return Err(AdapterError);
+                    return Err(fenced());
                 }
-                let stage = resources.stage.as_mut().ok_or(AdapterError)?;
+                let stage = resources.stage.as_mut().ok_or_else(fenced)?;
                 match stage.stage_mut().check_coverage(
                     &self.adapter.state,
                     &receipt.covered_cuts,
@@ -165,7 +171,7 @@ impl FleetStatePort {
                             refusal = %why,
                             "fleet peer image declined: live index incompatible"
                         );
-                        return Err(AdapterError);
+                        return Err(AdapterErrorKind::InvalidInput.into());
                     }
                 }
                 let charge = Self::event_charge(admission, true)?;
@@ -182,15 +188,15 @@ impl FleetStatePort {
                 ))
             }
             TransferEffect::InstallCandidate { op, coverage } => {
-                let permit = permit.ok_or(AdapterError)?.restricted_to(deadline);
-                let attachment = resources.attachment.as_ref().ok_or(AdapterError)?;
+                let permit = permit.ok_or_else(fenced)?.restricted_to(deadline);
+                let attachment = resources.attachment.as_ref().ok_or_else(fenced)?;
                 if coverage.parent != context.parent
                     || coverage.barrier.reservation != attachment.reservation
                     || coverage.barrier.attach_operation != attachment.operation
                     || coverage.staged_through != coverage.barrier.cursor
                     || coverage.buffered_bytes != 0
                 {
-                    return Err(AdapterError);
+                    return Err(AdapterErrorKind::InvalidInput.into());
                 }
                 // Membership can change after the B coverage observation even
                 // when the local index publication serial stays unchanged.
@@ -199,7 +205,7 @@ impl FleetStatePort {
                     .source_matches(op, &coverage.members, admission, deadline)
                     .await
                 {
-                    return Err(AdapterError);
+                    return Err(fenced());
                 }
                 let charge = Self::event_charge(admission, true)?;
                 let continued_cuts = coverage.proven_cuts.clone();
@@ -208,11 +214,11 @@ impl FleetStatePort {
                     .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                         old.checked_add(1)
                     })
-                    .map_err(|_| AdapterError)?;
+                    .map_err(|_| AdapterError::new(AdapterErrorKind::Capacity))?;
                 if applier_generation == 0 {
-                    return Err(AdapterError);
+                    return Err(AdapterErrorKind::Capacity.into());
                 }
-                let stage = resources.stage.as_mut().ok_or(AdapterError)?;
+                let stage = resources.stage.as_mut().ok_or_else(fenced)?;
                 let installed = permit
                     .publish(|| {
                         stage.stage_mut().install_into(
@@ -221,7 +227,7 @@ impl FleetStatePort {
                             &self.universe,
                         )
                     })
-                    .ok_or(AdapterError)?;
+                    .ok_or_else(fenced)?;
                 match installed {
                     // The image moved into the live index; release the
                     // emptied stage and its private memory permits.
@@ -251,7 +257,7 @@ impl FleetStatePort {
                             refusal = %why,
                             "fleet peer image declined at install: live index incompatible"
                         );
-                        return Err(AdapterError);
+                        return Err(AdapterErrorKind::InvalidInput.into());
                     }
                 }
                 let handoff = NativeHandoffReceipt {
@@ -274,7 +280,7 @@ impl FleetStatePort {
                 resources.native_overlap.take();
                 Ok(None)
             }
-            _ => Err(AdapterError),
+            _ => Err(AdapterErrorKind::Unsupported.into()),
         }
     }
 }

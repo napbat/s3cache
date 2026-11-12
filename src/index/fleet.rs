@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use groupnet::consistency::volatile_recovery::bootstrap::ports::{JournalIngress, LogicalClock};
-use groupnet::core::volatile_bootstrap::journal::{DeltaIdentity, Invalidation, NativeCut};
+use groupnet::core::volatile_bootstrap::journal::{
+    DeltaIdentity, Invalidation, NativeCut, NativeRenewal,
+};
 
 use s3s::dto::{ETag, ObjectStorageClass};
 
@@ -165,9 +167,13 @@ impl IndexCapture {
             return;
         };
         let now = self.clock.now();
+        let renewal = NativeRenewal {
+            sealed: sealed.clone(),
+            epoch,
+        };
         let _ = self
             .ingress
-            .with_journal(|journal| journal.renew(now, self.generation, sealed, epoch, effect));
+            .with_journal(|journal| journal.renew(now, self.generation, renewal, effect));
     }
 }
 

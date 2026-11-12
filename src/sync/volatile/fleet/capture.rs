@@ -1,5 +1,6 @@
 //! Finite donor C capture, with all large encoding outside the index lock.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,7 +17,7 @@ use tokio::sync::Notify;
 use crate::index::KeyIndex;
 use crate::index::fleet::{FleetDonorImage, ImageCaps, PendingFleetCapture};
 
-use super::super::AdapterError;
+use super::super::{AdapterError, AdapterErrorKind, fenced};
 
 static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -35,23 +36,28 @@ pub(super) const IMAGE_CAPS: ImageCaps = ImageCaps {
     name_bytes: 1_024,
 };
 
+/// `n` as a bound Groupnet accepts; a zero bound fails to compile.
+pub(super) const fn bound(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).expect("journal bounds are nonzero")
+}
+
 pub(super) const JOURNAL_CONFIG: JournalConfig = JournalConfig {
-    max_encoded_bytes: IMAGE_CAPS.bytes,
-    max_decoded_bytes: IMAGE_CAPS.decoded_bytes,
-    max_events: 1_024,
-    max_suffix_bytes: 8 << 20,
-    max_event_bytes: 4_096,
-    max_identity_bytes: 256,
-    max_followers: 2,
-    max_follower_id_bytes: 256,
-    max_cuts: 64,
-    max_cut_bytes: 4_096,
-    max_members: 64,
-    max_membership_bytes: 16 << 10,
-    max_scope_bytes: 8_192,
-    max_batch_events: 32,
-    max_batch_bytes: 128 << 10,
-    max_inflight_bytes: 256 << 10,
+    max_encoded_bytes: bound(IMAGE_CAPS.bytes),
+    max_decoded_bytes: bound(IMAGE_CAPS.decoded_bytes),
+    max_events: bound(1_024),
+    max_suffix_bytes: bound(8 << 20),
+    max_event_bytes: bound(4_096),
+    max_identity_bytes: bound(256),
+    max_followers: bound(2),
+    max_follower_id_bytes: bound(256),
+    max_cuts: bound(64),
+    max_cut_bytes: bound(4_096),
+    max_members: bound(64),
+    max_membership_bytes: bound(16 << 10),
+    max_scope_bytes: bound(8_192),
+    max_batch_events: bound(32),
+    max_batch_bytes: bound(128 << 10),
+    max_inflight_bytes: bound(256 << 10),
     max_total_ms: 600_000,
     // A 108 MB production image is about 1,700 sequential 64 KiB chunks; give a
     // follower on a loaded node minutes, not one, before its reservation expires.
@@ -67,9 +73,9 @@ pub(super) fn next_id(
         .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
             old.checked_add(1)
         })
-        .map_err(|_| AdapterError)?;
+        .map_err(|_| AdapterError::new(AdapterErrorKind::Capacity))?;
     if serial == 0 || generation == 0 {
-        return Err(AdapterError);
+        return Err(AdapterErrorKind::InvalidInput.into());
     }
     Ok(CaptureId {
         scope,
@@ -91,11 +97,13 @@ pub(super) fn prepare(
     budget: &ByteAdmission,
     id: CaptureId,
 ) -> Result<PreparedCapture, AdapterError> {
-    let suffix_bytes = DonorJournal::storage_bound(JOURNAL_CONFIG).map_err(|_| AdapterError)?;
+    let suffix_bytes = DonorJournal::storage_bound(JOURNAL_CONFIG)
+        .map_err(|error| AdapterError::with_source(AdapterErrorKind::InvalidInput, error))?;
     let suffix = budget
         .reserve(AdmissionClass::Suffix, suffix_bytes)
-        .map_err(|_| AdapterError)?;
-    let journal = DonorJournal::new(JOURNAL_CONFIG, id).map_err(|_| AdapterError)?;
+        .map_err(|error| AdapterError::with_source(AdapterErrorKind::Capacity, error))?;
+    let journal = DonorJournal::new(JOURNAL_CONFIG, id)
+        .map_err(|error| AdapterError::with_source(AdapterErrorKind::InvalidInput, error))?;
     Ok(PreparedCapture { journal, suffix })
 }
 
@@ -122,7 +130,7 @@ impl PreparedCapture {
                 IMAGE_CAPS,
                 clock,
             )
-            .map_err(|_| AdapterError)
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Capacity))
     }
 }
 
@@ -136,17 +144,17 @@ pub(super) async fn encode(
     tokio::task::spawn_blocking(move || {
         pending
             .encode(&universe, IMAGE_CAPS)
-            .map_err(|_| AdapterError)?;
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Capacity))?;
         Ok(pending)
     })
     .await
-    .map_err(|_| AdapterError)?
+    .map_err(|error| AdapterError::with_source(AdapterErrorKind::Unavailable, error))?
 }
 
 pub(super) fn finish(
     pending: PendingFleetCapture,
 ) -> Result<DonorCapture<FleetDonorImage>, AdapterError> {
-    pending.finish().map_err(|_| AdapterError)
+    pending.finish().map_err(|_| fenced())
 }
 
 pub(super) fn same_roster(

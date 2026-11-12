@@ -1,27 +1,36 @@
 //! Groupnet donor callbacks: complete guarded C and immutable bounded chunks.
 
 use std::mem::size_of;
-use std::time::Instant;
+use std::num::NonZeroUsize;
 
 use groupnet::consistency::volatile_recovery::bootstrap::admission::{
     AdmissionClass, Admitted, ByteAdmission,
 };
 use groupnet::consistency::volatile_recovery::bootstrap::bulk_adapter::BootstrapStatePort;
 use groupnet::consistency::volatile_recovery::bootstrap::ports::{
-    DonorCapture, LocalCaptureOutcome, LocalCaptureRequest, ReadyCaptureRequest, TransferContext,
+    DonorCapture, EffectContext, LocalCaptureOutcome, LocalCaptureRequest, ReadyCaptureRequest,
     TransferResources,
 };
-use groupnet::consistency::volatile_recovery::{
-    AdapterError, BoxRecoveryFuture, PublicationPermit,
-};
+use groupnet::consistency::volatile_recovery::{AdapterError, AdapterErrorKind};
 use groupnet::core::volatile_bootstrap::journal::{AttachToken, JournalBatch, JournalCursor};
 use groupnet::core::volatile_bootstrap::transfer::{TransferEffect, TransferEvent, TransferOffer};
 
 use crate::index::fleet::{FleetDonorImage, FleetStage};
+use crate::sync::volatile::fenced;
 
 use super::{FleetStatePort, capture};
 
-const CHUNK_BYTES: usize = 64 << 10;
+const CHUNK_BYTES: NonZeroUsize = NonZeroUsize::new(64 << 10).unwrap();
+
+/// A request or argument outside this donor's bounds.
+fn invalid() -> AdapterError {
+    AdapterError::new(AdapterErrorKind::InvalidInput)
+}
+
+/// An arithmetic bound or memory admission refused the work.
+fn capacity() -> AdapterError {
+    AdapterError::new(AdapterErrorKind::Capacity)
+}
 
 impl BootstrapStatePort for FleetStatePort {
     type Image = FleetDonorImage;
@@ -31,20 +40,20 @@ impl BootstrapStatePort for FleetStatePort {
     // refuses any concurrent final effect at the guarded install.
     type NativeBuffer = ();
 
-    fn build_local_capture<'a>(
-        &'a self,
+    async fn build_local_capture(
+        &self,
         request: LocalCaptureRequest,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<LocalCaptureOutcome<Self::Image>, AdapterError>> {
-        Box::pin(self.initial_capture(request, admission))
+        admission: &ByteAdmission,
+    ) -> Result<LocalCaptureOutcome<Self::Image>, AdapterError> {
+        self.initial_capture(request, admission).await
     }
 
-    fn recapture_current_index<'a>(
-        &'a self,
+    async fn recapture_current_index(
+        &self,
         request: ReadyCaptureRequest,
-        admission: &'a ByteAdmission,
-    ) -> BoxRecoveryFuture<'a, Result<DonorCapture<Self::Image>, AdapterError>> {
-        Box::pin(self.ready_capture(request, admission))
+        admission: &ByteAdmission,
+    ) -> Result<DonorCapture<Self::Image>, AdapterError> {
+        self.ready_capture(request, admission).await
     }
 
     fn retire_local_capture(&self, capture: &DonorCapture<Self::Image>) {
@@ -54,15 +63,15 @@ impl BootstrapStatePort for FleetStatePort {
     fn image_offer(
         &self,
         capture: &DonorCapture<Self::Image>,
-        max_metadata_bytes: usize,
+        max_metadata_bytes: NonZeroUsize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<TransferOffer>, AdapterError> {
         if !capture.is_active() || !capture::still_attached(&self.adapter.state, capture) {
-            return Err(AdapterError);
+            return Err(fenced());
         }
-        let bytes = capture.image().as_bytes().len();
-        if bytes == 0 || bytes > capture::IMAGE_CAPS.bytes || max_metadata_bytes == 0 {
-            return Err(AdapterError);
+        let bytes = NonZeroUsize::new(capture.image().as_bytes().len()).ok_or_else(invalid)?;
+        if bytes.get() > capture::IMAGE_CAPS.bytes {
+            return Err(capacity());
         }
         let chunks = bytes.div_ceil(CHUNK_BYTES);
         // Charge the complete retained DTO, both scope copies, cut vectors,
@@ -70,27 +79,27 @@ impl BootstrapStatePort for FleetStatePort {
         // entering the journal and allocating any response-owned metadata.
         let headers = size_of::<TransferOffer>()
             .checked_add(
-                capture::JOURNAL_CONFIG.max_members
+                capture::JOURNAL_CONFIG.max_members.get()
                     * size_of::<groupnet::core::volatile_bootstrap::BootstrapMemberIdentity>(),
             )
             .and_then(|n| {
                 n.checked_add(
-                    capture::JOURNAL_CONFIG.max_cuts
+                    capture::JOURNAL_CONFIG.max_cuts.get()
                         * size_of::<groupnet::core::volatile_bootstrap::journal::NativeCut>(),
                 )
             })
-            .ok_or(AdapterError)?;
+            .ok_or_else(capacity)?;
         let charge = max_metadata_bytes
-            .checked_mul(4)
+            .checked_mul(NonZeroUsize::new(4).ok_or_else(capacity)?)
             .and_then(|n| n.checked_add(headers))
-            .ok_or(AdapterError)?;
+            .ok_or_else(capacity)?;
         let permit = admission
             .reserve(AdmissionClass::Inflight, charge)
-            .map_err(|_| AdapterError)?;
+            .map_err(|error| AdapterError::with_source(AdapterErrorKind::Capacity, error))?;
         // The decoded charge finished at C is the measured image charge the
         // follower must reserve and decode under.
         let offer = capture.ingress().with_journal(|journal| {
-            let decoded_bytes = journal.image_charge()?.decoded_bytes;
+            let decoded_bytes = journal.image_charge()?.image.decoded_bytes;
             let id = journal.id().clone();
             let members = journal.image_members().to_vec();
             let cuts = journal.image_cuts().to_vec();
@@ -109,7 +118,7 @@ impl BootstrapStatePort for FleetStatePort {
                 cuts,
             })
         });
-        let offer = offer.ok_or(AdapterError)?;
+        let offer = offer.ok_or_else(fenced)?;
         let variable = offer
             .capture
             .scope
@@ -128,9 +137,12 @@ impl BootstrapStatePort for FleetStatePort {
                     .iter()
                     .try_fold(n, |sum, cut| sum.checked_add(cut.writer.len()))
             })
-            .ok_or(AdapterError)?;
-        if variable > max_metadata_bytes || !capture.is_active() {
-            return Err(AdapterError);
+            .ok_or_else(capacity)?;
+        if variable > max_metadata_bytes.get() {
+            return Err(capacity());
+        }
+        if !capture.is_active() {
+            return Err(fenced());
         }
         Ok(permit.hold(offer))
     }
@@ -139,97 +151,87 @@ impl BootstrapStatePort for FleetStatePort {
         &self,
         capture: &DonorCapture<Self::Image>,
         sequence: usize,
-        max_bytes: usize,
+        max_bytes: NonZeroUsize,
         admission: &ByteAdmission,
     ) -> Result<Admitted<Vec<u8>>, AdapterError> {
-        if !capture.is_active()
-            || !capture::still_attached(&self.adapter.state, capture)
-            || max_bytes == 0
-            || max_bytes > CHUNK_BYTES
-        {
-            return Err(AdapterError);
+        if !capture.is_active() || !capture::still_attached(&self.adapter.state, capture) {
+            return Err(fenced());
         }
-        let start = sequence.checked_mul(CHUNK_BYTES).ok_or(AdapterError)?;
+        if max_bytes > CHUNK_BYTES {
+            return Err(invalid());
+        }
+        let start = sequence.checked_mul(CHUNK_BYTES.get()).ok_or_else(invalid)?;
         let end = start
-            .checked_add(CHUNK_BYTES)
-            .ok_or(AdapterError)?
+            .checked_add(CHUNK_BYTES.get())
+            .ok_or_else(invalid)?
             .min(capture.image().as_bytes().len());
         let slice = capture
             .image()
             .as_bytes()
             .get(start..end)
-            .ok_or(AdapterError)?;
-        if slice.is_empty() || slice.len() > max_bytes {
-            return Err(AdapterError);
+            .ok_or_else(invalid)?;
+        if slice.is_empty() || slice.len() > max_bytes.get() {
+            return Err(invalid());
         }
         let permit = admission
             .reserve(AdmissionClass::Encoded, max_bytes)
-            .map_err(|_| AdapterError)?;
+            .map_err(|error| AdapterError::with_source(AdapterErrorKind::Capacity, error))?;
         let mut copy = Vec::new();
         copy.try_reserve_exact(slice.len())
-            .map_err(|_| AdapterError)?;
-        if copy.capacity() > max_bytes {
-            return Err(AdapterError);
+            .map_err(|error| AdapterError::with_source(AdapterErrorKind::Capacity, error))?;
+        if copy.capacity() > max_bytes.get() {
+            return Err(capacity());
         }
         copy.extend_from_slice(slice);
         Ok(permit.hold(copy))
     }
 
-    fn execute_local<'a>(
-        &'a self,
-        context: &'a TransferContext,
+    async fn execute_local(
+        &self,
         effect: TransferEffect,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-        admission: &'a ByteAdmission,
-        permit: Option<PublicationPermit>,
-        deadline: Instant,
-    ) -> BoxRecoveryFuture<'a, Result<Option<Admitted<TransferEvent>>, AdapterError>> {
-        Box::pin(self.execute_follower(context, effect, resources, admission, permit, deadline))
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+        context: EffectContext<'_>,
+    ) -> Result<Option<Admitted<TransferEvent>>, AdapterError> {
+        self.execute_follower(effect, resources, context).await
     }
 
-    fn store_chunk<'a>(
-        &'a self,
+    async fn store_chunk(
+        &self,
         sequence: usize,
-        chunk: &'a Admitted<Vec<u8>>,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<usize, AdapterError>> {
-        Box::pin(async move {
-            let stage = resources.stage.as_mut().ok_or(AdapterError)?;
-            stage
-                .stage_mut()
-                .store_chunk(sequence, chunk.get())
-                .map_err(|_| AdapterError)?;
-            Ok(stage.reserved_bytes().1)
-        })
+        chunk: &Admitted<Vec<u8>>,
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> Result<usize, AdapterError> {
+        let stage = resources.stage.as_mut().ok_or_else(fenced)?;
+        stage
+            .stage_mut()
+            .store_chunk(sequence, chunk.get())
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))?;
+        Ok(stage.reserved_bytes().1)
     }
 
-    fn stage_batch<'a>(
-        &'a self,
-        batch: &'a Admitted<JournalBatch>,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
-        Box::pin(async move {
-            resources
-                .stage
-                .as_mut()
-                .ok_or(AdapterError)?
-                .stage_mut()
-                .stage_batch(batch.get())
-                .map_err(|_| AdapterError)
-        })
+    async fn stage_batch(
+        &self,
+        batch: &Admitted<JournalBatch>,
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> Result<(), AdapterError> {
+        resources
+            .stage
+            .as_mut()
+            .ok_or_else(fenced)?
+            .stage_mut()
+            .stage_batch(batch.get())
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))
     }
 
-    fn detach<'a>(
-        &'a self,
+    async fn detach(
+        &self,
         token: AttachToken,
-        resources: &'a mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> BoxRecoveryFuture<'a, Result<(), AdapterError>> {
-        Box::pin(async move {
-            if resources.attachment.as_ref() != Some(&token) {
-                return Err(AdapterError);
-            }
-            resources.attachment.take();
-            Ok(())
-        })
+        resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
+    ) -> Result<(), AdapterError> {
+        if resources.attachment.as_ref() != Some(&token) {
+            return Err(fenced());
+        }
+        resources.attachment.take();
+        Ok(())
     }
 }
