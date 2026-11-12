@@ -823,6 +823,22 @@ impl Cluster {
             }
         }
         let _ = writeln!(text, "write failures: {failures:?}");
+        let mut latencies: Vec<Duration> = history
+            .writes
+            .iter()
+            .filter(|write| write.status == WriteStatus::Acked)
+            .map(|write| write.done - write.invoked)
+            .collect();
+        latencies.sort();
+        if let (Some(median), Some(p99)) = (
+            latencies.get(latencies.len() / 2),
+            latencies.get(latencies.len() * 99 / 100),
+        ) {
+            let _ = writeln!(
+                text,
+                "acknowledged write latency: median {median:?}, p99 {p99:?}"
+            );
+        }
         for violation in violations.iter().take(40) {
             let _ = writeln!(text, "  [{}] {}", violation.class, violation.text);
         }
