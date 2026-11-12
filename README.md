@@ -213,13 +213,16 @@ heuristic earlier releases used:
   positive, not an absence oracle, and `false` covers everything: booting, warming up,
   lapsed, awaiting a resync, a peer gone silent, or a partition. Every one of them sends
   the read to the origin: slower, never stale (`unhealthy_bypasses`).
-- **Writes end at an ack *or* at a lapse.** A write returns only after the origin acked
-  it AND every lease-holder either applied the invalidation (the fast path — one
-  in-cluster ack round, ~2 gossip hops, behind the origin round-trip already paid) or
-  had its serve-lease **expire in the writer's own engine** (the slow path — bounded by
-  `D`, counted as `write_lease_lapses`). So `PUT via A; GET via B` is deterministically
-  fresh, and a peer that stops answering costs one write up to `D` **once**, not an ack
-  timeout on every write forever.
+- **Writes are fenced first, and end at an ack *or* at a lapse.** A write first
+  announces itself on the write feed and waits until every lease-holder holds that
+  announcement (or has lapsed); only then is it sent to the origin. It returns only
+  after the origin acked it AND every lease-holder either applied the outcome (the fast
+  path — one in-cluster ack round, ~2 gossip hops) or had its serve-lease **expire in
+  the writer's own engine** (the slow path — bounded by `D`, counted as
+  `write_lease_lapses`). A write pays that round twice, once on each side of the origin
+  round-trip. So `PUT via A; GET via B` is deterministically fresh, and a peer that
+  stops answering costs one write up to `D` **once**, not an ack timeout on every write
+  forever.
 - **That second path is the whole point.** The old mode ended an unacked write in a
   *degradation*: the writer proceeded and correctness then depended on the stale peer
   *learning* it should stand down — exactly what an asymmetrically-partitioned peer
@@ -317,6 +320,15 @@ box is the long form):
   rule indexes that event skeletally, which also sends the key's reads to the origin.
   Every mutation runs on a task of its own, so a client hanging up mid-write cannot
   strand an applied DELETE, copy or completion outside the index.
+- **A writer that dies mid-write leaves its keys on the origin.** From a write's fence
+  until its outcome arrives, every peer answers the key, and any LIST whose prefix
+  covers it, from the origin. If the writer crashes in between, before its origin call
+  or after the origin applied it, the peers keep doing so until the writer's next life
+  reaches them (a feed gap or a renewal); each such key is then unknown, and one origin
+  HEAD resolves it. A fence that does not reach every lease-holder by the deadline is
+  answered **503** without calling the origin (`ack_timeouts`). A write the origin
+  refused abandons its fence. A node holding a peer's open fence offers no index image
+  to a joining node.
 - **A feed gap discards the gapped node's index.** The node missed writes it can no
   longer order its rows against, so it keeps nothing for a peer-image install to carry
   forward; the install or the origin rebuild repopulates it.

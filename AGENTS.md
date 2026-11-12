@@ -46,14 +46,16 @@ src/
     mod.rs      # cache link point: module docs and declarations only
     proxy.rs    # cache types and core tier/index helpers
     service.rs  # the S3 service implementation
-    mutation.rs # write-through paths: mutation tails, and unknown outcomes fenced and reconciled
+    mutation.rs # write-through paths: the strong pre-write fence, mutation tails, and unknown outcomes fenced and reconciled
     tests.rs    # cache unit tests
   index.rs      # in-memory LIST key index
+  index/pending.rs # peers' announced writes, fenced until settled
   tier.rs       # hot (moka heap) / warm (mmap disk) tiered object-body cache
   sync/
     mod.rs       # sync link point: module docs and declarations only
     coherence.rs # gossip write-feed and coherence core
     coherence/apply.rs # the apply loop: peer writes into the index, acks, gaps and lapses
+    coherence/fence.rs # the writer's pre-write fence: announce, wait, settle or abandon
     config.rs    # gossip env/config parsing and managed node construction
     volatile.rs  # S3 origin facts/effects for Groupnet's bounded recovery driver
     wire.rs      # write-event and session-token codec
@@ -206,8 +208,12 @@ completion of the initial index and coherence warm-up.
 
 The default `strong` mode is **lease-backed**: a node may answer a LIST, a GET, or an
 authoritative 404 from its own state only while it holds an unexpired *serve-lease* its
-peers granted (groupnet's `consistency::lease`, tier T3), and a write ends when every
-lease-holder has either applied the invalidation (one ack round) or had its lease lapse
+peers granted (groupnet's `consistency::lease`, tier T3). A write is **fenced** before
+its origin call: it publishes `IndexOp::Pending` and waits until every lease-holder has
+applied it or lapsed (`WriteSync::fence`), and each peer answers the key from the origin
+until the outcome event settles it (`index::pending`); a writer's next life hands
+anything it left open to the origin reconciliation. A write ends when every
+lease-holder has either applied the outcome (one ack round) or had its lease lapse
 in the writer's engine (bounded by `D`, on the straggler's own clock). That replaces the
 old view-stability heuristic (`Stability`/`settled()`), which survives only for
 `strong-acks` — deprecated, removed next release. `strong-acks` pins the **mechanism**

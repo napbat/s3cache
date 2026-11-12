@@ -15,7 +15,8 @@ use crate::tier::LocalCache;
 impl WriteSync {
     /// Spawn the apply loop: peer events update the LIST index and invalidate
     /// hot bodies. A peer write that describes nothing fences its key, and
-    /// `reconcile` resolves that fence from the origin. A gap synchronously
+    /// `reconcile` resolves that fence from the origin; a pending one fences it
+    /// until its writer settles it, or its next life hands it to `reconcile`. A gap synchronously
     /// closes Groupnet's local serving gate, discards the index, and schedules
     /// its rebuild. In `strong`, a small watcher reports the lease's monotone
     /// lapse count to that same recovery driver.

@@ -34,9 +34,9 @@ use crate::sync::wire::{
     IndexEvent, IndexOp, encode_event, etag_to_wire, from_micros, parse_token, to_micros,
 };
 
-/// Ring capacity: a peer that falls further behind than this many writes
-/// gets a gap (Groupnet closes serving, distrusts bodies, and rescans origin) instead
-/// of per-event application.
+/// Ring capacity: a peer that falls further behind than this many feed events (a
+/// `strong` write publishes two) gets a gap (Groupnet closes serving, distrusts
+/// bodies, and rescans origin) instead of per-event application.
 pub(super) const FEED_CAPACITY: usize = 4096;
 
 /// A peer feed position as the index's native writer cut.
@@ -128,9 +128,9 @@ pub enum Consistency {
     /// whereas a lapse here is a guarantee, because a lapsed reader serves
     /// nothing cached until it re-synchronizes and affirms it.
     ///
-    /// Costs one ack round (~2 in-cluster hops, behind the origin round-trip
-    /// already paid) per write, plus one ledger-entry republish per applied
-    /// event and one small renewal entry per node per `D/3` — right for
+    /// Costs two ack rounds (~2 in-cluster hops each) per write, one to fence the
+    /// key before the origin call and one for its outcome, plus one ledger-entry
+    /// republish per applied event and one small renewal entry per node per `D/3` — right for
     /// fleet-sized clusters, wrong past the scaling envelope (run `bounded`
     /// and cells). The named failure modes are in the README's consistency
     /// section, and in groupnet's `consistency::lease` honesty box.
