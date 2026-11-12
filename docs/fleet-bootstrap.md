@@ -147,10 +147,11 @@ LIST/HEAD callbacks. A row carries exact key, size when known,
 `Last-Modified` as the donor holds it (see Follower handoff), `ETag`, and
 storage class. Peer rows deliberately become **skeletal**: `Content-Type` and
 user HEAD metadata are not fabricated; HEAD falls through to origin. The
-donor cannot offer an image while any unresolved per-key uncertainty exists.
-A follower carries its own unresolved uncertainty across the swap with its
-reconciliation token (see Follower handoff); such reads keep going to the
-origin until exact HEAD reconciliation or origin rebuild.
+donor cannot offer an image while any unresolved per-key uncertainty, or any
+peer's pending `strong` write, exists. A follower carries its own unresolved
+uncertainty and the pending writes it holds across the swap (see Follower
+handoff); such reads keep going to the origin until exact HEAD reconciliation,
+the writer's outcome, or origin rebuild.
 Absence and LIST can be served locally only after a complete image, continuous
 native handoff, independent frontier check, and the existing lease/domain
 gate. Direct external S3 mutations still lack a fleet event and remain outside
@@ -322,10 +323,11 @@ was written after that delete. Each live effect is then exactly one of:
   provably later, and timestamp ties never silently choose arrival order.
 
 Open reconciliations cross the swap with their exact tokens and the bucket's
-token epoch. The fenced key stays origin-read, and its bucket's LIST stays
-origin-served, until that key's own HEAD resolves it in the installed index or
-a later definitive mutation supersedes it, as on a node that never
-bootstrapped. No later fence can reuse a carried token.
+token epoch. The fenced key stays origin-read, and a LIST whose prefix covers it
+stays origin-served, until that key's own HEAD resolves it in the installed index
+or a later definitive mutation supersedes it, as on a node that never
+bootstrapped. No later fence can reuse a carried token. Pending peer writes cross
+the swap unchanged and are settled by their writers' later events.
 
 **No live effect is lost.** A native effect the barrier does not cover
 misaligns the cuts and answers `NativePending`; the stage waits for a later
