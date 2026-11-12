@@ -5,9 +5,11 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use groupnet::consistency::volatile_recovery::{RecoveryError, RecoveryHandle, RecoveryStatus};
+use groupnet::consistency::lease::{
+    CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseView, Leases, RenewalId,
+};
 use groupnet::consistency::{
-    CAP_ACKS, CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseView, Leases, RenewalId, WriteFeed,
-    WriteToken, advertised_head, applied_by_selected,
+    AckWait, CAP_ACKS, PublishError, WriteFeed, WriteToken, advertised_head, applied_by_selected,
 };
 use groupnet::core::volatile_bootstrap::journal::NativeCut;
 use groupnet::core::{NodeId, Status};
@@ -398,9 +400,10 @@ impl WriteSync {
         );
         let capacity = NonZeroUsize::new(FEED_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         let feed = WriteFeed::new(group.clone(), capacity, encode_event);
-        let leases = consistency
-            .leases()
-            .then(|| Leases::new(group.clone(), me.clone(), lease));
+        let leases = consistency.leases().then(|| {
+            Leases::new(group.clone(), me.clone(), lease)
+                .expect("a validated lease config inside a Tokio runtime")
+        });
         let lease_view = leases.as_ref().map(Leases::view);
         let advertisement = Advertisement::declare(group.clone(), consistency);
         Self {
@@ -527,7 +530,7 @@ impl WriteSync {
     pub(crate) fn recovery_settle_floor_ms(&self) -> u64 {
         self.group
             .config()
-            .anti_entropy_interval_ms
+            .gossip_interval_ms
             .saturating_mul(2)
     }
 
@@ -546,7 +549,7 @@ impl WriteSync {
             && self
                 .lease_view
                 .as_ref()
-                .is_none_or(groupnet::consistency::LeaseView::mark_caught_up)
+                .is_none_or(LeaseView::mark_caught_up)
     }
 
     /// The newest renewal of this node's serve-lease that **every** granter in its
@@ -684,10 +687,21 @@ impl WriteSync {
 
     async fn advertised(
         &self,
-        publishing: impl Future<Output = WriteToken>,
+        publishing: impl Future<Output = Result<WriteToken, PublishError>>,
         metrics: &Metrics,
     ) -> WriteReceipt {
-        let token = publishing.await;
+        let token = match publishing.await {
+            Ok(token) => token,
+            // Recorded in the ring, which the next advertisement carries; until then no
+            // peer can apply it, so the write's ack wait decides whether it succeeded.
+            Err(PublishError::Unadvertised(unadvertised)) => {
+                warn!("{unadvertised}");
+                unadvertised.token
+            }
+            Err(PublishError::Sealed) => {
+                panic!("published after the feed was sealed: the seal promised no more writes")
+            }
+        };
         metrics.feed_published();
         WriteReceipt {
             token,
@@ -716,12 +730,15 @@ impl WriteSync {
             (Consistency::Strong | Consistency::StrongAcks, _) => {
                 let acked = applied_by_selected(
                     &self.group,
-                    &self.me,
-                    token,
+                    AckWait {
+                        writer: &self.me,
+                        token,
+                        timeout,
+                    },
                     |node| waits_on(&self.group, node),
-                    timeout,
                 )
-                .await;
+                .await
+                .is_complete();
                 if acked {
                     WriteWait::Applied
                 } else {
@@ -757,13 +774,19 @@ impl WriteSync {
     ) -> WriteWait {
         let (coherent, insured) = tokio::join!(
             leases.invalidated_coherently(&self.me, token, self.write_wait),
-            applied_by_selected(
-                &self.group,
-                &self.me,
-                token,
-                |node| waits_on_unleased(&self.group, node),
-                timeout,
-            ),
+            async {
+                applied_by_selected(
+                    &self.group,
+                    AckWait {
+                        writer: &self.me,
+                        token,
+                        timeout,
+                    },
+                    |node| waits_on_unleased(&self.group, node),
+                )
+                .await
+                .is_complete()
+            },
         );
         match (coherent, insured) {
             // A deadline the lease tier could not meet is the one outcome with no

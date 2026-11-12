@@ -20,7 +20,7 @@
 use std::time::Duration;
 
 use groupnet::consistency::volatile_recovery::{Mark, Renewal};
-use groupnet::consistency::{WriteToken, applied_by_selected};
+use groupnet::consistency::{AckWait, WriteToken, applied_by_selected};
 use groupnet::core::NodeId;
 use tracing::{info, warn};
 
@@ -96,7 +96,9 @@ impl WriteSync {
     /// Advertise this life's feed epoch before any write, so every peer learns of the
     /// restart now: a sealed previous life renews, an unsealed one gaps at once.
     pub(crate) async fn announce(&self) {
-        self.feed.republish().await;
+        if let Err(error) = self.feed.republish().await {
+            warn!("could not announce this life's write feed: {error}");
+        }
     }
 
     /// Seal this life's write feed and wait up to `wait` for the peers a write waits
@@ -105,18 +107,29 @@ impl WriteSync {
     /// Call it only once nothing can publish again: the HTTP drain has completed and
     /// every mutation tail has finished. The seal promises the peers that this life wrote
     /// nothing after it, which is what lets them skip the restart remediation; a
-    /// write published afterwards panics in the feed rather than break that promise.
+    /// write published afterwards panics rather than break that promise.
     pub async fn seal(&self, wait: Duration) -> SealOutcome {
-        let token = self.feed.seal().await;
+        let token = match self.feed.seal().await {
+            Ok(token) => token,
+            // Sealed locally either way; a peer that never sees the sealed frame gaps
+            // after the restart, and the acknowledgement wait below reports it.
+            Err(unadvertised) => {
+                warn!("{unadvertised}");
+                unadvertised.token
+            }
+        };
         let observed = self.consistency.acks()
             && applied_by_selected(
                 &self.group,
-                &self.me,
-                token,
+                AckWait {
+                    writer: &self.me,
+                    token,
+                    timeout: wait,
+                },
                 |node| waits_on(&self.group, node),
-                wait,
             )
-            .await;
+            .await
+            .is_complete();
         if observed {
             info!(
                 epoch = token.epoch,

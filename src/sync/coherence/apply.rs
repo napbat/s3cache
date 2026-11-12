@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use groupnet::consistency::{AckLedger, Frontier, LeaseView, PeerWrite, PeerWrites};
+use groupnet::consistency::lease::LeaseView;
+use groupnet::consistency::{AckLedger, Frontier, PeerWrite, PeerWrites, WriteToken};
+use groupnet::core::NodeId;
 use tracing::warn;
 
 use crate::index::KeyIndex;
@@ -65,9 +67,7 @@ impl WriteSync {
                         state.note_native_seal(native_cut(&peer, token));
                         sync.observe_seal(&peer, token);
                         frontier.advance(&peer, token);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, token).await;
-                        }
+                        acknowledge(ledger.as_ref(), &peer, token).await;
                     }
                     PeerWrite::Renewed {
                         peer,
@@ -76,9 +76,7 @@ impl WriteSync {
                     } => {
                         let start = sync.observe_renewal(&state, &peer, sealed, epoch, &metrics);
                         frontier.advance(&peer, start);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, start).await;
-                        }
+                        acknowledge(ledger.as_ref(), &peer, start).await;
                     }
                     PeerWrite::Wrote {
                         peer,
@@ -102,9 +100,7 @@ impl WriteSync {
                         // feed frontier.
                         local.invalidate_hot(&cache_key).await;
                         frontier.advance(&peer, token);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, token).await;
-                        }
+                        acknowledge(ledger.as_ref(), &peer, token).await;
                         metrics.feed_applied();
                         // The index has moved past any copy this node holds, so the warm
                         // copy can never serve again; left in place it would only crowd
@@ -130,13 +126,21 @@ impl WriteSync {
                             let _ = recovery.feed_gap(lapses);
                         }
                         frontier.advance(&peer, missed_through);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, missed_through).await;
-                        }
+                        acknowledge(ledger.as_ref(), &peer, missed_through).await;
                         metrics.feed_gap();
                     }
                 }
             }
         });
+    }
+}
+
+/// Advertise that this node applied `peer`'s feed through `token`. A refused
+/// advertisement keeps the advance locally, and the next advancing record carries it.
+async fn acknowledge(ledger: Option<&AckLedger>, peer: &NodeId, token: WriteToken) {
+    if let Some(ledger) = ledger
+        && let Err(error) = ledger.record(peer, token).await
+    {
+        warn!("could not advertise the ack of `{peer}` through {token:?}: {error}");
     }
 }
