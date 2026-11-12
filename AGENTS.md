@@ -212,7 +212,9 @@ peers granted (groupnet's `consistency::lease`, tier T3). A write is **fenced** 
 its origin call: it publishes `IndexOp::Pending` and waits until every lease-holder has
 applied it or lapsed (`WriteSync::fence`), and each peer answers the key from the origin
 until the outcome event settles it (`index::pending`); a writer's next life hands
-anything it left open to the origin reconciliation. A write ends when every
+anything it left open to the origin reconciliation. A peer that joined or gapped after
+an announcement answers every key from the origin until the floor each event carries
+(the writer's oldest open write) passes the first event it saw. A write ends when every
 lease-holder has either applied the outcome (one ack round) or had its lease lapse
 in the writer's engine (bounded by `D`, on the straggler's own clock). That replaces the
 old view-stability heuristic (`Stability`/`settled()`), which survives only for

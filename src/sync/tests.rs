@@ -2,9 +2,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use groupnet::consistency::CAP_ACKS;
 use groupnet::consistency::lease::{CAP_LEASE, LeaseConfig};
 use groupnet::consistency::volatile_recovery::{RecoveryStage, RecoveryStatus};
+use groupnet::consistency::{CAP_ACKS, PeerWrites, advertised_head};
 use groupnet::core::volatile_recovery::RecoveryState;
 use groupnet::core::{Config, NodeId, Status};
 use groupnet::runtime::{NamedSeeds, ResolveFuture, SeedResolver, SystemResolver};
@@ -12,13 +12,13 @@ use groupnet::transport::mem::Network;
 use s3s::dto::GetObjectOutput;
 
 use crate::index::{
-    AuthoritativeKeyState, KeyIndex, ObjEntry, resolve_uncertain_key, standard_class,
-    uncertain_key_is_current,
+    AuthoritativeKeyState, KeyIndex, ObjEntry, apply_observed_put, resolve_uncertain_key,
+    standard_class, uncertain_key_is_current,
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{
-    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, KeyReconcile, WriteReceipt, WriteSync, WriteWait,
-    recovery_generation_permits, waits_on, waits_on_unleased,
+    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, FEED_CAPACITY, KeyReconcile, WriteReceipt,
+    WriteSync, WriteWait, recovery_generation_permits, waits_on, waits_on_unleased,
 };
 use crate::sync::config::{SyncConfig, parse_lease_ms, parse_seeds};
 use crate::sync::wire::{
@@ -117,6 +117,41 @@ fn only_acknowledged_strong_waits_retire_feed_history() {
         "bounded Applied is immediate, not an all-readers watermark"
     );
     assert!(!WriteWait::Lapsed(Vec::new()).retires_feed(Consistency::Bounded));
+}
+
+/// The feed ring is cut to the gossip frame budget long before `FEED_CAPACITY` events:
+/// even the smallest event a valid bucket and key make stops it short of the cap, so
+/// the cap sets neither the gap horizon nor the ring's memory.
+#[tokio::test]
+async fn the_frame_budget_binds_the_feed_ring_before_its_event_cap() {
+    let net = Network::new();
+    let (w_id, _w_node, w_group) = spawn_node(&net, "ring-w", "ring-s").await;
+    let (s_id, _s_node, s_group) = spawn_node(&net, "ring-s", "ring-w").await;
+    // It never polls, so it never enters the writer's epoch: its lag is the whole window.
+    let unseen = PeerWrites::new(s_group.clone(), s_id, decode_event);
+    let sync_w = attach(w_group, w_id.clone(), Consistency::Bounded);
+    let smallest = IndexEvent {
+        op: IndexOp::Pending,
+        bucket: "abc".to_owned(),
+        key: "k".to_owned(),
+        ts_us: to_micros(SystemTime::now()),
+        settles: None,
+        floor: None,
+    };
+    let mut head = None;
+    for _ in 0..FEED_CAPACITY {
+        head = sync_w.feed.publish(&smallest).await.ok();
+    }
+    eventually(
+        || head.is_some() && advertised_head(&s_group, &w_id) == head,
+        "the subscriber to see the writer's head",
+    )
+    .await;
+    let window = unseen.lag(&w_id).expect("a decodable feed");
+    assert!(
+        window < FEED_CAPACITY as u64,
+        "the byte budget holds {window} events"
+    );
 }
 
 fn cached(body: &'static [u8]) -> Arc<CachedObject> {
@@ -829,6 +864,97 @@ async fn a_writer_that_dies_after_its_fence_leaves_the_keys_to_the_origin() {
     assert!(!fenced(&state, "unsent") && !fenced(&state, "applied"));
     assert_eq!(indexed_size(&state, "bkt", "applied"), Some(5));
     assert_eq!(indexed_size(&state, "bkt", "unsent"), Some(4));
+}
+
+/// A node that joins after a write's fence never saw that announcement, so it cannot
+/// fence the key itself. The writer's next event carries its oldest open write, older
+/// than anything the joiner saw: the joiner answers every key from the origin until that
+/// floor passes, which a writer that crashes and never comes back never lets happen.
+#[tokio::test]
+async fn a_joiner_that_missed_a_fence_answers_from_the_origin() {
+    let net = Network::new();
+    let (w_id, w_node, w_group) = spawn_neighbors(&net, "late-w", &["late-p", "late-j"]).await;
+    let (p_id, _p_node, p_group) = spawn_neighbors(&net, "late-p", &["late-w", "late-j"]).await;
+    let metrics = Arc::new(Metrics::default());
+    let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
+    let sync_p = Arc::new(attach(p_group, p_id.clone(), Consistency::Strong));
+    sync_p.start_apply(
+        cache.local(),
+        Arc::new(KeyIndex::default()),
+        metrics.clone(),
+        no_reconcile(),
+    );
+    let sync_w = attach(w_group, w_id, Consistency::Strong);
+    adopted(&sync_w, &p_id).await;
+    let own = KeyIndex::default();
+    let wait = Duration::from_secs(5);
+    let fence = async |key: &str| {
+        sync_w
+            .fence(&own, "bkt", &[key.to_owned()], wait, &metrics)
+            .await
+            .expect("the peers acknowledge the fence")
+            .pop()
+            .flatten()
+            .expect("strong announces each key")
+    };
+    let write = async |key: &str, size: i64| {
+        let pending = fence(key).await;
+        let (_, publishing) =
+            sync_w.index_put(&own, "bkt", key, written(size), Some(&pending), &metrics);
+        let receipt = publishing.await;
+        assert!(
+            sync_w
+                .ack_write(receipt.token, wait, "bkt", key, &metrics)
+                .await
+        );
+        receipt
+    };
+
+    // `k` is fenced and its origin call lands; `m` is written whole meanwhile, and its
+    // acknowledgement retires the feed past `k`'s announcement.
+    let k = fence("k").await;
+    write("m", 2).await;
+
+    // The joiner lists `k` as the origin held it before that call landed.
+    let (j_id, _j_node, j_group) = spawn_neighbors(&net, "late-j", &["late-w", "late-p"]).await;
+    let state = Arc::new(KeyIndex::default());
+    assert!(apply_observed_put(&state, "bkt", "k", written(4)));
+    let sync_j = Arc::new(attach(j_group, j_id, Consistency::Strong));
+    sync_j.start_apply(
+        cache.local(),
+        state.clone(),
+        metrics.clone(),
+        no_reconcile(),
+    );
+    let n = write("n", 3).await;
+    assert!(sync_j.reached_token(&n.header, wait).await);
+    // What the joiner's recovery affirms once its index is built.
+    eventually(
+        || sync_j.affirm_lease_now() && sync_j.mode_allows_local(),
+        "the joiner's serve-lease to be granted once it applied the writer's feed",
+    )
+    .await;
+    assert_eq!(indexed_size(&state, "bkt", "k"), Some(4));
+    assert!(
+        fenced(&state, "k"),
+        "the joiner never saw k's fence, and its listed row is stale"
+    );
+    assert!(
+        fenced(&state, "n"),
+        "nor can it tell which key that fence is"
+    );
+
+    // The writer crashes before it reports `k`, and never comes back.
+    drop(k);
+    drop(sync_w);
+    w_node.close().await;
+    drop(w_node);
+    eventually(
+        || !sync_j.peer_alive("late-w"),
+        "the joiner to see the writer gone",
+    )
+    .await;
+    assert!(fenced(&state, "k"));
 }
 
 /// A peer cut off from the writer cannot hold the fence up: its serve-lease lapses on

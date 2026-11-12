@@ -115,23 +115,13 @@ impl FleetStatePort {
             }
             TransferEffect::VerifyImage { op, commitment } => {
                 let mut stage = resources.stage.take().ok_or_else(fenced)?;
-                // Hash and full map decode are bounded but potentially large.
-                // The blocking task owns the stage and both permits until it
-                // exits, even if the recovery worker is cancelled.
-                let verified = tokio::task::spawn_blocking(move || {
-                    stage
-                        .stage_mut()
-                        .verify(commitment)
-                        .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))?;
-                    Ok::<_, AdapterError>(stage)
-                })
-                .await
-                .map_err(|error| AdapterError::with_source(AdapterErrorKind::Unavailable, error))
-                .flatten()
-                .inspect_err(|_| {
+                // Each chunk was hashed and decoded as it landed: this only
+                // finishes both, so no long step lets the donor's claim lapse.
+                stage.stage_mut().verify(commitment).map_err(|_| {
                     tracing::debug!("fleet peer image declined: commitment or decode failed");
+                    AdapterError::new(AdapterErrorKind::Malformed)
                 })?;
-                resources.stage = Some(verified);
+                resources.stage = Some(stage);
                 Ok(Some(
                     Self::event_charge(admission, false)?
                         .hold(TransferEvent::ImageVerified { op, commitment }),

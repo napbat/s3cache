@@ -148,10 +148,10 @@ LIST/HEAD callbacks. A row carries exact key, size when known,
 storage class. Peer rows deliberately become **skeletal**: `Content-Type` and
 user HEAD metadata are not fabricated; HEAD falls through to origin. The
 donor cannot offer an image while any unresolved per-key uncertainty, or any
-peer's pending `strong` write, exists. A follower carries its own unresolved
-uncertainty and the pending writes it holds across the swap (see Follower
-handoff); such reads keep going to the origin until exact HEAD reconciliation,
-the writer's outcome, or origin rebuild.
+peer's pending `strong` write, exists, nor while a peer may hold one it never
+saw. A follower carries its own unresolved uncertainty and the pending writes it
+holds across the swap (see Follower handoff); such reads keep going to the
+origin until exact HEAD reconciliation, the writer's outcome, or origin rebuild.
 Absence and LIST can be served locally only after a complete image, continuous
 native handoff, independent frontier check, and the existing lease/domain
 gate. Direct external S3 mutations still lack a fleet event and remain outside
@@ -164,6 +164,10 @@ unknown schema. Encoded bytes, decoded rows, native overlap, donor suffix,
 and each physical reply clone use distinct shared `ByteAdmission` permits.
 The decoder precharges conservative hash-table and tree-node capacity before
 allocation. This bounds private image ownership, not allocator RSS exactly.
+A follower hashes and decodes each chunk as it lands, so verification only
+finishes both: Groupnet's worker refreshes the donor's claim between its
+steps, and one long decode after the last chunk let that claim lapse on the
+follower under a live donor.
 The exact `DonorJournal::storage_bound` must fit the configured Suffix and
 global caps before cloning the image. Tests price the configured bound and
 measured live usage; a cap refusal falls back to origin without publishing a
@@ -327,7 +331,9 @@ token epoch. The fenced key stays origin-read, and a LIST whose prefix covers it
 stays origin-served, until that key's own HEAD resolves it in the installed index
 or a later definitive mutation supersedes it, as on a node that never
 bootstrapped. No later fence can reuse a carried token. Pending peer writes cross
-the swap unchanged and are settled by their writers' later events.
+the swap unchanged and are settled by their writers' later events. So does what
+the follower knows of each writer's feed: a write announced before the follower
+first saw that feed keeps every key origin-read until the writer's floor passes it.
 
 **No live effect is lost.** A native effect the barrier does not cover
 misaligns the cuts and answers `NativePending`; the stage waits for a later

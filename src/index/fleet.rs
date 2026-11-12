@@ -4,7 +4,6 @@
 //! rebuilds local generations at install; donor generation numbers never
 //! authorize a delayed local LIST or HEAD callback.
 
-use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use groupnet::consistency::volatile_recovery::bootstrap::ports::{JournalIngress, LogicalClock};
@@ -14,8 +13,7 @@ use groupnet::core::volatile_bootstrap::journal::{
 
 use s3s::dto::{ETag, ObjectStorageClass};
 
-use super::pending::PendingWrites;
-use super::{BucketState, GoneRows, IndexStats, KeyIndexState, KeyRows, ObjEntry};
+use super::{BucketState, KeyIndexState, ObjEntry};
 
 const VERSION: u8 = 1;
 pub(crate) const IMAGE_SCHEMA: u32 = 1;
@@ -23,6 +21,7 @@ const MAX_NATIVE_WRITERS: usize = 256;
 const MAX_NATIVE_ID_BYTES: usize = 256;
 
 mod capture;
+mod decoder;
 mod delta;
 mod install;
 mod snapshot;
@@ -346,13 +345,19 @@ impl super::KeyIndex {
     /// an origin rebuild discards it. Without the discard an install would
     /// carry pre-gap rows the donor no longer holds — a key the missed writes
     /// deleted, whose tombstone the donor's own rebuild forgot — as if they
-    /// were this node's own later effects.
+    /// were this node's own later effects. A pending write the gap hid fences
+    /// every key until the writer's floor passes it.
     pub(crate) fn discard_for_gap(&self, missed_through: &NativeCut) {
         let mut index = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         index.skip_native_gap(missed_through);
+        index.pending.skip(
+            &missed_through.writer,
+            missed_through.epoch,
+            missed_through.sequence,
+        );
         index.discard_buckets();
     }
 }
@@ -391,6 +396,8 @@ pub(crate) enum ImageError {
     Incomplete,
     Corrupt,
     Schema,
+    /// The bytes end inside an item: more of the image may complete it.
+    Truncated,
 }
 
 struct Writer {
@@ -463,7 +470,7 @@ impl<'a> Reader<'a> {
         let part = self
             .bytes
             .get(self.offset..end)
-            .ok_or(ImageError::Corrupt)?;
+            .ok_or(ImageError::Truncated)?;
         self.offset = end;
         Ok(part)
     }
@@ -864,105 +871,23 @@ fn read_entry<'a>(
     ))
 }
 
-/// Decode a private skeletal image. The caller holds a decoded-state permit;
-/// this function never publishes the result or treats donor generations as
-/// local callback fences.
-pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, ImageError> {
-    let caps = caps.validate()?;
-    if bytes.is_empty() || bytes.len() > caps.bytes {
+/// Decode a whole private skeletal image (see [`decoder::ImageDecoder`]).
+#[cfg(test)]
+fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, ImageError> {
+    let decoder = decoder::ImageDecoder::new(caps)?;
+    if bytes.is_empty() {
         return Err(ImageError::Capacity);
     }
-    let mut reader = Reader { bytes, offset: 0 };
-    if reader.u8()? != VERSION {
-        return Err(ImageError::Schema);
-    }
-    let count = reader.u32()?;
-    if count > caps.buckets {
-        return Err(ImageError::Capacity);
-    }
-    let mut budget = DecodeBudget::new(caps.decoded_bytes)?;
-    budget.take(state_charge(count)?)?;
-    let mut buckets = HashMap::new();
-    buckets
-        .try_reserve(count)
-        .map_err(|_| ImageError::Capacity)?;
-    let mut total = IndexStats::default();
-    let mut rows = 0usize;
-    let mut previous_bucket = None::<&str>;
-    for _ in 0..count {
-        let name = reader.text(caps.name_bytes)?;
-        if previous_bucket.is_some_and(|last| last >= name) {
-            return Err(ImageError::Corrupt);
-        }
-        previous_bucket = Some(name);
-        budget.take(bucket_charge(name.len())?)?;
-        let key_count = reader.u32()?;
-        rows = rows.checked_add(key_count).ok_or(ImageError::Capacity)?;
-        if rows > caps.rows {
-            return Err(ImageError::Capacity);
-        }
-        let mut keys = KeyRows::default();
-        let mut stats = IndexStats::default();
-        let mut previous_key = None::<&str>;
-        for _ in 0..key_count {
-            let (key, entry) = read_entry(&mut reader, &mut budget, caps.name_bytes)?;
-            if previous_key.is_some_and(|last| last >= key) {
-                return Err(ImageError::Corrupt);
-            }
-            previous_key = Some(key);
-            stats.replace(IndexStats::default(), IndexStats::for_entry(&entry));
-            keys.insert(key.to_owned(), entry);
-        }
-        let gone_count = reader.u32()?;
-        rows = rows.checked_add(gone_count).ok_or(ImageError::Capacity)?;
-        if rows > caps.rows {
-            return Err(ImageError::Capacity);
-        }
-        let mut gone = GoneRows::default();
-        let mut previous_gone = None::<&str>;
-        for _ in 0..gone_count {
-            let key = reader.text(caps.name_bytes)?;
-            if previous_gone.is_some_and(|last| last >= key) {
-                return Err(ImageError::Corrupt);
-            }
-            previous_gone = Some(key);
-            budget.take(gone_charge(key.len())?)?;
-            let deleted_at = read_timestamp(&mut reader)?;
-            if keys
-                .get(key)
-                .is_some_and(|entry: &ObjEntry| deleted_at >= entry.last_modified)
-            {
-                return Err(ImageError::Corrupt);
-            }
-            gone.insert(key.to_owned(), deleted_at);
-        }
-        total.replace(IndexStats::default(), stats);
-        buckets.insert(
-            name.to_owned(),
-            BucketState {
-                synced: true,
-                keys,
-                gone,
-                stats,
-                ..BucketState::default()
-            },
-        );
-    }
-    if reader.offset != bytes.len() {
-        return Err(ImageError::Corrupt);
-    }
-    Ok(KeyIndexState {
-        buckets,
-        stats: total,
-        capture: None,
-        native_cuts: BTreeMap::new(),
-        pending: PendingWrites::default(),
-    })
+    decoder.finish(bytes)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
     use super::*;
+    use crate::index::pending::PendingWrites;
+    use crate::index::{GoneRows, IndexStats, KeyRows};
 
     /// Measure then encode, as a donor does at C.
     fn encode(
@@ -1142,6 +1067,28 @@ mod tests {
             decode(&encoded, caps()),
             Err(ImageError::Capacity)
         ));
+    }
+
+    /// A follower decodes chunks as they land: any split decodes as the whole
+    /// does, and a bad item fails when it lands rather than after the last.
+    #[test]
+    fn an_image_fed_in_pieces_decodes_as_it_does_whole() {
+        let encoded = encode(&image(), &["bucket".to_owned()], caps()).unwrap();
+        for step in [1, 3, 7, encoded.len()] {
+            let mut pieces = decoder::ImageDecoder::new(caps()).unwrap();
+            let mut end = 0;
+            while end < encoded.len() {
+                end = (end + step).min(encoded.len());
+                pieces.feed(&encoded[..end]).unwrap();
+            }
+            let state = pieces.finish(&encoded).unwrap();
+            let bucket = &state.buckets["bucket"];
+            assert_eq!(bucket.keys["present"].size, Some(17));
+            assert!(bucket.gone.get("deleted").is_some());
+            assert_eq!(state.stats.objects, 1);
+        }
+        let mut bad = decoder::ImageDecoder::new(caps()).unwrap();
+        assert!(matches!(bad.feed(&[99]), Err(ImageError::Schema)));
     }
 
     #[test]

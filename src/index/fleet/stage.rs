@@ -7,14 +7,17 @@ use groupnet::core::volatile_bootstrap::journal::{JournalBatch, JournalCursor, N
 
 use crate::index::KeyIndex;
 
-use super::{ImageCaps, ImageError, InstallRefusal, decode, delta::decode_delta};
+use super::decoder::ImageDecoder;
+use super::{ImageCaps, ImageError, InstallRefusal, delta::decode_delta};
 
 /// Private, non-serving candidate. Its owner holds the encoded and decoded
 /// `StageResources` permits through verification, replay, and publication.
 pub(crate) struct FleetStage {
     encoded: Vec<u8>,
+    hasher: blake3::Hasher,
+    /// Decodes each chunk as it lands, until verification takes the result.
+    decoder: Option<ImageDecoder>,
     expected_bytes: usize,
-    decoded_bytes: usize,
     expected_chunks: usize,
     next_chunk: usize,
     caps: ImageCaps,
@@ -50,10 +53,16 @@ impl FleetStage {
         if encoded.capacity() > expected_bytes {
             return Err(ImageError::Capacity);
         }
+        let decoder = ImageDecoder::new(ImageCaps {
+            bytes: expected_bytes,
+            decoded_bytes,
+            ..caps
+        })?;
         Ok(Self {
             encoded,
+            hasher: blake3::Hasher::new(),
+            decoder: Some(decoder),
             expected_bytes,
-            decoded_bytes,
             expected_chunks,
             next_chunk: 0,
             caps,
@@ -65,7 +74,8 @@ impl FleetStage {
         })
     }
 
-    /// Append one exact nonempty chunk to the pre-admitted buffer.
+    /// Append one exact nonempty chunk to the pre-admitted buffer, and hash
+    /// and decode it there.
     pub(crate) fn store_chunk(&mut self, sequence: usize, chunk: &[u8]) -> Result<(), ImageError> {
         if sequence != self.next_chunk || chunk.is_empty() || sequence >= self.expected_chunks {
             return Err(ImageError::Corrupt);
@@ -79,12 +89,16 @@ impl FleetStage {
             return Err(ImageError::Capacity);
         }
         self.encoded.extend_from_slice(chunk);
+        self.hasher.update(chunk);
         self.next_chunk += 1;
-        Ok(())
+        self.decoder
+            .as_mut()
+            .ok_or(ImageError::Incomplete)?
+            .feed(&self.encoded)
     }
 
-    /// Verify the complete encoded image and decode a non-serving private
-    /// index under exactly the offered decoded-state reservation.
+    /// Check the complete image against its commitment, and take the private
+    /// index decoded from it under exactly the offered decoded-state reservation.
     pub(crate) fn verify(&mut self, commitment: [u8; 32]) -> Result<(), ImageError> {
         if self.index.is_some()
             || self.next_chunk != self.expected_chunks
@@ -92,15 +106,14 @@ impl FleetStage {
         {
             return Err(ImageError::Incomplete);
         }
-        if *blake3::hash(&self.encoded).as_bytes() != commitment {
+        if *self.hasher.finalize().as_bytes() != commitment {
             return Err(ImageError::Corrupt);
         }
-        let reserved = ImageCaps {
-            bytes: self.expected_bytes,
-            decoded_bytes: self.decoded_bytes,
-            ..self.caps
-        };
-        let state = decode(&self.encoded, reserved)?;
+        let state = self
+            .decoder
+            .take()
+            .ok_or(ImageError::Incomplete)?
+            .finish(&self.encoded)?;
         self.rows = state
             .buckets
             .values()

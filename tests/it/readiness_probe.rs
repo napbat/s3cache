@@ -259,8 +259,11 @@ async fn a_node_left_alone_is_ready() {
     donor.start(&fleet.bucket).await;
     until("the donor holds the index", || donor.indexed()).await;
     until("the other node reads the donor's index", || {
-        assert!(!alone.ready(), "ready beside an index holder");
-        alone.reads_indexed(fleet.names[0])
+        // The declaration first: until it arrives this node rightly reads the
+        // donor's earlier one, without an index, and is ready.
+        let reads = alone.reads_indexed(fleet.names[0]);
+        assert!(!reads || !alone.ready(), "ready beside an index holder");
+        reads
     })
     .await;
 
