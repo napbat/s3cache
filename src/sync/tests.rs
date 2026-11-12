@@ -5,8 +5,8 @@ use groupnet::consistency::volatile_recovery::{RecoveryStage, RecoveryStatus};
 use groupnet::consistency::{CAP_ACKS, CAP_LEASE, LeaseConfig};
 use groupnet::core::volatile_recovery::RecoveryState;
 use groupnet::core::{Config, NodeId, Status};
-use groupnet::runtime::{Group, NamedSeeds, Node, ResolveFuture, SeedResolver, SystemResolver};
-use groupnet::transport::mem::{MemTransport, Network};
+use groupnet::runtime::{NamedSeeds, ResolveFuture, SeedResolver, SystemResolver};
+use groupnet::transport::mem::Network;
 use s3s::dto::GetObjectOutput;
 
 use crate::index::{KeyIndex, ObjEntry, standard_class};
@@ -20,6 +20,9 @@ use crate::sync::wire::{
     IndexEvent, IndexOp, WIRE_MAGIC, decode_event, encode_event, from_micros, to_micros, wire_stamp,
 };
 use crate::tier::{CachedObject, TieredCache, open_warm};
+
+mod fixtures;
+use fixtures::{attach, spawn_neighbors, spawn_node, wired_pair, wired_pair_named};
 
 type Index = Arc<KeyIndex>;
 
@@ -112,22 +115,6 @@ fn only_acknowledged_strong_waits_retire_feed_history() {
     assert!(!WriteWait::Lapsed(Vec::new()).retires_feed(Consistency::Bounded));
 }
 
-fn spawn_node(net: &Network, id: &str, peer: &str) -> (NodeId, Node<MemTransport>, Group) {
-    let me = NodeId::new(id);
-    let node = Node::builder(me.clone(), net.endpoint(me.clone()))
-        .seed(NodeId::new(peer))
-        .config(brisk())
-        .spawn();
-    let group = node.join_group("s3cache");
-    (me, node, group)
-}
-
-/// A [`WriteSync`] on `group`, leased at [`TEST_LEASE`] unless the mode says
-/// otherwise.
-fn attach(group: Group, me: NodeId, consistency: Consistency) -> WriteSync {
-    WriteSync::attach(group, me, consistency, test_lease(), None)
-}
-
 fn cached(body: &'static [u8]) -> Arc<CachedObject> {
     Arc::new(CachedObject::from_get(
         &GetObjectOutput::default(),
@@ -152,33 +139,6 @@ fn indexed(state: &Index, bucket: &str, key: &str) -> Option<ObjEntry> {
         .get(bucket)
         .and_then(|b| b.keys.get(key))
         .cloned()
-}
-
-/// A fully-wired pair: node A publishes, node B applies into `state` and
-/// its local cache. Returns A's publisher, B's sync, and B's state and cache.
-fn wired_pair(net: &Network) -> (WriteSync, Arc<WriteSync>, Index, TieredCache) {
-    wired_pair_named(net, ("sync-a", "sync-b"), Consistency::Strong)
-}
-
-/// [`wired_pair`] with the gossip identities and the mode spelled out — unique ids
-/// per test, so parallel tests never share one.
-///
-/// B comes back as an [`Arc`]: it is the node whose apply loop runs, and
-/// [`WriteSync::start_apply`] hands the lapse watch a [`Weak`] back to it.
-fn wired_pair_named(
-    net: &Network,
-    ids: (&str, &str),
-    consistency: Consistency,
-) -> (WriteSync, Arc<WriteSync>, Index, TieredCache) {
-    let (a_id, _a_node, a_group) = spawn_node(net, ids.0, ids.1);
-    let (b_id, _b_node, b_group) = spawn_node(net, ids.1, ids.0);
-    let metrics = Arc::new(Metrics::default());
-    let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
-    let state = Arc::new(KeyIndex::default());
-    let sync_b = Arc::new(attach(b_group, b_id, consistency));
-    sync_b.start_apply(cache.local(), state.clone(), metrics, no_reconcile());
-    let sync_a = attach(a_group, a_id, consistency);
-    (sync_a, sync_b, state, cache)
 }
 
 async fn eventually(mut cond: impl FnMut() -> bool, what: &str) {
@@ -321,8 +281,8 @@ async fn an_unresolvable_seed_releases_readiness_after_its_window() {
 }
 
 /// A seed that comes back at a new address is relearned by re-resolution, and
-/// this node reaches the new life — which, seeding nobody, would otherwise
-/// never hear from it.
+/// this node reaches the new life. Both endpoints explicitly admit each other;
+/// discovering an address does not admit a new routing neighbor.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_moved_seed_is_relearned_and_rejoins() {
     let (a, b_first, b_moved) = (loopback(), loopback(), loopback());
@@ -334,9 +294,10 @@ async fn a_moved_seed_is_relearned_and_rejoins() {
     let node_a = WriteSync::bind(seed_config("seed-a", a, &[("seed-b", "b:1")]), resolution)
         .await
         .expect("binds loopback");
+    let address_a = a.to_string();
     let peer = |bind| {
         WriteSync::bind(
-            seed_config("seed-b", bind, &[]),
+            seed_config("seed-b", bind, &[("seed-a", address_a.as_str())]),
             NamedSeeds::new(SystemResolver),
         )
     };
@@ -393,11 +354,12 @@ fn only_a_mode_that_grants_leases_advertises_that_it_does() {
 #[tokio::test]
 async fn the_ack_wait_covers_advertisers_and_unknowns_but_not_declared_bounded_peers() {
     let net = Network::new();
-    let (_a_id, _a_node, a_group) = spawn_node(&net, "cap-a", "cap-b");
-    let (b_id, _b_node, b_group) = spawn_node(&net, "cap-b", "cap-a");
-    let (c_id, _c_node, c_group) = spawn_node(&net, "cap-c", "cap-a");
+    let (_a_id, _a_node, a_group) =
+        spawn_neighbors(&net, "cap-a", &["cap-b", "cap-c", "cap-d"]).await;
+    let (b_id, _b_node, b_group) = spawn_node(&net, "cap-b", "cap-a").await;
+    let (c_id, _c_node, c_group) = spawn_node(&net, "cap-c", "cap-a").await;
     // D runs, joins, and never advertises — a node from before this change.
-    let (d_id, _d_node, _d_group) = spawn_node(&net, "cap-d", "cap-a");
+    let (d_id, _d_node, _d_group) = spawn_node(&net, "cap-d", "cap-a").await;
     b_group
         .advertise_capabilities([CAP_ACKS])
         .expect("B advertises the ack tier");
@@ -427,12 +389,13 @@ async fn the_ack_wait_covers_advertisers_and_unknowns_but_not_declared_bounded_p
 #[tokio::test]
 async fn the_transition_wait_covers_exactly_what_the_lease_cannot() {
     let net = Network::new();
-    let (_a_id, _a_node, a_group) = spawn_node(&net, "mix-a", "mix-b");
-    let (b_id, _b_node, b_group) = spawn_node(&net, "mix-b", "mix-a");
-    let (c_id, _c_node, c_group) = spawn_node(&net, "mix-c", "mix-a");
+    let (_a_id, _a_node, a_group) =
+        spawn_neighbors(&net, "mix-a", &["mix-b", "mix-c", "mix-d", "mix-e"]).await;
+    let (b_id, _b_node, b_group) = spawn_node(&net, "mix-b", "mix-a").await;
+    let (c_id, _c_node, c_group) = spawn_node(&net, "mix-c", "mix-a").await;
     // D runs, joins, and never advertises — a node from before any of this.
-    let (d_id, _d_node, _d_group) = spawn_node(&net, "mix-d", "mix-a");
-    let (e_id, _e_node, e_group) = spawn_node(&net, "mix-e", "mix-a");
+    let (d_id, _d_node, _d_group) = spawn_node(&net, "mix-d", "mix-a").await;
+    let (e_id, _e_node, e_group) = spawn_node(&net, "mix-e", "mix-a").await;
     b_group
         .advertise_capabilities(Consistency::StrongAcks.capabilities().iter().copied())
         .expect("B pins the ack tier");
@@ -528,7 +491,7 @@ fn local_stamps_are_truncated_to_the_wire_precision() {
 #[tokio::test]
 async fn peer_events_fold_into_index_and_invalidate() {
     let net = Network::new();
-    let (sync_a, _sync_b, state, cache) = wired_pair(&net);
+    let (sync_a, _sync_b, state, cache) = wired_pair(&net).await;
     let metrics = Metrics::default();
 
     // B holds a soon-stale body copy.
@@ -588,8 +551,8 @@ async fn peer_events_fold_into_index_and_invalidate() {
 #[tokio::test]
 async fn peer_delete_retires_the_warm_copy() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "warm-a", "warm-b");
-    let (b_id, _b_node, b_group) = spawn_node(&net, "warm-b", "warm-a");
+    let (a_id, _a_node, a_group) = spawn_node(&net, "warm-a", "warm-b").await;
+    let (b_id, _b_node, b_group) = spawn_node(&net, "warm-b", "warm-a").await;
     let metrics = Arc::new(Metrics::default());
     let dir = std::env::temp_dir().join(format!("s3cache-peer-warm-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -646,8 +609,8 @@ async fn peer_delete_retires_the_warm_copy() {
 #[tokio::test]
 async fn an_undescribed_peer_write_fences_the_key_before_it_is_acknowledged() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "unknown-a", "unknown-b");
-    let (b_id, _b_node, b_group) = spawn_node(&net, "unknown-b", "unknown-a");
+    let (a_id, _a_node, a_group) = spawn_node(&net, "unknown-a", "unknown-b").await;
+    let (b_id, _b_node, b_group) = spawn_node(&net, "unknown-b", "unknown-a").await;
     let metrics = Arc::new(Metrics::default());
     let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
     let state = Arc::new(KeyIndex::default());
@@ -713,7 +676,7 @@ async fn an_undescribed_peer_write_fences_the_key_before_it_is_acknowledged() {
 #[tokio::test]
 async fn await_fresh_reflects_the_publishers_head() {
     let net = Network::new();
-    let (sync_a, sync_b, state, _cache) = wired_pair(&net);
+    let (sync_a, sync_b, state, _cache) = wired_pair(&net).await;
     let metrics = Metrics::default();
 
     own_put(&sync_a, "fresh", written(7), &metrics).await;
@@ -737,7 +700,7 @@ async fn await_fresh_reflects_the_publishers_head() {
 #[tokio::test]
 async fn write_tokens_upgrade_reads_to_strict() {
     let net = Network::new();
-    let (sync_a, sync_b, state, _cache) = wired_pair(&net);
+    let (sync_a, sync_b, state, _cache) = wired_pair(&net).await;
     let metrics = Metrics::default();
 
     let receipt = own_put(&sync_a, "tok", written(1), &metrics).await;
@@ -793,7 +756,7 @@ async fn write_tokens_upgrade_reads_to_strict() {
 async fn in_strong_acks_an_unacked_write_is_counted_and_not_retired() {
     let net = Network::new();
     let (_sync_a, sync_b, _state, _cache) =
-        wired_pair_named(&net, ("acks-a", "acks-b"), Consistency::StrongAcks);
+        wired_pair_named(&net, ("acks-a", "acks-b"), Consistency::StrongAcks).await;
     let metrics = Metrics::default();
     // A was attached without an apply loop, so it publishes no ack ledger — but it
     // is alive, so B has to wait for it and then give up.
@@ -843,7 +806,7 @@ async fn in_strong_acks_an_unacked_write_is_counted_and_not_retired() {
 async fn a_leased_write_resolves_on_acks_and_the_peer_already_has_it() {
     let net = Network::new();
     let (sync_a, _sync_b, state, _cache) =
-        wired_pair_named(&net, ("fast-a", "fast-b"), Consistency::Strong);
+        wired_pair_named(&net, ("fast-a", "fast-b"), Consistency::Strong).await;
     let metrics = Metrics::default();
     // Nothing about a *fast* path is provable until there is somebody to be fast
     // against: an empty wait set resolves immediately and would pass this vacuously.
@@ -883,8 +846,8 @@ async fn a_leased_write_resolves_on_acks_and_the_peer_already_has_it() {
 #[tokio::test]
 async fn a_dropped_peers_lease_lapses_and_the_write_completes_inside_one_duration() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "lapse-a", "lapse-b");
-    let (b_id, _b_node, b_group) = spawn_node(&net, "lapse-b", "lapse-a");
+    let (a_id, _a_node, a_group) = spawn_node(&net, "lapse-a", "lapse-b").await;
+    let (b_id, _b_node, b_group) = spawn_node(&net, "lapse-b", "lapse-a").await;
     let sync_a = attach(a_group, a_id, Consistency::Strong);
     // B renews and grants but never applies: no apply loop, so no ack ledger. It is
     // the fail-slow reader, which is exactly the peer a lapse has to rescue.
@@ -954,8 +917,8 @@ async fn a_dropped_peers_lease_lapses_and_the_write_completes_inside_one_duratio
 #[tokio::test]
 async fn a_granter_that_crashed_without_departing_is_named_until_it_returns() {
     let net = Network::new();
-    let (a_id, _a_node, a_group) = spawn_node(&net, "absent-a", "absent-b");
-    let (b_id, b_node, b_group) = spawn_node(&net, "absent-b", "absent-a");
+    let (a_id, _a_node, a_group) = spawn_node(&net, "absent-a", "absent-b").await;
+    let (b_id, b_node, b_group) = spawn_node(&net, "absent-b", "absent-a").await;
     let sync_a = attach(a_group, a_id, Consistency::Strong);
     let sync_b = attach(b_group, b_id.clone(), Consistency::Strong);
     eventually(
@@ -968,12 +931,10 @@ async fn a_granter_that_crashed_without_departing_is_named_until_it_returns() {
         "B is alive and granting"
     );
 
-    // A crash: no departure, the node simply stops. Dropping the handles is not enough
-    // on its own — the receive loop keeps the node ticking until its endpoint is
-    // evicted, which registering the id again does.
+    // A crash: no departure or feed seal; close only the managed network.
     drop(sync_b);
+    b_node.close().await;
     drop(b_node);
-    drop(net.endpoint(b_id.clone()));
     eventually(
         || sync_a.absent_granters() == [b_id.clone()],
         "A to name B as the counted granter it is waiting on",
@@ -985,7 +946,7 @@ async fn a_granter_that_crashed_without_departing_is_named_until_it_returns() {
     assert!(!sync_a.may_serve_local());
 
     // B returns under the same id (a StatefulSet pod) and is no longer named.
-    let (b_id, _b_node, b_group) = spawn_node(&net, "absent-b", "absent-a");
+    let (b_id, _b_node, b_group) = spawn_node(&net, "absent-b", "absent-a").await;
     let _sync_b = attach(b_group, b_id, Consistency::Strong);
     eventually(
         || sync_a.absent_granters().is_empty(),

@@ -85,6 +85,14 @@ impl WriteSync {
         }
     }
 
+    /// Close the managed gossip network after the mutation drain and feed seal.
+    /// This cancels address resolution and releases every owned link endpoint.
+    pub async fn close(&self) {
+        if let Some(node) = &self.node {
+            node.close().await;
+        }
+    }
+
     /// Advertise this life's feed epoch before any write, so every peer learns of the
     /// restart now: a sealed previous life renews, an unsealed one gaps at once.
     pub(crate) async fn announce(&self) {

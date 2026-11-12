@@ -163,6 +163,11 @@ documentation-only edit does not require an image build.
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval |
 | `S3CACHE_METRICS_LISTEN` | empty (disabled) | Bind address for the Prometheus text endpoint (`GET /metrics`) |
 
+Gossip uses one managed network: `S3CACHE_GOSSIP_SEEDS` explicitly admits UDP routing
+neighbors on both endpoints; DNS and advertisements refresh addresses only. The chart
+lists every ordinal. Startup awaits link binding, and planned shutdown closes the
+links and resolver after mutation drain and feed seal.
+
 `GET /ready` on the metrics listener is the pod readiness probe
 (`CachingProxy::probe_ready`): ready once this node's index is complete, or while
 no live (`Alive`/`Suspect`) peer declares the `s3cache:indexed` gossip capability or

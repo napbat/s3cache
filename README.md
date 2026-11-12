@@ -102,8 +102,13 @@ The fast path stays in local memory (LIST is served from RAM; nothing remote is 
 read path). Loss is **detected, never silent**: a peer that falls behind the feed's ring,
 or a peer restart, surfaces as a *gap* — the node distrusts every local body and resyncs
 its index from the origin, which is the authority the index caches, so a copy is served
-again only once that index has proved it current. Only seeds need static addressing;
-every other peer resolves through gossiped advertisements. The ring is bounded by both
+again only once that index has proved it current. `S3CACHE_GOSSIP_SEEDS` explicitly
+admits routing neighbors: configure both endpoints of every intended link. DNS and
+gossiped advertisements refresh admitted neighbors' addresses; discovering another
+member does not grant admission. The Helm chart configures every ordinal, including
+later-starting peers. Groupnet starts one managed network asynchronously and closes
+its links and resolver after the planned mutation drain and feed seal.
+The ring is bounded by both
 event count and encoded bytes: sustained long-key writes shorten its replay window and
 surface the same explicit gap instead of growing one state entry past the transport
 envelope and silently arresting peer application.
@@ -507,7 +512,7 @@ Unrelated documentation-only edits do not require a container build.
 | `S3CACHE_DISK_CACHE` | (empty) | Directory for the warm disk tier; unset = no disk tier |
 | `S3CACHE_DISK_CACHE_BYTES` | `10737418240` (10 GB) | Warm disk tier capacity (bytes) |
 | `S3CACHE_GOSSIP_BIND` | (empty) | UDP bind for the gossip write feed (e.g. `0.0.0.0:7946`); unset = single-node, no coherence layer |
-| `S3CACHE_GOSSIP_SEEDS` | (empty) | Comma-separated seed peers as `id=host:port`; only seeds need static addressing |
+| `S3CACHE_GOSSIP_SEEDS` | (empty) | Explicit UDP routing neighbors as comma-separated `id=host:port` pairs; configure both endpoints (self entries are ignored) |
 | `S3CACHE_GOSSIP_ADVERTISE` | bind addr | Address peers should dial back (set under NAT/container networking) |
 | `S3CACHE_CONSISTENCY` | `strong` | `strong`: lease-backed — a node serves locally only while it holds a serve-lease, and a write ends at an ack or at a lapse. `strong-acks`: the pre-lease ack-only mechanism, **deprecated**, removed next release. `bounded`: ~one-hop freshness, no per-write ack round (large clusters; set uniformly) |
 | `S3CACHE_LEASE_MS` | `2000` | Coherence-lease duration `D` (`strong` only): the writer's worst-case stall on a silent peer, each reader's window between confirmations, and the fleet's membership `dead_timeout`. Renewal traffic is one small entry per node per `D/3` |

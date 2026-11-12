@@ -90,11 +90,10 @@ spec:
             - name: S3CACHE_METRICS_LISTEN
               value: "0.0.0.0:{{ .Values.metrics.port | int64 }}"
             {{- end }}
-            # Pod name = gossip node id (HOSTNAME is set by the kubelet). Pod-0 is the
-            # only static seed; the rest resolves via gossiped advertisements. The
-            # advertise address must be the routable pod IP (peers parse it as an
-            # address), hence the downward API rather than a DNS name. Always on: a
-            # single replica is a cluster of one, and scaling is just replicaCount.
+            # Pod name = gossip node id (HOSTNAME is set by the kubelet). Every
+            # ordinal explicitly admits the other routing neighbors below. The
+            # advertise address is the routable pod IP, supplied by the downward API.
+            # Always on: a single replica is a cluster of one; scaling is replicaCount.
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -103,12 +102,14 @@ spec:
               value: "0.0.0.0:{{ .Values.gossip.port }}"
             - name: S3CACHE_GOSSIP_ADVERTISE
               value: "$(POD_IP):{{ .Values.gossip.port }}"
-            # Two seed ordinals when there can be a peer: each pod skips itself,
-            # leaving pod-0 seeding pod-1 and everyone else seeding pod-0. A
-            # single-replica cluster names only pod-0, so its skipped self entry
-            # does not generate a permanent unresolved-peer warning.
+            # Explicitly admit every ordinal, including peers that have not started.
+            # Each pod skips itself; a singleton therefore has no unresolved seed.
+            {{- $gossipPeers := list }}
+            {{- range $ordinal := until (int .Values.replicaCount) }}
+            {{- $gossipPeers = append $gossipPeers (printf "s3cache-%d=s3cache-%d.s3cache-gossip:%d" $ordinal $ordinal (int $.Values.gossip.port)) }}
+            {{- end }}
             - name: S3CACHE_GOSSIP_SEEDS
-              value: {{ if gt (int .Values.replicaCount) 1 }}"s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }},s3cache-1=s3cache-1.s3cache-gossip:{{ .Values.gossip.port }}"{{ else }}"s3cache-0=s3cache-0.s3cache-gossip:{{ .Values.gossip.port }}"{{ end }}
+              value: {{ join "," $gossipPeers | quote }}
             # Peer index bootstrap: a joining pod copies a ready peer's verified index
             # instead of listing the origin. Every ordinal shares this StatefulSet's
             # origin identity and bucket inventory; with no configured buckets there

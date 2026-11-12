@@ -1,15 +1,17 @@
+mod apply;
+
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use groupnet::consistency::volatile_recovery::{RecoveryError, RecoveryHandle, RecoveryStatus};
 use groupnet::consistency::{
-    AckLedger, CAP_ACKS, CAP_LEASE, CoherenceOutcome, Frontier, LeaseConfig, LeaseView, Leases,
-    PeerWrite, PeerWrites, RenewalId, WriteFeed, WriteToken, advertised_head, applied_by_selected,
+    CAP_ACKS, CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseView, Leases, RenewalId, WriteFeed,
+    WriteToken, advertised_head, applied_by_selected,
 };
 use groupnet::core::volatile_bootstrap::journal::NativeCut;
 use groupnet::core::{NodeId, Status};
-use groupnet::runtime::Group;
+use groupnet::runtime::{Group, Node};
 use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
@@ -23,10 +25,8 @@ use crate::sync::readiness::UnmetSeeds;
 use crate::sync::stop::Crossing;
 use crate::sync::volatile::CacheRecoveryAdapter;
 use crate::sync::wire::{
-    IndexEvent, IndexOp, decode_event, encode_event, etag_to_wire, from_micros, parse_token,
-    to_micros,
+    IndexEvent, IndexOp, encode_event, etag_to_wire, from_micros, parse_token, to_micros,
 };
-use crate::tier::LocalCache;
 
 /// Ring capacity: a peer that falls further behind than this many writes
 /// gets a gap (Groupnet closes serving, distrusts bodies, and rescans origin) instead
@@ -163,7 +163,8 @@ impl Consistency {
     }
 
     /// Whether this mode participates in the ack tier — publishes an
-    /// [`AckLedger`] and waits on other participants' watermarks. Exhaustive
+    /// [`AckLedger`](groupnet::consistency::AckLedger) and waits on participants'
+    /// watermarks. Exhaustive
     /// on purpose: a mode added later has to answer this question rather than
     /// inherit an answer from a `!= Bounded`.
     pub(super) fn acks(self) -> bool {
@@ -354,10 +355,9 @@ pub struct WriteSync {
     /// The deadline the coherence wait gets: one lease duration (the longest a
     /// silent holder's lapse can take) plus [`WRITE_WAIT_SLACK`].
     write_wait: Duration,
-    /// Keeps the gossip node (receive loop, group actors) alive for the
-    /// process lifetime, whatever its transport. `None` when a test drives a raw
-    /// group directly.
-    _node: Option<Box<dyn Send + Sync>>,
+    /// Owns the managed gossip network for this feed. `None` when a test holds
+    /// the node separately while driving its group.
+    pub(super) node: Option<Node>,
     /// This node's `~caps` declaration; [`WriteSync::advertise_indexed`] extends it.
     pub(super) advertisement: Arc<Advertisement>,
     /// Seeds not in the roster yet (see [`WriteSync::expect_seeds`]).
@@ -389,7 +389,7 @@ impl WriteSync {
         me: NodeId,
         consistency: Consistency,
         lease: LeaseConfig,
-        node: Option<Box<dyn Send + Sync>>,
+        node: Option<Node>,
     ) -> Self {
         debug_assert!(
             lease.validate().is_ok(),
@@ -418,7 +418,7 @@ impl WriteSync {
             advertisement,
             unmet_seeds: Arc::default(),
             absent_granters: std::sync::Mutex::default(),
-            _node: node,
+            node,
         }
     }
 
@@ -896,136 +896,6 @@ impl WriteSync {
         tokio::time::timeout(timeout, view.reached(&NodeId::new(writer), write))
             .await
             .unwrap_or(false)
-    }
-
-    /// Spawn the apply loop: peer events update the LIST index and invalidate
-    /// hot bodies. A peer write that describes nothing fences its key, and
-    /// `reconcile` resolves that fence from the origin. A gap synchronously
-    /// closes Groupnet's local serving gate, discards the index, and schedules
-    /// its rebuild. In `strong`, a small watcher reports the lease's monotone
-    /// lapse count to that same recovery driver.
-    ///
-    /// Takes `self` as an [`Arc`] because the lapse watcher holds a weak
-    /// reference back to this object, avoiding a task/handle cycle.
-    pub(crate) fn start_apply(
-        self: &Arc<Self>,
-        local: LocalCache,
-        state: Arc<KeyIndex>,
-        metrics: Arc<Metrics>,
-        reconcile: KeyReconcile,
-    ) {
-        let (frontier, view) = Frontier::new();
-        let _ = self.view.set(view);
-        // Declare this node's feed writer before any capture can start, at
-        // its current position (zero for a feed with no writes yet).
-        state.register_native_writer(&self.own_position());
-        if let Some(leases) = &self.leases {
-            let weak = Arc::downgrade(self);
-            let poll = lapse_poll(leases.config().duration);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(poll).await;
-                    let Some(sync) = weak.upgrade() else { return };
-                    let Some(recovery) = sync.recovery.get() else {
-                        return;
-                    };
-                    let count = sync.lease_view.as_ref().map_or(0, LeaseView::lapses);
-                    if count > recovery.status().state.covered_lapses {
-                        let _ = recovery.lease_lapse(count);
-                    }
-                }
-            });
-        }
-        // Bounded mode publishes no acks (that is its point at scale); both strong
-        // spellings do, and say so through their capability advertisement.
-        let ledger = self
-            .consistency
-            .acks()
-            .then(|| AckLedger::new(self.group.clone()));
-        let mut peers = PeerWrites::new(self.group.clone(), self.me.clone(), decode_event);
-        let weak = Arc::downgrade(self);
-        let lapse_view = self.lease_view.clone();
-        tokio::spawn(async move {
-            while let Some(event) = peers.next().await {
-                let Some(sync) = weak.upgrade() else { return };
-                match event {
-                    PeerWrite::Sealed { peer, token } => {
-                        state.note_native_seal(native_cut(&peer, token));
-                        sync.observe_seal(&peer, token);
-                        frontier.advance(&peer, token);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, token).await;
-                        }
-                    }
-                    PeerWrite::Renewed {
-                        peer,
-                        sealed,
-                        epoch,
-                    } => {
-                        let start = sync.observe_renewal(&state, &peer, sealed, epoch, &metrics);
-                        frontier.advance(&peer, start);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, start).await;
-                        }
-                    }
-                    PeerWrite::Wrote {
-                        peer,
-                        token,
-                        key: event,
-                    } => {
-                        let cache_key = (event.bucket.clone(), event.key.clone());
-                        let mutation = local.fence_mutation(&cache_key).await;
-                        let fenced = apply_feed_index(&state, &peer, token, &event);
-                        drop(mutation);
-                        // Fenced before the acknowledgement below: from then on this
-                        // node answers the key from the origin until the reconciliation
-                        // resolves it.
-                        if let Some(fence) = fenced {
-                            reconcile(&event.bucket, &event.key, fence);
-                        }
-                        // The index must move first: a warm body promoted after this hot
-                        // eviction decodes suspect and is checked against the new entry
-                        // before it can be served. Awaiting moka removal before the ack
-                        // closes the stale-hot window without putting disk I/O on the
-                        // feed frontier.
-                        local.invalidate_hot(&cache_key).await;
-                        frontier.advance(&peer, token);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, token).await;
-                        }
-                        metrics.feed_applied();
-                        // The index has moved past any copy this node holds, so the warm
-                        // copy can never serve again; left in place it would only crowd
-                        // live bodies out of the disk budget until LRU found it. Disk I/O
-                        // stays off the frontier: retire it after the acknowledgement.
-                        let retire = local.clone();
-                        tokio::spawn(async move { retire.invalidate(&cache_key).await });
-                    }
-                    PeerWrite::Gap {
-                        peer,
-                        missed_through,
-                    } => {
-                        warn!("write-feed gap from `{peer}`: distrusting bodies, resyncing index");
-                        sync.forget_crossing(&peer);
-                        state.discard_for_gap(&native_cut(&peer, missed_through));
-                        // The public signal fences serving before returning; the
-                        // recovery worker distrusts bodies and guards every origin
-                        // scan page with that exact operation's permit. Frontier
-                        // progress below means the old local state is unservable,
-                        // not that the replacement index has materialized already.
-                        if let Some(recovery) = sync.recovery.get() {
-                            let lapses = lapse_view.as_ref().map_or(0, LeaseView::lapses);
-                            let _ = recovery.feed_gap(lapses);
-                        }
-                        frontier.advance(&peer, missed_through);
-                        if let Some(ledger) = &ledger {
-                            ledger.record(&peer, missed_through).await;
-                        }
-                        metrics.feed_gap();
-                    }
-                }
-            }
-        });
     }
 
     /// Wait (bounded by `timeout`) until every peer's currently-advertised

@@ -5,8 +5,10 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use groupnet::consistency::{LeaseConfig, WriteFeed, advertised_head};
 use groupnet::core::{Config, NodeId};
+use groupnet::network::RouterConfig;
 use groupnet::runtime::Node;
-use groupnet::transport::mem::{MemTransport, Network};
+use groupnet::transport::link::{BoundLink, LinkConfig};
+use groupnet::transport::mem::Network;
 use http::HeaderMap;
 use s3s::dto::{ETag, GetObjectInput, GetObjectOutput, ListObjectsV2Input, Timestamp};
 use s3s::{S3, S3ErrorCode, S3Request};
@@ -38,12 +40,18 @@ fn brisk() -> Config {
 /// One leased node, alone in its group. A solo reader's granter roster is empty, so
 /// its lease confirms vacuously — which is exactly why the shell's warm-up guard,
 /// not the confirmation, is what a booting node has to get past.
-fn solo(id: &str) -> (Node<MemTransport>, Arc<WriteSync>) {
+async fn solo(id: &str) -> (Node, Arc<WriteSync>) {
     let net = Network::new();
     let me = NodeId::new(id);
-    let node = Node::builder(me.clone(), net.endpoint(me.clone()))
+    let node = Node::builder(me.clone())
+        .link(BoundLink::new(
+            net.endpoint(me.clone()),
+            LinkConfig::new(Vec::new()),
+        ))
         .config(brisk())
-        .spawn();
+        .start()
+        .await
+        .expect("solo managed node starts");
     let group = node.join_group("s3cache");
     let sync = WriteSync::attach(
         group,
@@ -123,7 +131,7 @@ async fn revoke_before_local_return(
 
 #[tokio::test]
 async fn a_lease_revoked_after_local_body_lookup_forces_origin_get() {
-    let (_node, sync) = solo("return-fence-get");
+    let (_node, sync) = solo("return-fence-get").await;
     let proxy = proxy(Some(sync.clone()));
     let body = cached("v1", at(1_700_000_000));
     body.mark_trusted(proxy.obj_cache.suspect_gen());
@@ -158,7 +166,7 @@ async fn a_lease_revoked_after_local_body_lookup_forces_origin_get() {
 
 #[tokio::test]
 async fn a_lease_revoked_after_index_answer_forces_origin_list() {
-    let (_node, sync) = solo("return-fence-list");
+    let (_node, sync) = solo("return-fence-list").await;
     let proxy = proxy(Some(sync.clone()));
     index(&proxy, "k", Some("v1"), at(1_700_000_000));
     synced(&proxy);
@@ -294,7 +302,7 @@ fn counter(proxy: &CachingProxy, name: &str) -> u64 {
 /// body of that same version can pass revalidation after warm-up completes.
 #[tokio::test]
 async fn an_unknown_read_observation_keeps_the_origin_mtime() {
-    let (_node, sync) = solo("observed-origin-mtime");
+    let (_node, sync) = solo("observed-origin-mtime").await;
     let proxy = proxy(Some(sync));
     let modified = at(1_700_000_000);
     let observed = ObservedObject {
@@ -336,14 +344,32 @@ async fn a_freshness_timeout_routes_to_origin_and_is_counted() {
     let net = Network::new();
     let a_id = NodeId::new("barrier-a");
     let b_id = NodeId::new("barrier-b");
-    let a_node = Node::builder(a_id.clone(), net.endpoint(a_id.clone()))
-        .seed(b_id.clone())
+    let a_node = Node::builder(a_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(a_id.clone()),
+            LinkConfig::new(vec![b_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
-    let b_node = Node::builder(b_id.clone(), net.endpoint(b_id.clone()))
-        .seed(a_id.clone())
+        .start()
+        .await
+        .expect("A managed node starts");
+    let b_node = Node::builder(b_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(b_id.clone()),
+            LinkConfig::new(vec![a_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
+        .start()
+        .await
+        .expect("B managed node starts");
     let a_group = a_node.join_group("s3cache");
     let b_group = b_node.join_group("s3cache");
     let sync = Arc::new(WriteSync::attach(
@@ -404,14 +430,32 @@ async fn a_stalled_write_is_a_503_not_a_success() {
     let net = Network::new();
     let a_id = NodeId::new("stall-a");
     let b_id = NodeId::new("stall-b");
-    let a_node = Node::builder(a_id.clone(), net.endpoint(a_id.clone()))
-        .seed(b_id.clone())
+    let a_node = Node::builder(a_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(a_id.clone()),
+            LinkConfig::new(vec![b_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
-    let b_node = Node::builder(b_id.clone(), net.endpoint(b_id.clone()))
-        .seed(a_id.clone())
+        .start()
+        .await
+        .expect("A managed node starts");
+    let b_node = Node::builder(b_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(b_id.clone()),
+            LinkConfig::new(vec![a_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
+        .start()
+        .await
+        .expect("B managed node starts");
     let lease = LeaseConfig::for_duration(Duration::from_millis(300));
     // A advertises the ack tier but runs no apply loop, so it never acknowledges.
     let _peer = WriteSync::attach(
@@ -456,7 +500,7 @@ async fn a_stalled_write_is_a_503_not_a_success() {
 
 #[tokio::test]
 async fn an_unlicensed_read_records_its_bypass_reason() {
-    let (_node, sync) = solo("unlicensed-read");
+    let (_node, sync) = solo("unlicensed-read").await;
     let proxy = proxy(Some(sync));
     assert!(matches!(
         proxy.read_barrier(&HeaderMap::new()).await,
@@ -492,7 +536,7 @@ async fn a_single_node_serves_a_suspect_copy_unproved() {
 /// atomic load, without the index being asked anything.
 #[tokio::test]
 async fn a_proved_copy_is_served_without_consulting_the_index() {
-    let (_node, sync) = solo("proved");
+    let (_node, sync) = solo("proved").await;
     let proxy = proxy(Some(sync));
     let obj = cached("v1", at(1_700_000_000));
     obj.mark_trusted(proxy.obj_cache.suspect_gen());
@@ -579,7 +623,7 @@ async fn peer_put_cannot_complete_new_index_metadata_from_an_older_get() {
 /// and not once per read. The second call must not touch the index again.
 #[tokio::test]
 async fn a_suspect_copy_the_index_confirms_is_proved_exactly_once() {
-    let (_node, sync) = solo("confirm");
+    let (_node, sync) = solo("confirm").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     proxy.obj_cache.insert(ck("k"), cached("v1", filled)).await;
@@ -602,7 +646,7 @@ async fn a_suspect_copy_the_index_confirms_is_proved_exactly_once() {
 /// drop it and let the origin serve the read.
 #[tokio::test]
 async fn a_suspect_copy_the_index_contradicts_is_dropped() {
-    let (_node, sync) = solo("contradict");
+    let (_node, sync) = solo("contradict").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     synced(&proxy);
@@ -649,7 +693,7 @@ async fn a_suspect_copy_the_index_contradicts_is_dropped() {
 /// entry is stamped microseconds after its body.
 #[tokio::test]
 async fn a_byte_identical_rewrite_is_caught_by_the_mtime_and_a_fresh_fill_is_not() {
-    let (_node, sync) = solo("rewrite");
+    let (_node, sync) = solo("rewrite").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     synced(&proxy);
@@ -694,7 +738,7 @@ async fn a_byte_identical_rewrite_is_caught_by_the_mtime_and_a_fresh_fill_is_not
 /// are actually read.
 #[tokio::test]
 async fn an_unsynced_bucket_arbitrates_nothing_and_drops_the_copy() {
-    let (_node, sync) = solo("unsynced");
+    let (_node, sync) = solo("unsynced").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     proxy.obj_cache.insert(ck("k"), cached("v1", filled)).await;

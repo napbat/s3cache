@@ -356,7 +356,9 @@ mod tests {
     use super::*;
     use groupnet::consistency::LeaseConfig;
     use groupnet::core::Config;
+    use groupnet::network::RouterConfig;
     use groupnet::runtime::Node;
+    use groupnet::transport::link::{BoundLink, LinkConfig};
     use groupnet::transport::mem::Network;
 
     #[tokio::test]
@@ -369,14 +371,30 @@ mod tests {
             anti_entropy_interval_ms: 25,
             ..Config::default()
         };
-        let node_a = Node::builder(a.clone(), net.endpoint(a.clone()))
-            .seed(b.clone())
+        let routing = RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        };
+        let node_a = Node::builder(a.clone())
+            .link(BoundLink::new(
+                net.endpoint(a.clone()),
+                LinkConfig::new(vec![b.clone()]),
+            ))
+            .routing(routing.clone())
             .config(config.clone())
-            .spawn();
-        let node_b = Node::builder(b.clone(), net.endpoint(b.clone()))
-            .seed(a.clone())
+            .start()
+            .await
+            .expect("A managed node starts");
+        let node_b = Node::builder(b.clone())
+            .link(BoundLink::new(
+                net.endpoint(b.clone()),
+                LinkConfig::new(vec![a.clone()]),
+            ))
+            .routing(routing)
             .config(config)
-            .spawn();
+            .start()
+            .await
+            .expect("B managed node starts");
         let group_a = node_a.join_group("s3cache");
         let group_b = node_b.join_group("s3cache");
         tokio::time::timeout(Duration::from_secs(3), async {

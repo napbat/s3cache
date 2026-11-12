@@ -4,7 +4,7 @@ use std::time::Duration;
 use groupnet::consistency::LeaseConfig;
 use groupnet::core::{Config, NodeId};
 use groupnet::runtime::{Group, NamedSeeds, Node, SeedEvent, SystemResolver};
-use groupnet::transport::Transport;
+use groupnet::transport::link::{BoundLink, LinkConfig, LinkProvider};
 use groupnet::transport::udp::UdpTransport;
 use tracing::{info, warn};
 
@@ -63,9 +63,9 @@ pub struct SyncConfig {
     /// The address peers should reach this node on; the bound address when
     /// `None` (`S3CACHE_GOSSIP_ADVERTISE`).
     pub advertise: Option<String>,
-    /// Statically-addressed peers as `(node id, host:port)`. Every other peer
-    /// resolves itself through gossiped advertisements, so only seeds need
-    /// static addressing (`S3CACHE_GOSSIP_SEEDS`).
+    /// Explicit routing neighbors as `(node id, host:port)`. DNS resolution and
+    /// gossiped advertisements refresh their addresses, but do not admit additional
+    /// neighbors (`S3CACHE_GOSSIP_SEEDS`).
     pub seeds: Vec<(String, String)>,
     /// This node's identity in the cluster (the pod name, in the chart).
     pub node_id: String,
@@ -145,60 +145,62 @@ impl WriteSync {
         for (id, addr) in &cfg.seeds {
             resolution = resolution.seed(NodeId::new(id.as_str()), addr.as_str());
         }
-        let mut builder = Node::builder(me.clone(), transport)
+        let mut builder = Node::builder(me.clone())
+            .link(BoundLink::new(transport, LinkConfig::new(seeds.clone())))
             .config(gossip_config(cfg.lease_ms))
             .named_seeds(resolution);
         if let Some(advertise) = advertise {
             builder = builder.advertise_addr(advertise);
         }
-        let node = builder.spawn();
+        let node = match builder.start().await {
+            Ok(node) => node,
+            Err(error) => {
+                warn!("gossip disabled: cannot start managed network: {error}");
+                return None;
+            }
+        };
         let group = node.join_group("s3cache");
         let (bind, node_id, mode) = (&cfg.bind, &cfg.node_id, cfg.consistency.label());
         let lease_ms = cfg.lease_ms;
         info!(
             "gossip coherence bound on `{bind}` as `{node_id}` (consistency: {mode}, lease: {lease_ms}ms)"
         );
-        let sync = WriteSync::attach(group, me, cfg.consistency, lease, Some(Box::new(node)));
+        let sync = WriteSync::attach(group, me, cfg.consistency, lease, Some(node));
         let _ = unmet.set(sync.expect_seeds(seeds));
         Some(sync)
     }
 
-    /// Join the cluster group as `node_id` over an already-built groupnet
-    /// `transport`, seeded with `seeds`, with exactly the membership tuning and
-    /// coherence lease [`WriteSync::new`] runs. `new` is this over UDP plus seed
-    /// address resolution; any other transport (the in-memory one, for a whole
-    /// fleet in one process) resolves its own peers.
+    /// Join the cluster group as `node_id` over a managed protocol `link`, with
+    /// exactly the membership tuning and coherence lease [`WriteSync::new`] runs.
+    /// The link explicitly admits its routing neighbors; `seeds` additionally
+    /// records the peers readiness must await.
     ///
-    /// # Panics
-    /// Outside a Tokio runtime: the node spawns its tasks here.
-    pub fn over_transport<T: Transport>(
-        transport: T,
+    /// # Errors
+    /// Returns an error if the link cannot bind or the managed network cannot start.
+    pub async fn over_link(
+        link: impl LinkProvider,
         node_id: &str,
         seeds: &[&str],
         consistency: Consistency,
         lease_ms: u64,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let me = NodeId::new(node_id);
-        let mut builder = Node::builder(me.clone(), transport).config(gossip_config(lease_ms));
+        let mut builder = Node::builder(me.clone())
+            .link(link)
+            .config(gossip_config(lease_ms));
         for seed in seeds.iter().filter(|seed| **seed != node_id) {
             builder = builder.seed(NodeId::new(*seed));
         }
-        let node = builder.spawn();
+        let node = builder.start().await?;
         let group = node.join_group("s3cache");
-        let sync = WriteSync::attach(
-            group,
-            me,
-            consistency,
-            lease_config(lease_ms),
-            Some(Box::new(node)),
-        );
+        let sync = WriteSync::attach(group, me, consistency, lease_config(lease_ms), Some(node));
         sync.expect_seeds(
             seeds
                 .iter()
                 .filter(|seed| **seed != node_id)
                 .map(|seed| NodeId::new(*seed)),
         );
-        sync
+        Ok(sync)
     }
 
     /// The gossip group this node's feed, leases and membership ride on, for
