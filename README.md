@@ -108,10 +108,11 @@ gossiped advertisements refresh admitted neighbors' addresses; discovering anoth
 member does not grant admission. The Helm chart configures every ordinal, including
 later-starting peers. Groupnet starts one managed network asynchronously and closes
 its links and resolver after the planned mutation drain and feed seal.
-The ring is bounded by both
-event count and encoded bytes: sustained long-key writes shorten its replay window and
-surface the same explicit gap instead of growing one state entry past the transport
-envelope and silently arresting peer application.
+The ring is bounded by both event count (4096) and encoded bytes (one 60 kB gossip
+frame), and the bytes bind first: a `strong` write is two events, about 230 bytes for a
+44-byte key, so a peer about 260 such writes behind gets a gap. Longer keys shorten
+that window and surface the same explicit gap instead of growing one state entry past
+the transport envelope and silently arresting peer application.
 After a `strong`/`strong-acks` write has a real all-readers acknowledgement (or every
 straggler has lost serving authority), its safe feed prefix is retired while the newest
 head remains advertised as an anchor. Healthy feeds therefore carry an anchor plus only

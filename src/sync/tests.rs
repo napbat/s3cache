@@ -2,9 +2,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use groupnet::consistency::CAP_ACKS;
 use groupnet::consistency::lease::{CAP_LEASE, LeaseConfig};
 use groupnet::consistency::volatile_recovery::{RecoveryStage, RecoveryStatus};
+use groupnet::consistency::{CAP_ACKS, PeerWrites, advertised_head};
 use groupnet::core::volatile_recovery::RecoveryState;
 use groupnet::core::{Config, NodeId, Status};
 use groupnet::runtime::{NamedSeeds, ResolveFuture, SeedResolver, SystemResolver};
@@ -17,8 +17,8 @@ use crate::index::{
 };
 use crate::metrics::Metrics;
 use crate::sync::coherence::{
-    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, KeyReconcile, WriteReceipt, WriteSync, WriteWait,
-    recovery_generation_permits, waits_on, waits_on_unleased,
+    CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, FEED_CAPACITY, KeyReconcile, WriteReceipt,
+    WriteSync, WriteWait, recovery_generation_permits, waits_on, waits_on_unleased,
 };
 use crate::sync::config::{SyncConfig, parse_lease_ms, parse_seeds};
 use crate::sync::wire::{
@@ -117,6 +117,41 @@ fn only_acknowledged_strong_waits_retire_feed_history() {
         "bounded Applied is immediate, not an all-readers watermark"
     );
     assert!(!WriteWait::Lapsed(Vec::new()).retires_feed(Consistency::Bounded));
+}
+
+/// The feed ring is cut to the gossip frame budget long before `FEED_CAPACITY` events:
+/// even the smallest event a valid bucket and key make stops it short of the cap, so
+/// the cap sets neither the gap horizon nor the ring's memory.
+#[tokio::test]
+async fn the_frame_budget_binds_the_feed_ring_before_its_event_cap() {
+    let net = Network::new();
+    let (w_id, _w_node, w_group) = spawn_node(&net, "ring-w", "ring-s").await;
+    let (s_id, _s_node, s_group) = spawn_node(&net, "ring-s", "ring-w").await;
+    // It never polls, so it never enters the writer's epoch: its lag is the whole window.
+    let unseen = PeerWrites::new(s_group.clone(), s_id, decode_event);
+    let sync_w = attach(w_group, w_id.clone(), Consistency::Bounded);
+    let smallest = IndexEvent {
+        op: IndexOp::Pending,
+        bucket: "abc".to_owned(),
+        key: "k".to_owned(),
+        ts_us: to_micros(SystemTime::now()),
+        settles: None,
+        floor: None,
+    };
+    let mut head = None;
+    for _ in 0..FEED_CAPACITY {
+        head = sync_w.feed.publish(&smallest).await.ok();
+    }
+    eventually(
+        || head.is_some() && advertised_head(&s_group, &w_id) == head,
+        "the subscriber to see the writer's head",
+    )
+    .await;
+    let window = unseen.lag(&w_id).expect("a decodable feed");
+    assert!(
+        window < FEED_CAPACITY as u64,
+        "the byte budget holds {window} events"
+    );
 }
 
 fn cached(body: &'static [u8]) -> Arc<CachedObject> {

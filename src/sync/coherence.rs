@@ -34,9 +34,10 @@ use crate::sync::wire::{
     IndexEvent, IndexOp, encode_event, etag_to_wire, from_micros, parse_token, to_micros,
 };
 
-/// Ring capacity: a peer that falls further behind than this many feed events (a
-/// `strong` write publishes two) gets a gap (Groupnet closes serving, distrusts
-/// bodies, and rescans origin) instead of per-event application.
+/// Ring capacity in events, a ceiling only: the ring is also cut to one gossip frame
+/// (60 kB by default), which binds first. That holds about 260 `strong` writes (two
+/// events each) of a 44-byte key, and never 4096 events. A peer further behind gets a
+/// gap (Groupnet closes serving, distrusts bodies, and rescans origin).
 pub(super) const FEED_CAPACITY: usize = 4096;
 
 /// A peer feed position as the index's native writer cut.
