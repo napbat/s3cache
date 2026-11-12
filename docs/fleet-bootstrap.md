@@ -164,6 +164,10 @@ unknown schema. Encoded bytes, decoded rows, native overlap, donor suffix,
 and each physical reply clone use distinct shared `ByteAdmission` permits.
 The decoder precharges conservative hash-table and tree-node capacity before
 allocation. This bounds private image ownership, not allocator RSS exactly.
+A follower hashes and decodes each chunk as it lands, so verification only
+finishes both: Groupnet's worker refreshes the donor's claim between its
+steps, and one long decode after the last chunk let that claim lapse on the
+follower under a live donor.
 The exact `DonorJournal::storage_bound` must fit the configured Suffix and
 global caps before cloning the image. Tests price the configured bound and
 measured live usage; a cap refusal falls back to origin without publishing a
