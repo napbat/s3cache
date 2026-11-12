@@ -346,13 +346,19 @@ impl super::KeyIndex {
     /// an origin rebuild discards it. Without the discard an install would
     /// carry pre-gap rows the donor no longer holds — a key the missed writes
     /// deleted, whose tombstone the donor's own rebuild forgot — as if they
-    /// were this node's own later effects.
+    /// were this node's own later effects. A pending write the gap hid fences
+    /// every key until the writer's floor passes it.
     pub(crate) fn discard_for_gap(&self, missed_through: &NativeCut) {
         let mut index = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         index.skip_native_gap(missed_through);
+        index.pending.skip(
+            &missed_through.writer,
+            missed_through.epoch,
+            missed_through.sequence,
+        );
         index.discard_buckets();
     }
 }

@@ -8,6 +8,10 @@
 //! to a gap is covered by the next event. What a writer's ended life left open is
 //! fenced as uncertain instead (see [`fence_uncertain_key`](super::fence_uncertain_key)):
 //! only the origin can say what it did.
+//!
+//! A reader that joined, or gapped, after a write was announced never held it, and
+//! cannot tell which key it fences. Until that writer's floor shows nothing older than
+//! the reader's first event is open, the reader answers every key from the origin.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
@@ -25,11 +29,21 @@ struct Life {
     open: BTreeMap<u64, (String, String)>,
 }
 
+/// The writer life a reader last saw, and, while that life may hold a pending write
+/// from before what the reader saw, the first sequence the reader did see.
+struct Seen {
+    epoch: u64,
+    blind_below: Option<u64>,
+}
+
 #[derive(Default)]
 pub(super) struct PendingWrites {
     writers: HashMap<Vec<u8>, Life>,
     /// How many open pending writes fence each key, per bucket.
     keys: HashMap<String, BTreeMap<String, u32>>,
+    seen: HashMap<Vec<u8>, Seen>,
+    /// How many writers in `seen` may hold a pending write this reader never saw.
+    blind: usize,
 }
 
 impl PendingWrites {
@@ -39,15 +53,53 @@ impl PendingWrites {
     }
 
     fn fenced(&self, bucket: &str, key: &str) -> bool {
-        self.keys
-            .get(bucket)
-            .is_some_and(|keys| keys.contains_key(key))
+        self.blind > 0
+            || self
+                .keys
+                .get(bucket)
+                .is_some_and(|keys| keys.contains_key(key))
     }
 
     pub(super) fn fenced_under(&self, bucket: &str, prefix: &str) -> bool {
-        self.keys
-            .get(bucket)
-            .is_some_and(|keys| first_under(keys, prefix))
+        self.blind > 0
+            || self
+                .keys
+                .get(bucket)
+                .is_some_and(|keys| first_under(keys, prefix))
+    }
+
+    fn set_seen(&mut self, writer: &[u8], seen: Option<Seen>) {
+        let blind = seen.as_ref().is_some_and(|seen| seen.blind_below.is_some());
+        let was = match seen {
+            Some(seen) => self.seen.insert(writer.to_vec(), seen),
+            None => self.seen.remove(writer),
+        };
+        self.blind += usize::from(blind);
+        self.blind -= usize::from(was.is_some_and(|was| was.blind_below.is_some()));
+    }
+
+    /// Note an event of `writer` at `seq`, carrying `floor`. The first one seen of a
+    /// life leaves anything open below it unknown here, until a floor at or above it.
+    fn see(&mut self, writer: &[u8], epoch: u64, seq: u64, floor: Option<u64>) {
+        let from = match self.seen.get(writer) {
+            Some(seen) if seen.epoch > epoch => return,
+            Some(seen) if seen.epoch == epoch => match seen.blind_below {
+                Some(from) => from,
+                None => return,
+            },
+            _ => seq,
+        };
+        let blind_below = floor.is_some_and(|floor| floor < from).then_some(from);
+        self.set_seen(writer, Some(Seen { epoch, blind_below }));
+    }
+
+    /// A feed gap: every event of `writer` through `through` was missed.
+    pub(super) fn skip(&mut self, writer: &[u8], epoch: u64, through: u64) {
+        if self.seen.get(writer).is_some_and(|seen| seen.epoch > epoch) {
+            return;
+        }
+        let blind_below = (through > 0).then(|| through + 1);
+        self.set_seen(writer, Some(Seen { epoch, blind_below }));
     }
 
     fn hold(&mut self, writer: &[u8], epoch: u64, seq: u64, bucket: &str, key: &str) {
@@ -79,6 +131,7 @@ impl PendingWrites {
         settles: Option<u64>,
         floor: Option<u64>,
     ) {
+        self.see(writer, epoch, seq, floor);
         let Some(life) = self.writers.get_mut(writer) else {
             return;
         };
@@ -101,6 +154,9 @@ impl PendingWrites {
 
     /// End `writer`'s life if it is older than `epoch`, returning what it left open.
     fn end_life_before(&mut self, writer: &[u8], epoch: u64) -> Vec<(String, String)> {
+        if self.seen.get(writer).is_some_and(|seen| seen.epoch < epoch) {
+            self.set_seen(writer, None);
+        }
         if self
             .writers
             .get(writer)
@@ -233,7 +289,8 @@ impl KeyIndex {
 
 impl KeyIndexReadGuard<'_> {
     /// Whether `key` may only be answered from the origin: its last mutation is
-    /// unreconciled, or a peer's write of it is pending.
+    /// unreconciled, a peer's write of it is pending, or a peer may hold a pending
+    /// write this node never saw.
     pub(crate) fn key_fenced(&self, bucket: &str, key: &str) -> bool {
         self.0.pending.fenced(bucket, key)
             || self
@@ -345,5 +402,57 @@ mod tests {
         assert!(!guard.fenced_under("bkt", "ptr/"));
         assert!(!guard.fenced_under("bkt", "log/0003"));
         assert!(!guard.fenced_under("other", ""));
+    }
+
+    /// The first event a reader sees of a writer names an older open write it never
+    /// held: every key goes to the origin until the floor reaches that first event.
+    #[test]
+    fn an_unseen_open_write_fences_every_key_until_the_floor_passes_it() {
+        let state = KeyIndex::default();
+        state.hold_pending_native("bkt", "m", &cut(1, 5), Some(3));
+        assert!(fenced(&state, "elsewhere"));
+        assert!(state.read().unwrap().fenced_under("other", ""));
+        // 3 settled; 5, which this reader holds, is still open.
+        state.settle_pending_native(&cut(1, 6), None, Some(5), true);
+        assert!(!fenced(&state, "elsewhere"));
+        assert!(fenced(&state, "m"));
+    }
+
+    #[test]
+    fn a_first_event_with_nothing_older_open_fences_only_its_own_key() {
+        let state = KeyIndex::default();
+        state.hold_pending_native("bkt", "m", &cut(1, 5), None);
+        assert!(fenced(&state, "m"));
+        assert!(!fenced(&state, "elsewhere"));
+    }
+
+    /// A gap may hide an announcement; a gap into a new life before its first event
+    /// hides none.
+    #[test]
+    fn a_gap_fences_every_key_until_the_floor_passes_it() {
+        let state = KeyIndex::default();
+        state.hold_pending_native("bkt", "k", &cut(1, 1), None);
+        state.discard_for_gap(&cut(1, 9));
+        assert!(fenced(&state, "elsewhere"));
+        state.settle_pending_native(&cut(1, 10), None, Some(1), true);
+        assert!(
+            fenced(&state, "elsewhere"),
+            "1 is held, but 2 to 9 may hide another"
+        );
+        state.settle_pending_native(&cut(1, 11), Some(1), None, true);
+        assert!(!fenced(&state, "elsewhere") && !fenced(&state, "k"));
+        state.discard_for_gap(&cut(2, 0));
+        assert!(!fenced(&state, "elsewhere"));
+    }
+
+    /// A writer's next life ends the last one's blindness: a gap into it rebuilds the
+    /// index from the origin, and a seal follows every outcome of the life it ends.
+    #[test]
+    fn a_new_life_ends_the_last_ones_blindness() {
+        let state = KeyIndex::default();
+        state.hold_pending_native("bkt", "m", &cut(1, 5), Some(3));
+        assert_eq!(state.end_pending_life(b"writer", 2).len(), 1);
+        assert!(!fenced(&state, "elsewhere"));
+        assert!(fenced(&state, "m"), "uncertain until the origin says");
     }
 }
