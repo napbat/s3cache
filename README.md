@@ -246,7 +246,7 @@ heuristic earlier releases used:
   after the lapse (so every wait held against the old one is resolved — read per granter
   rather than off the confirmed watermark, which is a *min* over the roster and advances
   when the member pinning it merely departs), settles for the fabric's
-  entry-propagation bound (`2 × anti_entropy_interval`), checks that no peer which was
+  entry-propagation bound (`2 × gossip_interval`), checks that no peer which was
   live at the lapse has vanished from membership since, and then barriers on every peer's
   advertised feed head — re-running the vanished check once more afterwards, because the
   barrier waits and a reap can land inside that wait. Past the barrier the apply loop has

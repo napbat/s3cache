@@ -53,10 +53,12 @@ src/
   sync/
     mod.rs       # sync link point: module docs and declarations only
     coherence.rs # gossip write-feed and coherence core
-    config.rs    # gossip env/config parsing and node construction
+    coherence/apply.rs # the apply loop: peer writes into the index, acks, gaps and lapses
+    config.rs    # gossip env/config parsing and managed node construction
     volatile.rs  # S3 origin facts/effects for Groupnet's bounded recovery driver
     wire.rs      # write-event and session-token codec
     tests.rs     # coherence unit tests
+    tests/fixtures.rs # managed in-memory nodes and wired pairs for those tests
   metrics.rs    # counters, warm-residency gauges, and periodic stats logging
 tests/it/       # one integration-test binary; each module is a suite (links the library crate)
 deploy/helm/s3cache/   # Helm chart
