@@ -329,6 +329,13 @@ box is the long form):
   answered **503** without calling the origin (`ack_timeouts`). A write the origin
   refused abandons its fence. A node holding a peer's open fence offers no index image
   to a joining node.
+- **A node that never saw a fence answers every key from the origin until it is
+  settled.** A node that joins, or gaps, after a write was fenced cannot tell which key
+  it fences. Every feed event carries its writer's oldest open write, so the first
+  event such a node applies from that writer shows whether one predates what it saw;
+  until a later event shows none does, the node answers every read from the origin,
+  and offers no index image. If the writer crashes first, the node is waiting on it
+  as a lease granter anyway, and its next life's gap rebuilds the index.
 - **A feed gap discards the gapped node's index.** The node missed writes it can no
   longer order its rows against, so it keeps nothing for a peer-image install to carry
   forward; the install or the origin rebuild repopulates it.
