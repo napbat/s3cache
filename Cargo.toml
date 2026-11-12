@@ -24,7 +24,7 @@ blake3 = "1.8.5"
 bytes = { version = "1", features = ["serde"] }
 futures = "0.3"
 getrandom = "0.4"
-groupnet = { git = "https://github.com/napbat/groupnet", rev = "fb97452387e396c9b77e91f15c654c69489e2378", features = ["consistency-leases", "consistency-volatile-recovery", "consistency-volatile-bootstrap-bulk", "dns", "tcp", "udp"] }
+groupnet = { git = "https://github.com/napbat/groupnet", rev = "30407c0bb057a7f12bf1520397f7398b38f97103", default-features = false, features = ["runtime", "consistency-leases", "consistency-volatile-recovery", "consistency-volatile-bootstrap-bulk", "dns", "tcp", "udp"] }
 http = "1"
 http-body-util = "0.1"
 # Already under hyper-util/s3s; direct so the metrics endpoint can build its own responses.
@@ -106,6 +106,8 @@ debug = "line-tables-only"
 opt-level = 2
 
 [dev-dependencies]
+# Managed in-process control links are test-only; production binds UDP.
+groupnet = { workspace = true, features = ["mem"] }
 # Real bincode 1 bytes: the fixtures that prove `codec::legacy` still reads what
 # earlier releases stored. Never a runtime dependency.
 bincode.workspace = true

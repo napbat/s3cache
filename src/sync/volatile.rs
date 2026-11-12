@@ -1,16 +1,18 @@
 //! Application facts and origin-index effects for Groupnet's volatile recovery.
 
 use std::collections::BTreeSet;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use groupnet::consistency::lease::CAP_LEASE;
 use groupnet::consistency::{
-    CAP_LEASE, FrontierView, WriteToken, checked_advertised_head,
+    FrontierView, WriteToken, checked_advertised_head,
     volatile_recovery::{
-        AdapterError, BoxRecoveryFuture, Mark, Peer, PeerObservation, PublicationPermit,
-        RecoveryAdapter, RecoveryConfig, RecoveryFallback, RecoveryHandle, RecoveryMode,
-        RecoveryOperation, RecoveryRearm, RecoveryStage,
+        AdapterError, AdapterErrorKind, Mark, Peer, PeerObservation, PublicationPermit,
+        RecoveryAdapter, RecoveryBuilder, RecoveryConfig, RecoveryFallback, RecoveryHandle,
+        RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryStage,
     },
 };
 use groupnet::core::{NodeId, Status};
@@ -125,9 +127,9 @@ impl WriteSync {
             .unwrap_or(2_000)
             .max(self.recovery_settle_floor_ms());
         let config = config.unwrap_or(RecoveryConfig {
-            max_members: 256,
-            max_member_bytes: 256,
-            max_barrier_rounds: 4,
+            max_members: const { NonZeroUsize::new(256).unwrap() },
+            max_member_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_barrier_rounds: const { NonZeroU32::new(4).unwrap() },
             // Neither bound has to fit a bucket's scan time. Every committed LIST page
             // reports progress, which restarts both, so a scan that keeps committing
             // pages runs to completion in one pass. `attempt_ms` is how long a scan may
@@ -160,26 +162,25 @@ struct PreparedRecovery {
 }
 
 impl PreparedRecovery {
-    fn open_origin(&self) -> RecoveryHandle<CacheRecoveryAdapter> {
-        if let Some(policy) = self.rearm {
-            RecoveryHandle::open_with_rearm(
-                Arc::clone(&self.adapter),
-                self.config,
-                self.mode,
-                self.adapter.me.clone(),
-                self.session,
-                policy,
-            )
-        } else {
-            RecoveryHandle::open(
-                Arc::clone(&self.adapter),
-                self.config,
-                self.mode,
-                self.adapter.me.clone(),
-                self.session,
-            )
+    /// The driver's builder with this node's configuration, mode, and rearm policy.
+    fn builder(&self) -> RecoveryBuilder<CacheRecoveryAdapter> {
+        let builder = RecoveryHandle::builder(
+            Arc::clone(&self.adapter),
+            self.adapter.me.clone(),
+            self.session,
+        )
+        .config(self.config)
+        .mode(self.mode);
+        match self.rearm {
+            Some(policy) => builder.rearm(policy),
+            None => builder,
         }
-        .expect("valid recovery configuration and Tokio runtime")
+    }
+
+    fn open_origin(&self) -> RecoveryHandle<CacheRecoveryAdapter> {
+        self.builder()
+            .open()
+            .expect("valid recovery configuration and Tokio runtime")
     }
 }
 
@@ -198,17 +199,20 @@ fn observe_group(
     lease: Duration,
     limits: RecoveryConfig,
 ) -> PeerObservation {
-    let bound = limits.max_members.checked_add(1).ok_or(AdapterError)?;
+    let bound = limits
+        .max_members
+        .checked_add(1)
+        .ok_or(AdapterErrorKind::Capacity)?;
     let roster = group
         .statuses_held_bounded(bound, limits.max_member_bytes)
-        .map_err(|_| AdapterError)?;
+        .map_err(|error| AdapterError::with_source(AdapterErrorKind::Capacity, error))?;
     let mut peers = Vec::with_capacity(roster.len().saturating_sub(1));
     for (node, status, held) in roster {
         if node == *me {
             continue;
         }
         let head = checked_advertised_head(group, &node)
-            .map_err(|_| AdapterError)?
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))?
             .map(|token| Mark {
                 epoch: token.epoch,
                 sequence: token.seq,
@@ -245,6 +249,11 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
         }
     }
 
+    fn operation_failed(&self, stage: RecoveryStage, error: AdapterError) {
+        let cause = std::error::Error::source(&error).map(ToString::to_string);
+        tracing::warn!(?stage, ?cause, "recovery operation failed: {error}");
+    }
+
     fn fell_back(&self, from: RecoveryStage, reason: RecoveryFallback) {
         self.metrics.recovery_fallback();
         tracing::info!(?from, ?reason, "recovery fell back");
@@ -255,93 +264,92 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
         _op: RecoveryOperation,
         distrust_bodies: bool,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        std::future::ready(
             permit
                 .publish(|| {
                     if distrust_bodies {
                         self.local.distrust_all();
                     }
                 })
-                .ok_or(AdapterError)
-        })
+                .ok_or_else(fenced),
+        )
     }
 
-    fn rebuild_origin(
+    async fn rebuild_origin(
         &self,
         _op: RecoveryOperation,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            self.metrics.recovery_origin_scan();
-            let buckets: BTreeSet<String> = {
-                let state = self.state.read().map_err(|_| AdapterError)?;
-                if state.len() > MAX_RECOVERY_BUCKETS
-                    || state.len().saturating_add(self.buckets.len()) > MAX_RECOVERY_BUCKETS
-                {
-                    return Err(AdapterError);
-                }
-                let mut buckets: BTreeSet<String> = self.buckets.iter().cloned().collect();
-                buckets.extend(state.keys().cloned());
-                buckets
-            };
-            let mut generations = Vec::with_capacity(buckets.len());
-            for bucket in buckets {
-                let generation = permit
-                    .publish(|| begin_bucket_resync(&self.state, &bucket))
-                    .ok_or(AdapterError)?;
-                generations.push((bucket, generation));
+    ) -> Result<(), AdapterError> {
+        self.metrics.recovery_origin_scan();
+        let buckets: BTreeSet<String> = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| AdapterError::new(AdapterErrorKind::Unavailable))?;
+            if state.len() > MAX_RECOVERY_BUCKETS
+                || state.len().saturating_add(self.buckets.len()) > MAX_RECOVERY_BUCKETS
+            {
+                return Err(AdapterErrorKind::Capacity.into());
             }
-            for (bucket, generation) in generations {
-                sync_bucket_generation_guarded(
-                    &self.client,
-                    &self.state,
-                    &bucket,
-                    generation,
-                    self.scan,
-                    permit.clone(),
-                )
-                .await
-                .map_err(|_| AdapterError)?;
-            }
-            Ok(())
-        })
+            let mut buckets: BTreeSet<String> = self.buckets.iter().cloned().collect();
+            buckets.extend(state.keys().cloned());
+            buckets
+        };
+        let mut generations = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let generation = permit
+                .publish(|| begin_bucket_resync(&self.state, &bucket))
+                .ok_or_else(fenced)?;
+            generations.push((bucket, generation));
+        }
+        for (bucket, generation) in generations {
+            sync_bucket_generation_guarded(
+                &self.client,
+                &self.state,
+                &bucket,
+                generation,
+                self.scan,
+                permit.clone(),
+            )
+            .await
+            .map_err(|error| AdapterError::with_source(AdapterErrorKind::Unavailable, error))?;
+        }
+        Ok(())
     }
 
     fn observe_peers(
         &self,
         _op: RecoveryOperation,
         limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, PeerObservation> {
-        Box::pin(async move {
-            let sync = self.sync.upgrade().ok_or(AdapterError)?;
-            observe_group(&self.group, &sync, &self.me, self.lease, limits)
+    ) -> impl Future<Output = PeerObservation> + Send {
+        std::future::ready(match self.sync.upgrade() {
+            Some(sync) => observe_group(&self.group, &sync, &self.me, self.lease, limits),
+            None => Err(closed()),
         })
     }
 
-    fn wait_frontiers(
+    async fn wait_frontiers(
         &self,
         _op: RecoveryOperation,
         heads: Vec<(NodeId, Mark)>,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            let frontier = self.frontier().ok_or(AdapterError)?;
-            for (node, head) in heads {
-                if !frontier
-                    .reached(
-                        &node,
-                        WriteToken {
-                            epoch: head.epoch,
-                            seq: head.sequence,
-                        },
-                    )
-                    .await
-                {
-                    return Err(AdapterError);
-                }
+    ) -> Result<(), AdapterError> {
+        let frontier = self.frontier().ok_or_else(closed)?;
+        for (node, head) in heads {
+            if !frontier
+                .reached(
+                    &node,
+                    WriteToken {
+                        epoch: head.epoch,
+                        seq: head.sequence,
+                    },
+                )
+                .await
+            {
+                return Err(AdapterErrorKind::Unavailable.into());
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     fn affirm(&self, _op: RecoveryOperation) -> bool {
@@ -351,12 +359,24 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
     }
 }
 
+/// The operation's publication permit is no longer current.
+fn fenced() -> AdapterError {
+    AdapterError::new(AdapterErrorKind::Fenced)
+}
+
+/// The write feed this adapter serves has shut down or never started its apply loop.
+fn closed() -> AdapterError {
+    AdapterError::new(AdapterErrorKind::Unavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use groupnet::consistency::LeaseConfig;
+    use groupnet::consistency::lease::LeaseConfig;
     use groupnet::core::Config;
+    use groupnet::network::RouterConfig;
     use groupnet::runtime::Node;
+    use groupnet::transport::link::{BoundLink, LinkConfig};
     use groupnet::transport::mem::Network;
 
     #[tokio::test]
@@ -365,18 +385,33 @@ mod tests {
         let a = NodeId::new("recovery-a");
         let b = NodeId::new("recovery-b");
         let config = Config {
-            gossip_interval_ms: 10,
-            anti_entropy_interval_ms: 25,
+            gossip_interval_ms: 25,
             ..Config::default()
         };
-        let node_a = Node::builder(a.clone(), net.endpoint(a.clone()))
-            .seed(b.clone())
+        let routing = RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        };
+        let node_a = Node::builder(a.clone())
+            .link(BoundLink::new(
+                net.endpoint(a.clone()),
+                LinkConfig::new(vec![b.clone()]),
+            ))
+            .routing(routing.clone())
             .config(config.clone())
-            .spawn();
-        let node_b = Node::builder(b.clone(), net.endpoint(b.clone()))
-            .seed(a.clone())
+            .start()
+            .await
+            .expect("A managed node starts");
+        let node_b = Node::builder(b.clone())
+            .link(BoundLink::new(
+                net.endpoint(b.clone()),
+                LinkConfig::new(vec![a.clone()]),
+            ))
+            .routing(routing)
             .config(config)
-            .spawn();
+            .start()
+            .await
+            .expect("B managed node starts");
         let group_a = node_a.join_group("s3cache");
         let group_b = node_b.join_group("s3cache");
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -394,20 +429,22 @@ mod tests {
             None,
         );
         let limits = RecoveryConfig {
-            max_members: 4,
-            max_member_bytes: 64,
-            max_barrier_rounds: 2,
+            max_members: NonZeroUsize::new(4).unwrap(),
+            max_member_bytes: NonZeroUsize::new(64).unwrap(),
+            max_barrier_rounds: NonZeroU32::new(2).unwrap(),
             total_ms: 2_000,
             attempt_ms: 500,
             settle_ms: 100,
             poll_ms: 25,
         };
         assert!(observe_group(&group_b, &sync, &b, Duration::from_millis(300), limits).is_ok());
+        // Groupnet keys the default write feed's entry as `~writes/d`.
+        let feed_entry = "~writes/d";
         group_a
-            .set_entry("~writes", vec![0xFF], None)
+            .set_entry(feed_entry, vec![0xFF], None)
             .expect("malformed entry enqueued");
         tokio::time::timeout(Duration::from_secs(3), async {
-            while group_b.node_entry(&a, "~writes").is_none() {
+            while group_b.node_entry(&a, feed_entry).is_none() {
                 tokio::task::yield_now().await;
             }
         })

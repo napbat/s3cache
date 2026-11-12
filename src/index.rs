@@ -29,6 +29,7 @@ use s3s::dto::{
 };
 
 pub(crate) mod fleet;
+pub(crate) mod pending;
 mod rows;
 mod scan;
 use rows::{GoneRows, KeyRows};
@@ -250,6 +251,7 @@ struct KeyIndexState {
     stats: IndexStats,
     capture: Option<fleet::IndexCapture>,
     native_cuts: BTreeMap<Vec<u8>, (u64, u64)>,
+    pending: pending::PendingWrites,
 }
 
 /// Read guard over the key map. The aggregate statistics share its lock but remain an

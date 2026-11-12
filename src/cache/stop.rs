@@ -140,7 +140,7 @@ impl CachingProxy {
                 let mut receipt = None;
                 for key in keys {
                     receipt = self
-                        .announce_unknown(bucket, key, "the mutation task terminated")
+                        .announce_unknown(bucket, key, "the mutation task terminated", None)
                         .await
                         .or(receipt);
                 }
@@ -196,6 +196,9 @@ impl CachingProxy {
             async { tokio::time::timeout(DRAIN_WAIT, drain).await.is_ok() },
             self.seal_writes(SEAL_WAIT),
         );
+        if let Some(sync) = &self.sync {
+            sync.close().await;
+        }
         if drained {
             info!("graceful shutdown complete");
         } else {

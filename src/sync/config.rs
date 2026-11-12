@@ -1,10 +1,11 @@
+use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use groupnet::consistency::LeaseConfig;
+use groupnet::consistency::lease::LeaseConfig;
 use groupnet::core::{Config, NodeId};
 use groupnet::runtime::{Group, NamedSeeds, Node, SeedEvent, SystemResolver};
-use groupnet::transport::Transport;
+use groupnet::transport::link::{BoundLink, LinkConfig, LinkProvider};
 use groupnet::transport::udp::UdpTransport;
 use tracing::{info, warn};
 
@@ -13,7 +14,7 @@ use crate::sync::readiness::UnmetSeeds;
 
 /// Attempts to resolve a gossip seed's DNS name before it is reported
 /// unresolvable — a `StatefulSet` peer's record can lag its own startup.
-const SEED_RESOLVE_ATTEMPTS: u32 = 30;
+const SEED_RESOLVE_ATTEMPTS: NonZeroU32 = NonZeroU32::new(30).unwrap();
 
 /// The wait between those first attempts.
 const SEED_RETRY: Duration = Duration::from_secs(1);
@@ -28,9 +29,9 @@ const SEED_REFRESH: Duration = Duration::from_secs(15);
 /// s3cache's startup window and refresh cadence.
 fn seed_resolution() -> NamedSeeds {
     NamedSeeds::new(SystemResolver)
-        .retry_interval(SEED_RETRY)
-        .startup_attempts(SEED_RESOLVE_ATTEMPTS)
-        .refresh_interval(SEED_REFRESH)
+        .with_retry_interval(SEED_RETRY)
+        .with_startup_attempts(SEED_RESOLVE_ATTEMPTS)
+        .with_refresh_interval(SEED_REFRESH)
 }
 
 /// Logs what the seed resolver did and releases readiness for a seed that
@@ -63,9 +64,9 @@ pub struct SyncConfig {
     /// The address peers should reach this node on; the bound address when
     /// `None` (`S3CACHE_GOSSIP_ADVERTISE`).
     pub advertise: Option<String>,
-    /// Statically-addressed peers as `(node id, host:port)`. Every other peer
-    /// resolves itself through gossiped advertisements, so only seeds need
-    /// static addressing (`S3CACHE_GOSSIP_SEEDS`).
+    /// Explicit routing neighbors as `(node id, host:port)`. DNS resolution and
+    /// gossiped advertisements refresh their addresses, but do not admit additional
+    /// neighbors (`S3CACHE_GOSSIP_SEEDS`).
     pub seeds: Vec<(String, String)>,
     /// This node's identity in the cluster (the pod name, in the chart).
     pub node_id: String,
@@ -127,12 +128,15 @@ impl WriteSync {
         let lease = lease_config(cfg.lease_ms);
         let advertise = cfg
             .advertise
-            .or_else(|| transport.local_addr().ok().map(|addr| addr.to_string()));
+            .unwrap_or_else(|| transport.local_addr().to_string());
+        // A link admits each neighbor once; a repeated seed id names the same peer.
         let seeds: Vec<NodeId> = cfg
             .seeds
             .iter()
             .filter(|(id, _)| *id != cfg.node_id) // a pod seeding itself (uniform config) is a no-op
             .map(|(id, _)| NodeId::new(id.as_str()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         // Seeds resolve off the startup path (DNS for a just-starting peer may
         // lag, and a slow resolver must not delay serving), inside groupnet:
@@ -141,64 +145,64 @@ impl WriteSync {
         // the first `Unresolved` comes a whole startup window later.
         let unmet = Arc::new(OnceLock::new());
         let observed = Arc::clone(&unmet);
-        let mut resolution = resolution.on_event(move |event| observe_seed(event, &observed));
+        let mut resolution = resolution.with_observer(move |event| observe_seed(event, &observed));
         for (id, addr) in &cfg.seeds {
-            resolution = resolution.seed(NodeId::new(id.as_str()), addr.as_str());
+            resolution = resolution.with_seed(NodeId::new(id.as_str()), addr.as_str());
         }
-        let mut builder = Node::builder(me.clone(), transport)
+        let node = Node::builder(me.clone())
+            .link(BoundLink::new(transport, LinkConfig::new(seeds.clone())))
             .config(gossip_config(cfg.lease_ms))
-            .named_seeds(resolution);
-        if let Some(advertise) = advertise {
-            builder = builder.advertise_addr(advertise);
-        }
-        let node = builder.spawn();
+            .named_seeds(resolution)
+            .advertise_addr(advertise);
+        let node = match node.start().await {
+            Ok(node) => node,
+            Err(error) => {
+                warn!("gossip disabled: cannot start managed network: {error}");
+                return None;
+            }
+        };
         let group = node.join_group("s3cache");
         let (bind, node_id, mode) = (&cfg.bind, &cfg.node_id, cfg.consistency.label());
         let lease_ms = cfg.lease_ms;
         info!(
             "gossip coherence bound on `{bind}` as `{node_id}` (consistency: {mode}, lease: {lease_ms}ms)"
         );
-        let sync = WriteSync::attach(group, me, cfg.consistency, lease, Some(Box::new(node)));
+        let sync = WriteSync::attach(group, me, cfg.consistency, lease, Some(node));
         let _ = unmet.set(sync.expect_seeds(seeds));
         Some(sync)
     }
 
-    /// Join the cluster group as `node_id` over an already-built groupnet
-    /// `transport`, seeded with `seeds`, with exactly the membership tuning and
-    /// coherence lease [`WriteSync::new`] runs. `new` is this over UDP plus seed
-    /// address resolution; any other transport (the in-memory one, for a whole
-    /// fleet in one process) resolves its own peers.
+    /// Join the cluster group as `node_id` over a managed protocol `link`, with
+    /// exactly the membership tuning and coherence lease [`WriteSync::new`] runs.
+    /// The link explicitly admits its routing neighbors; `seeds` additionally
+    /// records the peers readiness must await.
     ///
-    /// # Panics
-    /// Outside a Tokio runtime: the node spawns its tasks here.
-    pub fn over_transport<T: Transport>(
-        transport: T,
+    /// # Errors
+    /// Returns an error if the link cannot bind or the managed network cannot start.
+    pub async fn over_link(
+        link: impl LinkProvider,
         node_id: &str,
         seeds: &[&str],
         consistency: Consistency,
         lease_ms: u64,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let me = NodeId::new(node_id);
-        let mut builder = Node::builder(me.clone(), transport).config(gossip_config(lease_ms));
+        let mut builder = Node::builder(me.clone())
+            .link(link)
+            .config(gossip_config(lease_ms));
         for seed in seeds.iter().filter(|seed| **seed != node_id) {
             builder = builder.seed(NodeId::new(*seed));
         }
-        let node = builder.spawn();
+        let node = builder.start().await?;
         let group = node.join_group("s3cache");
-        let sync = WriteSync::attach(
-            group,
-            me,
-            consistency,
-            lease_config(lease_ms),
-            Some(Box::new(node)),
-        );
+        let sync = WriteSync::attach(group, me, consistency, lease_config(lease_ms), Some(node));
         sync.expect_seeds(
             seeds
                 .iter()
                 .filter(|seed| **seed != node_id)
                 .map(|seed| NodeId::new(*seed)),
         );
-        sync
+        Ok(sync)
     }
 
     /// The gossip group this node's feed, leases and membership ride on, for
@@ -279,4 +283,44 @@ pub(super) fn parse_seeds(raw: &str) -> Vec<(String, String)> {
             Some((id.to_owned(), addr.to_owned()))
         })
         .collect()
+}
+
+/// Why [`CachingProxy::with_recovery_config`](crate::cache::proxy::CachingProxy::with_recovery_config)
+/// refused a recovery configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryConfigRejected {
+    /// Groupnet's own bounds refused it.
+    Invalid(groupnet::core::volatile_recovery::RecoveryConfigError),
+    /// The settle window is shorter than two gossip rounds of this node, so a
+    /// renewal could still be in flight when the window closes.
+    SettleBelowGossip {
+        /// The configured settle window.
+        settle_ms: u64,
+        /// Two of this node's gossip rounds.
+        floor_ms: u64,
+    },
+}
+
+impl std::fmt::Display for RecoveryConfigRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) => error.fmt(f),
+            Self::SettleBelowGossip {
+                settle_ms,
+                floor_ms,
+            } => write!(
+                f,
+                "recovery settle_ms {settle_ms} is below two gossip rounds ({floor_ms} ms)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryConfigRejected {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(error) => Some(error),
+            Self::SettleBelowGossip { .. } => None,
+        }
+    }
 }

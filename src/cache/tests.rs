@@ -1,14 +1,20 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use groupnet::consistency::{LeaseConfig, WriteFeed, advertised_head};
+use groupnet::consistency::lease::LeaseConfig;
+use groupnet::consistency::{WriteFeed, advertised_head};
 use groupnet::core::{Config, NodeId};
+use groupnet::network::RouterConfig;
 use groupnet::runtime::Node;
-use groupnet::transport::mem::{MemTransport, Network};
+use groupnet::transport::link::{BoundLink, LinkConfig};
+use groupnet::transport::mem::Network;
 use http::HeaderMap;
-use s3s::dto::{ETag, GetObjectInput, GetObjectOutput, ListObjectsV2Input, Timestamp};
+use s3s::dto::{
+    ETag, GetObjectInput, GetObjectOutput, ListObjectsV2Input, PutObjectInput, Timestamp,
+};
 use s3s::{S3, S3ErrorCode, S3Request};
 
 use crate::cache::proxy::{CacheConfig, CachingProxy, FullSyncOwner, ObservedObject, ReadRoute};
@@ -25,12 +31,11 @@ use crate::tier::CachedObject;
 /// warm-up window is milliseconds rather than a second.
 fn brisk() -> Config {
     Config {
-        gossip_interval_ms: 10,
+        gossip_interval_ms: 25,
         probe_interval_ms: 20,
         probe_timeout_ms: 10,
         suspect_timeout_ms: 50,
         dead_timeout_ms: 300,
-        anti_entropy_interval_ms: 25,
         ..Config::default()
     }
 }
@@ -38,12 +43,18 @@ fn brisk() -> Config {
 /// One leased node, alone in its group. A solo reader's granter roster is empty, so
 /// its lease confirms vacuously — which is exactly why the shell's warm-up guard,
 /// not the confirmation, is what a booting node has to get past.
-fn solo(id: &str) -> (Node<MemTransport>, Arc<WriteSync>) {
+async fn solo(id: &str) -> (Node, Arc<WriteSync>) {
     let net = Network::new();
     let me = NodeId::new(id);
-    let node = Node::builder(me.clone(), net.endpoint(me.clone()))
+    let node = Node::builder(me.clone())
+        .link(BoundLink::new(
+            net.endpoint(me.clone()),
+            LinkConfig::new(Vec::new()),
+        ))
         .config(brisk())
-        .spawn();
+        .start()
+        .await
+        .expect("solo managed node starts");
     let group = node.join_group("s3cache");
     let sync = WriteSync::attach(
         group,
@@ -68,6 +79,11 @@ fn only_the_newest_single_node_warmup_may_retry() {
 /// A proxy over an origin it never dials. Every case below is decided from local
 /// state; a row that reached the endpoint would fail on the connection, not pass.
 fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
+    proxy_at("http://127.0.0.1:1", sync)
+}
+
+/// A proxy whose origin is `endpoint`.
+fn proxy_at(endpoint: &str, sync: Option<Arc<WriteSync>>) -> CachingProxy {
     let conf = aws_sdk_s3::config::Builder::new()
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
@@ -78,7 +94,7 @@ fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
             None,
             "s3cache-unit-tests",
         ))
-        .endpoint_url("http://127.0.0.1:1")
+        .endpoint_url(endpoint)
         .force_path_style(true)
         .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
         .build();
@@ -123,7 +139,7 @@ async fn revoke_before_local_return(
 
 #[tokio::test]
 async fn a_lease_revoked_after_local_body_lookup_forces_origin_get() {
-    let (_node, sync) = solo("return-fence-get");
+    let (_node, sync) = solo("return-fence-get").await;
     let proxy = proxy(Some(sync.clone()));
     let body = cached("v1", at(1_700_000_000));
     body.mark_trusted(proxy.obj_cache.suspect_gen());
@@ -158,7 +174,7 @@ async fn a_lease_revoked_after_local_body_lookup_forces_origin_get() {
 
 #[tokio::test]
 async fn a_lease_revoked_after_index_answer_forces_origin_list() {
-    let (_node, sync) = solo("return-fence-list");
+    let (_node, sync) = solo("return-fence-list").await;
     let proxy = proxy(Some(sync.clone()));
     index(&proxy, "k", Some("v1"), at(1_700_000_000));
     synced(&proxy);
@@ -294,7 +310,7 @@ fn counter(proxy: &CachingProxy, name: &str) -> u64 {
 /// body of that same version can pass revalidation after warm-up completes.
 #[tokio::test]
 async fn an_unknown_read_observation_keeps_the_origin_mtime() {
-    let (_node, sync) = solo("observed-origin-mtime");
+    let (_node, sync) = solo("observed-origin-mtime").await;
     let proxy = proxy(Some(sync));
     let modified = at(1_700_000_000);
     let observed = ObservedObject {
@@ -336,14 +352,32 @@ async fn a_freshness_timeout_routes_to_origin_and_is_counted() {
     let net = Network::new();
     let a_id = NodeId::new("barrier-a");
     let b_id = NodeId::new("barrier-b");
-    let a_node = Node::builder(a_id.clone(), net.endpoint(a_id.clone()))
-        .seed(b_id.clone())
+    let a_node = Node::builder(a_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(a_id.clone()),
+            LinkConfig::new(vec![b_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
-    let b_node = Node::builder(b_id.clone(), net.endpoint(b_id.clone()))
-        .seed(a_id.clone())
+        .start()
+        .await
+        .expect("A managed node starts");
+    let b_node = Node::builder(b_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(b_id.clone()),
+            LinkConfig::new(vec![a_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
+        .start()
+        .await
+        .expect("B managed node starts");
     let a_group = a_node.join_group("s3cache");
     let b_group = b_node.join_group("s3cache");
     let sync = Arc::new(WriteSync::attach(
@@ -375,7 +409,7 @@ async fn a_freshness_timeout_routes_to_origin_and_is_counted() {
         NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         |_value: &u8| vec![0],
     );
-    let token = feed.publish(&1).await;
+    let token = feed.publish(&1).await.expect("the feed is open");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if advertised_head(&b_group, &a_id) == Some(token) {
@@ -404,14 +438,32 @@ async fn a_stalled_write_is_a_503_not_a_success() {
     let net = Network::new();
     let a_id = NodeId::new("stall-a");
     let b_id = NodeId::new("stall-b");
-    let a_node = Node::builder(a_id.clone(), net.endpoint(a_id.clone()))
-        .seed(b_id.clone())
+    let a_node = Node::builder(a_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(a_id.clone()),
+            LinkConfig::new(vec![b_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
-    let b_node = Node::builder(b_id.clone(), net.endpoint(b_id.clone()))
-        .seed(a_id.clone())
+        .start()
+        .await
+        .expect("A managed node starts");
+    let b_node = Node::builder(b_id.clone())
+        .link(BoundLink::new(
+            net.endpoint(b_id.clone()),
+            LinkConfig::new(vec![a_id.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
         .config(brisk())
-        .spawn();
+        .start()
+        .await
+        .expect("B managed node starts");
     let lease = LeaseConfig::for_duration(Duration::from_millis(300));
     // A advertises the ack tier but runs no apply loop, so it never acknowledges.
     let _peer = WriteSync::attach(
@@ -447,16 +499,107 @@ async fn a_stalled_write_is_a_503_not_a_success() {
         meta: None,
     };
     let error = proxy
-        .record_put(crate::cache::proxy::IndexedWrite::Put, "bkt", "k", entry)
+        .record_put(
+            crate::cache::proxy::IndexedWrite::Put,
+            "bkt",
+            "k",
+            entry,
+            None,
+        )
         .await
         .expect_err("a stalled write must not be acknowledged");
     assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
     assert_eq!(counter(&proxy, "ack_timeouts"), 1);
 }
 
+async fn linked(net: &Network, id: &NodeId, peer: &NodeId) -> Node {
+    Node::builder(id.clone())
+        .link(BoundLink::new(
+            net.endpoint(id.clone()),
+            LinkConfig::new(vec![peer.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
+        .config(brisk())
+        .start()
+        .await
+        .expect("managed node starts")
+}
+
+/// The fence comes before the origin call. A write whose fence cannot complete is a 503
+/// that never reached the origin, which is also all a writer that dies before its fence
+/// completes can have done. The announcement is abandoned, not left open.
+#[tokio::test]
+async fn a_stalled_fence_is_a_503_that_never_reaches_the_origin() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the origin binds");
+    let endpoint = format!("http://{}", origin.local_addr().expect("origin address"));
+    let dialed = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&dialed);
+    tokio::spawn(async move {
+        while origin.accept().await.is_ok() {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let net = Network::new();
+    let (a_id, b_id) = (NodeId::new("fence-stall-a"), NodeId::new("fence-stall-b"));
+    let a_node = linked(&net, &a_id, &b_id).await;
+    let b_node = linked(&net, &b_id, &a_id).await;
+    let lease = LeaseConfig::for_duration(Duration::from_millis(300));
+    // A is in the ack tier without a lease and runs no apply loop: B's fence waits on
+    // it and never hears back.
+    let _peer = WriteSync::attach(
+        a_node.join_group("s3cache"),
+        a_id.clone(),
+        Consistency::StrongAcks,
+        lease,
+        None,
+    );
+    let b_group = b_node.join_group("s3cache");
+    let sync = Arc::new(WriteSync::attach(
+        b_group.clone(),
+        b_id,
+        Consistency::Strong,
+        lease,
+        None,
+    ));
+    let proxy = proxy_at(&endpoint, Some(sync));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !b_group.members().contains(&a_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the peers converge");
+
+    let error = proxy
+        .put_object(request(PutObjectInput {
+            bucket: "bkt".to_owned(),
+            key: "k".to_owned(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a stalled fence must not be acknowledged");
+    assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+    assert_eq!(
+        dialed.load(Ordering::SeqCst),
+        0,
+        "nothing reached the origin"
+    );
+    assert_eq!(counter(&proxy, "ack_timeouts"), 1);
+    assert_eq!(
+        counter(&proxy, "feed_published"),
+        2,
+        "the announcement and its abandonment"
+    );
+}
+
 #[tokio::test]
 async fn an_unlicensed_read_records_its_bypass_reason() {
-    let (_node, sync) = solo("unlicensed-read");
+    let (_node, sync) = solo("unlicensed-read").await;
     let proxy = proxy(Some(sync));
     assert!(matches!(
         proxy.read_barrier(&HeaderMap::new()).await,
@@ -492,7 +635,7 @@ async fn a_single_node_serves_a_suspect_copy_unproved() {
 /// atomic load, without the index being asked anything.
 #[tokio::test]
 async fn a_proved_copy_is_served_without_consulting_the_index() {
-    let (_node, sync) = solo("proved");
+    let (_node, sync) = solo("proved").await;
     let proxy = proxy(Some(sync));
     let obj = cached("v1", at(1_700_000_000));
     obj.mark_trusted(proxy.obj_cache.suspect_gen());
@@ -579,7 +722,7 @@ async fn peer_put_cannot_complete_new_index_metadata_from_an_older_get() {
 /// and not once per read. The second call must not touch the index again.
 #[tokio::test]
 async fn a_suspect_copy_the_index_confirms_is_proved_exactly_once() {
-    let (_node, sync) = solo("confirm");
+    let (_node, sync) = solo("confirm").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     proxy.obj_cache.insert(ck("k"), cached("v1", filled)).await;
@@ -602,7 +745,7 @@ async fn a_suspect_copy_the_index_confirms_is_proved_exactly_once() {
 /// drop it and let the origin serve the read.
 #[tokio::test]
 async fn a_suspect_copy_the_index_contradicts_is_dropped() {
-    let (_node, sync) = solo("contradict");
+    let (_node, sync) = solo("contradict").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     synced(&proxy);
@@ -649,7 +792,7 @@ async fn a_suspect_copy_the_index_contradicts_is_dropped() {
 /// entry is stamped microseconds after its body.
 #[tokio::test]
 async fn a_byte_identical_rewrite_is_caught_by_the_mtime_and_a_fresh_fill_is_not() {
-    let (_node, sync) = solo("rewrite");
+    let (_node, sync) = solo("rewrite").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     synced(&proxy);
@@ -694,7 +837,7 @@ async fn a_byte_identical_rewrite_is_caught_by_the_mtime_and_a_fresh_fill_is_not
 /// are actually read.
 #[tokio::test]
 async fn an_unsynced_bucket_arbitrates_nothing_and_drops_the_copy() {
-    let (_node, sync) = solo("unsynced");
+    let (_node, sync) = solo("unsynced").await;
     let proxy = proxy(Some(sync));
     let filled = at(1_700_000_000);
     proxy.obj_cache.insert(ck("k"), cached("v1", filled)).await;

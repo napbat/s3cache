@@ -71,7 +71,7 @@ FIRST_WRITE_MS = LEASE_MS + 2000
 FAST_MS = 500
 
 # How long the returning node gets to settle before anything is asserted about it: its
-# lease warm-up (one detection window plus two anti-entropy rounds) and its bootstrap LIST.
+# lease warm-up (one detection window plus two gossip rounds) and its bootstrap LIST.
 # Below that it is correct but origin-served, which is exactly what the polls tolerate.
 REJOIN_SETTLE_S = LEASE_MS / 1000.0 + 1.0
 

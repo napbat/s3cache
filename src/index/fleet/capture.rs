@@ -1,6 +1,7 @@
 //! Exact C publication under the live index lock in O(buckets); measuring and
 //! encoding the image run off-lock, from the snapshot taken at C.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,9 @@ use groupnet::consistency::volatile_recovery::bootstrap::admission::{
 use groupnet::consistency::volatile_recovery::bootstrap::ports::{
     DonorCapture, JournalIngress, LogicalClock,
 };
-use groupnet::core::volatile_bootstrap::journal::{DonorJournal, Invalidation, NativeCut};
+use groupnet::core::volatile_bootstrap::journal::{
+    CapturePlan, DonorJournal, ImageSize as JournalImageSize, Invalidation, NativeCut,
+};
 use groupnet::core::volatile_bootstrap::{BootstrapMemberIdentity, same_membership};
 use tokio::sync::Notify;
 
@@ -126,8 +129,12 @@ impl PendingFleetCapture {
             // The clock every local effect was journaled on, so finishing can never
             // land behind a write that arrived while the image was encoding.
             let now = capture.clock().now();
+            let actual = JournalImageSize {
+                encoded_bytes: NonZeroUsize::new(image.len()).ok_or(ImageError::Incomplete)?,
+                decoded_bytes: NonZeroUsize::new(private_size).ok_or(ImageError::Incomplete)?,
+            };
             self.ingress
-                .with_journal(|journal| journal.finish_capture(now, image.len(), private_size))
+                .with_journal(|journal| journal.finish_capture(now, actual))
                 .map_err(|_| ImageError::Incomplete)?;
         }
         let encoded = self.encoded.take().ok_or(ImageError::Corrupt)?;
@@ -193,20 +200,24 @@ impl KeyIndex {
         // complete sync, no uncertainty, and the ceilings before anything is
         // reserved; the rows themselves are measured off-lock at encode.
         let size = tallied_size(&live, universe, caps)?;
+        let image = JournalImageSize {
+            encoded_bytes: NonZeroUsize::new(size.encoded_bytes).ok_or(ImageError::Capacity)?,
+            decoded_bytes: NonZeroUsize::new(size.decoded_bytes).ok_or(ImageError::Capacity)?,
+        };
         let encoded = admission
-            .reserve(AdmissionClass::Encoded, size.encoded_bytes)
+            .reserve(AdmissionClass::Encoded, image.encoded_bytes)
             .map_err(|_| ImageError::Capacity)?;
         let decoded = admission
-            .reserve(AdmissionClass::Decoded, size.decoded_bytes)
+            .reserve(AdmissionClass::Decoded, image.decoded_bytes)
             .map_err(|_| ImageError::Capacity)?;
         let snapshot = snapshot_state(&live, universe)?;
         let mut cuts = Vec::new();
-        if live.native_cuts.len() > config.max_cuts {
+        if live.native_cuts.len() > config.max_cuts.get() {
             return Err(ImageError::Capacity);
         }
         cuts.try_reserve_exact(live.native_cuts.len())
             .map_err(|_| ImageError::Capacity)?;
-        if cuts.capacity() > config.max_cuts.saturating_mul(2).max(4) {
+        if cuts.capacity() > config.max_cuts.get().saturating_mul(2).max(4) {
             return Err(ImageError::Capacity);
         }
         let mut cut_bytes = 0usize;
@@ -214,14 +225,14 @@ impl KeyIndex {
             cut_bytes = cut_bytes
                 .checked_add(writer.len())
                 .ok_or(ImageError::Capacity)?;
-            if writer.is_empty() || cut_bytes > config.max_cut_bytes {
+            if writer.is_empty() || cut_bytes > config.max_cut_bytes.get() {
                 return Err(ImageError::Capacity);
             }
             let mut identity = Vec::new();
             identity
                 .try_reserve_exact(writer.len())
                 .map_err(|_| ImageError::Capacity)?;
-            if identity.capacity() > config.max_cut_bytes {
+            if identity.capacity() > config.max_cut_bytes.get() {
                 return Err(ImageError::Capacity);
             }
             identity.extend_from_slice(writer);
@@ -234,10 +245,11 @@ impl KeyIndex {
         journal
             .begin_capture(
                 clock.now(),
-                size.encoded_bytes,
-                size.decoded_bytes,
-                members,
-                cuts,
+                CapturePlan {
+                    image,
+                    members,
+                    cuts,
+                },
             )
             .map_err(|_| ImageError::Incomplete)?;
         let ingress =
@@ -249,7 +261,7 @@ impl KeyIndex {
             ingress.clone(),
             generation,
             clock,
-            config.max_event_bytes,
+            config.max_event_bytes.get(),
             caps.name_bytes,
         ));
         let lock_held = locked.elapsed();
@@ -324,24 +336,28 @@ mod tests {
 
     use super::*;
 
+    fn n(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
+
     fn config() -> JournalConfig {
         JournalConfig {
-            max_encoded_bytes: 2_048,
-            max_decoded_bytes: 8_192,
-            max_events: 4,
-            max_suffix_bytes: 1_024,
-            max_event_bytes: 128,
-            max_identity_bytes: 64,
-            max_followers: 1,
-            max_follower_id_bytes: 64,
-            max_cuts: 2,
-            max_cut_bytes: 128,
-            max_members: 2,
-            max_membership_bytes: 256,
-            max_scope_bytes: 128,
-            max_batch_events: 1,
-            max_batch_bytes: 128,
-            max_inflight_bytes: 256,
+            max_encoded_bytes: n(2_048),
+            max_decoded_bytes: n(8_192),
+            max_events: n(4),
+            max_suffix_bytes: n(1_024),
+            max_event_bytes: n(128),
+            max_identity_bytes: n(64),
+            max_followers: n(1),
+            max_follower_id_bytes: n(64),
+            max_cuts: n(2),
+            max_cut_bytes: n(128),
+            max_members: n(2),
+            max_membership_bytes: n(256),
+            max_scope_bytes: n(128),
+            max_batch_events: n(1),
+            max_batch_bytes: n(128),
+            max_inflight_bytes: n(256),
             max_total_ms: 100_000,
             max_follower_ms: 10_000,
         }
@@ -379,13 +395,13 @@ mod tests {
 
     fn admission() -> ByteAdmission {
         ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 1_000_000,
+            max_total_bytes: n(1_000_000),
             max_encoded_bytes: 16_384,
             max_decoded_bytes: 65_536,
             max_suffix_bytes: 900_000,
             max_native_overlap_bytes: 1,
             max_inflight_bytes: 1,
-            max_reservations: 16,
+            max_reservations: n(16),
         })
         .unwrap()
     }
@@ -471,7 +487,10 @@ mod tests {
             donor
                 .ingress()
                 .with_journal(|journal| journal.image_charge())
-                .map(|charge| (charge.encoded_bytes, charge.decoded_bytes)),
+                .map(|charge| (
+                    charge.image.encoded_bytes.get(),
+                    charge.image.decoded_bytes.get()
+                )),
             Some((size.encoded_bytes, size.decoded_bytes))
         );
     }
@@ -538,7 +557,7 @@ mod tests {
                 DonorJournal::storage_bound(config).unwrap(),
             )
             .unwrap();
-        let held = budget.reserve(AdmissionClass::Decoded, 65_536).unwrap();
+        let held = budget.reserve(AdmissionClass::Decoded, n(65_536)).unwrap();
         let before = budget.usage().0;
         let refused = index.begin_fleet_capture(
             journal,
@@ -874,18 +893,18 @@ mod tests {
             name_bytes: 64,
         };
         let config = JournalConfig {
-            max_encoded_bytes: caps.bytes,
-            max_decoded_bytes: caps.decoded_bytes,
+            max_encoded_bytes: n(caps.bytes),
+            max_decoded_bytes: n(caps.decoded_bytes),
             ..config()
         };
         let budget = ByteAdmission::new(AdmissionLimits {
-            max_total_bytes: 1 << 28,
+            max_total_bytes: n(1 << 28),
             max_encoded_bytes: caps.bytes,
             max_decoded_bytes: caps.decoded_bytes,
             max_suffix_bytes: 900_000,
             max_native_overlap_bytes: 1,
             max_inflight_bytes: 1,
-            max_reservations: 16,
+            max_reservations: n(16),
         })
         .unwrap();
         let suffix = budget

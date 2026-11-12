@@ -46,17 +46,21 @@ src/
     mod.rs      # cache link point: module docs and declarations only
     proxy.rs    # cache types and core tier/index helpers
     service.rs  # the S3 service implementation
-    mutation.rs # write-through paths: mutation tails, and unknown outcomes fenced and reconciled
+    mutation.rs # write-through paths: the strong pre-write fence, mutation tails, and unknown outcomes fenced and reconciled
     tests.rs    # cache unit tests
   index.rs      # in-memory LIST key index
+  index/pending.rs # peers' announced writes, fenced until settled
   tier.rs       # hot (moka heap) / warm (mmap disk) tiered object-body cache
   sync/
     mod.rs       # sync link point: module docs and declarations only
     coherence.rs # gossip write-feed and coherence core
-    config.rs    # gossip env/config parsing and node construction
+    coherence/apply.rs # the apply loop: peer writes into the index, acks, gaps and lapses
+    coherence/fence.rs # the writer's pre-write fence: announce, wait, settle or abandon
+    config.rs    # gossip env/config parsing and managed node construction
     volatile.rs  # S3 origin facts/effects for Groupnet's bounded recovery driver
     wire.rs      # write-event and session-token codec
     tests.rs     # coherence unit tests
+    tests/fixtures.rs # managed in-memory nodes and wired pairs for those tests
   metrics.rs    # counters, warm-residency gauges, and periodic stats logging
 tests/it/       # one integration-test binary; each module is a suite (links the library crate)
 deploy/helm/s3cache/   # Helm chart
@@ -163,6 +167,11 @@ documentation-only edit does not require an image build.
 | `S3CACHE_STATS_SECS` | `60` | Stats log interval |
 | `S3CACHE_METRICS_LISTEN` | empty (disabled) | Bind address for the Prometheus text endpoint (`GET /metrics`) |
 
+Gossip uses one managed network: `S3CACHE_GOSSIP_SEEDS` explicitly admits UDP routing
+neighbors on both endpoints; DNS and advertisements refresh addresses only. The chart
+lists every ordinal. Startup awaits link binding, and planned shutdown closes the
+links and resolver after mutation drain and feed seal.
+
 `GET /ready` on the metrics listener is the pod readiness probe
 (`CachingProxy::probe_ready`): ready once this node's index is complete, or while
 no live (`Alive`/`Suspect`) peer declares the `s3cache:indexed` gossip capability or
@@ -199,8 +208,12 @@ completion of the initial index and coherence warm-up.
 
 The default `strong` mode is **lease-backed**: a node may answer a LIST, a GET, or an
 authoritative 404 from its own state only while it holds an unexpired *serve-lease* its
-peers granted (groupnet's `consistency::lease`, tier T3), and a write ends when every
-lease-holder has either applied the invalidation (one ack round) or had its lease lapse
+peers granted (groupnet's `consistency::lease`, tier T3). A write is **fenced** before
+its origin call: it publishes `IndexOp::Pending` and waits until every lease-holder has
+applied it or lapsed (`WriteSync::fence`), and each peer answers the key from the origin
+until the outcome event settles it (`index::pending`); a writer's next life hands
+anything it left open to the origin reconciliation. A write ends when every
+lease-holder has either applied the outcome (one ack round) or had its lease lapse
 in the writer's engine (bounded by `D`, on the straggler's own clock). That replaces the
 old view-stability heuristic (`Stability`/`settled()`), which survives only for
 `strong-acks` — deprecated, removed next release. `strong-acks` pins the **mechanism**

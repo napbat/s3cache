@@ -260,9 +260,10 @@ counters! {
     body_revalidation_etag_mismatch => body_revalidation_etag_mismatch,
     /// Record a suspect body whose indexed modification time is newer.
     body_revalidation_timestamp_mismatch => body_revalidation_timestamp_mismatch,
-    /// Record a write advertised to peers over the gossip write feed.
+    /// Record an event advertised to peers over the gossip write feed (a `strong`
+    /// write advertises its fence and its outcome).
     feed_published => feed_published,
-    /// Record a peer's write applied from the feed (index + invalidation).
+    /// Record a peer's feed event applied (index + invalidation).
     feed_applied => feed_applied,
     /// Record a feed gap (missed writes): every local body distrusted, index resynced.
     feed_gaps => feed_gap,

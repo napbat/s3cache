@@ -17,14 +17,15 @@ use s3cache::cache::proxy::CachingProxy;
 use s3cache::metrics::Metrics;
 use s3s::S3;
 use s3s::dto::GetObjectInput;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 const CAP: usize = 1024 * 1024;
 
 fn short_recovery() -> RecoveryConfig {
     RecoveryConfig {
-        max_members: 16,
-        max_member_bytes: 128,
-        max_barrier_rounds: 4,
+        max_members: NonZeroUsize::new(16).unwrap(),
+        max_member_bytes: NonZeroUsize::new(128).unwrap(),
+        max_barrier_rounds: NonZeroU32::new(4).unwrap(),
         total_ms: 5_000,
         attempt_ms: 250,
         settle_ms: 2_000,

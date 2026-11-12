@@ -252,13 +252,22 @@ pub async fn mem_pod_node(
     let (name, peer) = (name.to_owned(), peer.to_owned());
     pod.handle()
         .spawn(async move {
-            let sync = Arc::new(WriteSync::over_transport(
-                net.endpoint(groupnet::core::NodeId::new(name.as_str())),
-                &name,
-                &[peer.as_str()],
-                Consistency::Strong,
-                DEFAULT_LEASE_MS,
-            ));
+            let sync = Arc::new(
+                WriteSync::over_link(
+                    groupnet::transport::link::BoundLink::new(
+                        net.endpoint(groupnet::core::NodeId::new(name.as_str())),
+                        groupnet::transport::link::LinkConfig::new(vec![
+                            groupnet::core::NodeId::new(peer.as_str()),
+                        ]),
+                    ),
+                    &name,
+                    &[peer.as_str()],
+                    Consistency::Strong,
+                    DEFAULT_LEASE_MS,
+                )
+                .await
+                .expect("managed memory link starts"),
+            );
             let proxy = proxy_over_with_metrics(
                 &origin.counted_client(),
                 CAP,
