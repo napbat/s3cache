@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -11,7 +12,9 @@ use groupnet::runtime::Node;
 use groupnet::transport::link::{BoundLink, LinkConfig};
 use groupnet::transport::mem::Network;
 use http::HeaderMap;
-use s3s::dto::{ETag, GetObjectInput, GetObjectOutput, ListObjectsV2Input, Timestamp};
+use s3s::dto::{
+    ETag, GetObjectInput, GetObjectOutput, ListObjectsV2Input, PutObjectInput, Timestamp,
+};
 use s3s::{S3, S3ErrorCode, S3Request};
 
 use crate::cache::proxy::{CacheConfig, CachingProxy, FullSyncOwner, ObservedObject, ReadRoute};
@@ -76,6 +79,11 @@ fn only_the_newest_single_node_warmup_may_retry() {
 /// A proxy over an origin it never dials. Every case below is decided from local
 /// state; a row that reached the endpoint would fail on the connection, not pass.
 fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
+    proxy_at("http://127.0.0.1:1", sync)
+}
+
+/// A proxy whose origin is `endpoint`.
+fn proxy_at(endpoint: &str, sync: Option<Arc<WriteSync>>) -> CachingProxy {
     let conf = aws_sdk_s3::config::Builder::new()
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new("us-east-1"))
@@ -86,7 +94,7 @@ fn proxy(sync: Option<Arc<WriteSync>>) -> CachingProxy {
             None,
             "s3cache-unit-tests",
         ))
-        .endpoint_url("http://127.0.0.1:1")
+        .endpoint_url(endpoint)
         .force_path_style(true)
         .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1))
         .build();
@@ -491,11 +499,102 @@ async fn a_stalled_write_is_a_503_not_a_success() {
         meta: None,
     };
     let error = proxy
-        .record_put(crate::cache::proxy::IndexedWrite::Put, "bkt", "k", entry, None)
+        .record_put(
+            crate::cache::proxy::IndexedWrite::Put,
+            "bkt",
+            "k",
+            entry,
+            None,
+        )
         .await
         .expect_err("a stalled write must not be acknowledged");
     assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
     assert_eq!(counter(&proxy, "ack_timeouts"), 1);
+}
+
+async fn linked(net: &Network, id: &NodeId, peer: &NodeId) -> Node {
+    Node::builder(id.clone())
+        .link(BoundLink::new(
+            net.endpoint(id.clone()),
+            LinkConfig::new(vec![peer.clone()]),
+        ))
+        .routing(RouterConfig {
+            announce_interval: Duration::from_millis(10),
+            ..RouterConfig::default()
+        })
+        .config(brisk())
+        .start()
+        .await
+        .expect("managed node starts")
+}
+
+/// The fence comes before the origin call. A write whose fence cannot complete is a 503
+/// that never reached the origin, which is also all a writer that dies before its fence
+/// completes can have done. The announcement is abandoned, not left open.
+#[tokio::test]
+async fn a_stalled_fence_is_a_503_that_never_reaches_the_origin() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the origin binds");
+    let endpoint = format!("http://{}", origin.local_addr().expect("origin address"));
+    let dialed = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&dialed);
+    tokio::spawn(async move {
+        while origin.accept().await.is_ok() {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let net = Network::new();
+    let (a_id, b_id) = (NodeId::new("fence-stall-a"), NodeId::new("fence-stall-b"));
+    let a_node = linked(&net, &a_id, &b_id).await;
+    let b_node = linked(&net, &b_id, &a_id).await;
+    let lease = LeaseConfig::for_duration(Duration::from_millis(300));
+    // A is in the ack tier without a lease and runs no apply loop: B's fence waits on
+    // it and never hears back.
+    let _peer = WriteSync::attach(
+        a_node.join_group("s3cache"),
+        a_id.clone(),
+        Consistency::StrongAcks,
+        lease,
+        None,
+    );
+    let b_group = b_node.join_group("s3cache");
+    let sync = Arc::new(WriteSync::attach(
+        b_group.clone(),
+        b_id,
+        Consistency::Strong,
+        lease,
+        None,
+    ));
+    let proxy = proxy_at(&endpoint, Some(sync));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !b_group.members().contains(&a_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the peers converge");
+
+    let error = proxy
+        .put_object(request(PutObjectInput {
+            bucket: "bkt".to_owned(),
+            key: "k".to_owned(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a stalled fence must not be acknowledged");
+    assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+    assert_eq!(
+        dialed.load(Ordering::SeqCst),
+        0,
+        "nothing reached the origin"
+    );
+    assert_eq!(counter(&proxy, "ack_timeouts"), 1);
+    assert_eq!(
+        counter(&proxy, "feed_published"),
+        2,
+        "the announcement and its abandonment"
+    );
 }
 
 #[tokio::test]

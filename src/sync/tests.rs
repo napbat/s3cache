@@ -11,7 +11,10 @@ use groupnet::runtime::{NamedSeeds, ResolveFuture, SeedResolver, SystemResolver}
 use groupnet::transport::mem::Network;
 use s3s::dto::GetObjectOutput;
 
-use crate::index::{KeyIndex, ObjEntry, standard_class};
+use crate::index::{
+    AuthoritativeKeyState, KeyIndex, ObjEntry, resolve_uncertain_key, standard_class,
+    uncertain_key_is_current,
+};
 use crate::metrics::Metrics;
 use crate::sync::coherence::{
     CAP_BOUNDED, Consistency, DEFAULT_LEASE_MS, KeyReconcile, WriteReceipt, WriteSync, WriteWait,
@@ -644,8 +647,7 @@ async fn an_undescribed_peer_write_fences_the_key_before_it_is_acknowledged() {
     let ckey = ("bkt".to_owned(), "ptr".to_owned());
     cache.insert(ckey.clone(), cached(b"old")).await;
 
-    let (_, publishing) =
-        sync_a.index_unknown(&KeyIndex::default(), "bkt", "ptr", None, &metrics);
+    let (_, publishing) = sync_a.index_unknown(&KeyIndex::default(), "bkt", "ptr", None, &metrics);
     let unknown = publishing.await;
     assert!(
         sync_b
@@ -675,6 +677,194 @@ async fn an_undescribed_peer_write_fences_the_key_before_it_is_acknowledged() {
     );
     assert!(state.read().unwrap()["bkt"].uncertain_keys.is_empty());
     assert_eq!(indexed_size(&state, "bkt", "ptr"), Some(5));
+}
+
+fn fenced(state: &Index, key: &str) -> bool {
+    state.read().unwrap().key_fenced("bkt", key)
+}
+
+/// Until `writer` waits on `reader`'s serve-lease and not on its acks alone, a fence
+/// could resolve without the reader in it.
+async fn adopted(writer: &WriteSync, reader: &NodeId) {
+    eventually(
+        || {
+            writer.lease_holders() == std::slice::from_ref(reader)
+                && !waits_on_unleased(&writer.group, reader)
+        },
+        "the writer to adopt the reader's serve-lease and its lease advertisement",
+    )
+    .await;
+}
+
+/// The pre-write fence: once it returns, the peer answers the key from the origin, and
+/// the event reporting that write's outcome is what lifts it, for that write alone.
+#[tokio::test]
+async fn a_fenced_write_holds_the_peer_off_the_key_until_its_outcome_arrives() {
+    let net = Network::new();
+    let (sync_a, sync_b, state, _cache) =
+        wired_pair_named(&net, ("fence-a", "fence-b"), Consistency::Strong).await;
+    adopted(&sync_a, &NodeId::new("fence-b")).await;
+    let metrics = Metrics::default();
+    let own = KeyIndex::default();
+    let first = own_put(&sync_a, "k", written(4), &metrics).await;
+    assert!(
+        sync_b
+            .reached_token(&first.header, Duration::from_secs(5))
+            .await
+    );
+
+    let keys = ["k".to_owned(), "refused".to_owned()];
+    let mut pending = sync_a
+        .fence(&own, "bkt", &keys, Duration::from_secs(5), &metrics)
+        .await
+        .expect("the peer acknowledges the fence");
+    assert!(
+        fenced(&state, "k") && fenced(&state, "refused"),
+        "the peer holds the fence before the origin is called"
+    );
+    let refused = pending.pop().flatten().expect("strong announces each key");
+    let k = pending.pop().flatten().expect("strong announces each key");
+
+    let (_, publishing) = sync_a.index_put(&own, "bkt", "k", written(5), Some(&k), &metrics);
+    let outcome = publishing.await;
+    assert!(
+        sync_b
+            .reached_token(&outcome.header, Duration::from_secs(5))
+            .await
+    );
+    assert!(!fenced(&state, "k"));
+    assert_eq!(indexed_size(&state, "bkt", "k"), Some(5));
+    assert!(
+        fenced(&state, "refused"),
+        "an outcome lifts only the write it settles"
+    );
+
+    sync_a
+        .index_abandoned(&own, "bkt", "refused", refused, &metrics)
+        .await;
+    eventually(
+        || !fenced(&state, "refused"),
+        "the abandonment lifts the fence",
+    )
+    .await;
+    assert_eq!(indexed_size(&state, "bkt", "refused"), None);
+}
+
+/// A writer that dies after its fence, before its origin call or after it, cannot say
+/// what the origin holds. Its peer keeps the keys origin-only, and the writer's next
+/// life hands them to the origin reconciliation. A write it never fenced never reached
+/// the origin, so it leaves nothing to reconcile.
+#[tokio::test]
+async fn a_writer_that_dies_after_its_fence_leaves_the_keys_to_the_origin() {
+    let net = Network::new();
+    let (a_id, a_node, a_group) = spawn_node(&net, "died-a", "died-b").await;
+    let (b_id, _b_node, b_group) = spawn_node(&net, "died-b", "died-a").await;
+    let metrics = Arc::new(Metrics::default());
+    let cache = TieredCache::new(1024 * 1024, None, metrics.clone());
+    let state = Arc::new(KeyIndex::default());
+    let reconciling = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sync_b = Arc::new(attach(b_group, b_id.clone(), Consistency::Strong));
+    let handed = Arc::clone(&reconciling);
+    sync_b.start_apply(
+        cache.local(),
+        state.clone(),
+        metrics.clone(),
+        Arc::new(move |bucket: &str, key: &str, token: u64| {
+            handed
+                .lock()
+                .unwrap()
+                .push((bucket.to_owned(), key.to_owned(), token));
+        }),
+    );
+    let sync_a = attach(a_group, a_id, Consistency::Strong);
+    adopted(&sync_a, &b_id).await;
+
+    // `unsent` dies before its origin call; `applied` after the origin applied it.
+    let keys = ["unsent".to_owned(), "applied".to_owned()];
+    let pending = sync_a
+        .fence(
+            &KeyIndex::default(),
+            "bkt",
+            &keys,
+            Duration::from_secs(5),
+            &metrics,
+        )
+        .await
+        .expect("the peer acknowledges the fence");
+    // The crash: no outcome and no seal.
+    drop(pending);
+    drop(sync_a);
+    a_node.close().await;
+    drop(a_node);
+    assert!(fenced(&state, "unsent") && fenced(&state, "applied"));
+    assert!(reconciling.lock().unwrap().is_empty());
+
+    // The pod returns under the same id as a new life, and writes another key.
+    let (a_id, _a_node, a_group) = spawn_node(&net, "died-a", "died-b").await;
+    let sync_a = attach(a_group, a_id, Consistency::Strong);
+    own_put(&sync_a, "other", written(1), &metrics).await;
+    eventually(
+        || reconciling.lock().unwrap().len() == 2,
+        "the new life hands both keys to the origin reconciliation",
+    )
+    .await;
+    let handed: Vec<(String, String, u64)> = reconciling.lock().unwrap().clone();
+    assert!(
+        handed.iter().all(|(_, key, _)| key != "other"),
+        "an unfenced write leaves nothing to reconcile"
+    );
+    assert!(fenced(&state, "unsent") && fenced(&state, "applied"));
+    // What the origin answers resolves each: the old object, and the applied one.
+    for (bucket, key, token) in handed {
+        assert!(uncertain_key_is_current(&state, &bucket, &key, token));
+        let size = if key == "applied" { 5 } else { 4 };
+        assert!(resolve_uncertain_key(
+            &state,
+            &bucket,
+            &key,
+            token,
+            AuthoritativeKeyState::Present(written(size)),
+        ));
+    }
+    assert!(!fenced(&state, "unsent") && !fenced(&state, "applied"));
+    assert_eq!(indexed_size(&state, "bkt", "applied"), Some(5));
+    assert_eq!(indexed_size(&state, "bkt", "unsent"), Some(4));
+}
+
+/// A peer cut off from the writer cannot hold the fence up: its serve-lease lapses on
+/// the writer's clock, and the fence completes with the guarantee intact.
+#[tokio::test]
+async fn a_partitioned_peer_lapses_and_the_fence_completes() {
+    let net = Network::new();
+    let (a_id, _a_node, a_group) = spawn_node(&net, "cut-a", "cut-b").await;
+    let (b_id, b_node, b_group) = spawn_node(&net, "cut-b", "cut-a").await;
+    let sync_a = attach(a_group, a_id, Consistency::Strong);
+    let _sync_b = attach(b_group, b_id.clone(), Consistency::Strong);
+    adopted(&sync_a, &b_id).await;
+    let metrics = Metrics::default();
+
+    // The cut: B's process runs on, but nothing reaches it or leaves it.
+    b_node.close().await;
+    let started = Instant::now();
+    let pending = sync_a
+        .fence(
+            &KeyIndex::default(),
+            "bkt",
+            &["k".to_owned()],
+            Duration::from_millis(200),
+            &metrics,
+        )
+        .await
+        .expect("a lapse carries the guarantee");
+    assert!(pending[0].is_some());
+    let waited = started.elapsed();
+    assert!(
+        waited < TEST_LEASE * 3,
+        "the fence ends at the lapse, not at its own deadline ({waited:?})"
+    );
+    let text = metrics.prometheus_text();
+    assert!(text.contains("\ns3cache_write_lease_lapses 1\n"));
+    assert!(text.contains("\ns3cache_ack_timeouts 0\n"));
 }
 
 /// The strict-LIST barrier: after a publish, `await_fresh` on the peer
