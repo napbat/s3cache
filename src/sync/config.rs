@@ -1,7 +1,8 @@
+use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use groupnet::consistency::LeaseConfig;
+use groupnet::consistency::lease::LeaseConfig;
 use groupnet::core::{Config, NodeId};
 use groupnet::runtime::{Group, NamedSeeds, Node, SeedEvent, SystemResolver};
 use groupnet::transport::link::{BoundLink, LinkConfig, LinkProvider};
@@ -13,7 +14,7 @@ use crate::sync::readiness::UnmetSeeds;
 
 /// Attempts to resolve a gossip seed's DNS name before it is reported
 /// unresolvable — a `StatefulSet` peer's record can lag its own startup.
-const SEED_RESOLVE_ATTEMPTS: u32 = 30;
+const SEED_RESOLVE_ATTEMPTS: NonZeroU32 = NonZeroU32::new(30).unwrap();
 
 /// The wait between those first attempts.
 const SEED_RETRY: Duration = Duration::from_secs(1);
@@ -28,9 +29,9 @@ const SEED_REFRESH: Duration = Duration::from_secs(15);
 /// s3cache's startup window and refresh cadence.
 fn seed_resolution() -> NamedSeeds {
     NamedSeeds::new(SystemResolver)
-        .retry_interval(SEED_RETRY)
-        .startup_attempts(SEED_RESOLVE_ATTEMPTS)
-        .refresh_interval(SEED_REFRESH)
+        .with_retry_interval(SEED_RETRY)
+        .with_startup_attempts(SEED_RESOLVE_ATTEMPTS)
+        .with_refresh_interval(SEED_REFRESH)
 }
 
 /// Logs what the seed resolver did and releases readiness for a seed that
@@ -127,12 +128,15 @@ impl WriteSync {
         let lease = lease_config(cfg.lease_ms);
         let advertise = cfg
             .advertise
-            .or_else(|| transport.local_addr().ok().map(|addr| addr.to_string()));
+            .unwrap_or_else(|| transport.local_addr().to_string());
+        // A link admits each neighbor once; a repeated seed id names the same peer.
         let seeds: Vec<NodeId> = cfg
             .seeds
             .iter()
             .filter(|(id, _)| *id != cfg.node_id) // a pod seeding itself (uniform config) is a no-op
             .map(|(id, _)| NodeId::new(id.as_str()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         // Seeds resolve off the startup path (DNS for a just-starting peer may
         // lag, and a slow resolver must not delay serving), inside groupnet:
@@ -141,18 +145,16 @@ impl WriteSync {
         // the first `Unresolved` comes a whole startup window later.
         let unmet = Arc::new(OnceLock::new());
         let observed = Arc::clone(&unmet);
-        let mut resolution = resolution.on_event(move |event| observe_seed(event, &observed));
+        let mut resolution = resolution.with_observer(move |event| observe_seed(event, &observed));
         for (id, addr) in &cfg.seeds {
-            resolution = resolution.seed(NodeId::new(id.as_str()), addr.as_str());
+            resolution = resolution.with_seed(NodeId::new(id.as_str()), addr.as_str());
         }
-        let mut builder = Node::builder(me.clone())
+        let node = Node::builder(me.clone())
             .link(BoundLink::new(transport, LinkConfig::new(seeds.clone())))
             .config(gossip_config(cfg.lease_ms))
-            .named_seeds(resolution);
-        if let Some(advertise) = advertise {
-            builder = builder.advertise_addr(advertise);
-        }
-        let node = match builder.start().await {
+            .named_seeds(resolution)
+            .advertise_addr(advertise);
+        let node = match node.start().await {
             Ok(node) => node,
             Err(error) => {
                 warn!("gossip disabled: cannot start managed network: {error}");

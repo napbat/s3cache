@@ -1,16 +1,18 @@
 //! Application facts and origin-index effects for Groupnet's volatile recovery.
 
 use std::collections::BTreeSet;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use groupnet::consistency::lease::CAP_LEASE;
 use groupnet::consistency::{
-    CAP_LEASE, FrontierView, WriteToken, checked_advertised_head,
+    FrontierView, WriteToken, checked_advertised_head,
     volatile_recovery::{
-        AdapterError, BoxRecoveryFuture, Mark, Peer, PeerObservation, PublicationPermit,
-        RecoveryAdapter, RecoveryConfig, RecoveryFallback, RecoveryHandle, RecoveryMode,
-        RecoveryOperation, RecoveryRearm, RecoveryStage,
+        AdapterError, AdapterErrorKind, Mark, Peer, PeerObservation, PublicationPermit,
+        RecoveryAdapter, RecoveryBuilder, RecoveryConfig, RecoveryFallback, RecoveryHandle,
+        RecoveryMode, RecoveryOperation, RecoveryRearm, RecoveryStage,
     },
 };
 use groupnet::core::{NodeId, Status};
@@ -125,9 +127,9 @@ impl WriteSync {
             .unwrap_or(2_000)
             .max(self.recovery_settle_floor_ms());
         let config = config.unwrap_or(RecoveryConfig {
-            max_members: 256,
-            max_member_bytes: 256,
-            max_barrier_rounds: 4,
+            max_members: const { NonZeroUsize::new(256).unwrap() },
+            max_member_bytes: const { NonZeroUsize::new(256).unwrap() },
+            max_barrier_rounds: const { NonZeroU32::new(4).unwrap() },
             // Neither bound has to fit a bucket's scan time. Every committed LIST page
             // reports progress, which restarts both, so a scan that keeps committing
             // pages runs to completion in one pass. `attempt_ms` is how long a scan may
@@ -160,26 +162,25 @@ struct PreparedRecovery {
 }
 
 impl PreparedRecovery {
-    fn open_origin(&self) -> RecoveryHandle<CacheRecoveryAdapter> {
-        if let Some(policy) = self.rearm {
-            RecoveryHandle::open_with_rearm(
-                Arc::clone(&self.adapter),
-                self.config,
-                self.mode,
-                self.adapter.me.clone(),
-                self.session,
-                policy,
-            )
-        } else {
-            RecoveryHandle::open(
-                Arc::clone(&self.adapter),
-                self.config,
-                self.mode,
-                self.adapter.me.clone(),
-                self.session,
-            )
+    /// The driver's builder with this node's configuration, mode, and rearm policy.
+    fn builder(&self) -> RecoveryBuilder<CacheRecoveryAdapter> {
+        let builder = RecoveryHandle::builder(
+            Arc::clone(&self.adapter),
+            self.adapter.me.clone(),
+            self.session,
+        )
+        .config(self.config)
+        .mode(self.mode);
+        match self.rearm {
+            Some(policy) => builder.rearm(policy),
+            None => builder,
         }
-        .expect("valid recovery configuration and Tokio runtime")
+    }
+
+    fn open_origin(&self) -> RecoveryHandle<CacheRecoveryAdapter> {
+        self.builder()
+            .open()
+            .expect("valid recovery configuration and Tokio runtime")
     }
 }
 
@@ -198,17 +199,20 @@ fn observe_group(
     lease: Duration,
     limits: RecoveryConfig,
 ) -> PeerObservation {
-    let bound = limits.max_members.checked_add(1).ok_or(AdapterError)?;
+    let bound = limits
+        .max_members
+        .checked_add(1)
+        .ok_or(AdapterErrorKind::Capacity)?;
     let roster = group
         .statuses_held_bounded(bound, limits.max_member_bytes)
-        .map_err(|_| AdapterError)?;
+        .map_err(|error| AdapterError::with_source(AdapterErrorKind::Capacity, error))?;
     let mut peers = Vec::with_capacity(roster.len().saturating_sub(1));
     for (node, status, held) in roster {
         if node == *me {
             continue;
         }
         let head = checked_advertised_head(group, &node)
-            .map_err(|_| AdapterError)?
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))?
             .map(|token| Mark {
                 epoch: token.epoch,
                 sequence: token.seq,
@@ -245,103 +249,99 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
         }
     }
 
+    fn operation_failed(&self, stage: RecoveryStage, error: AdapterError) {
+        let cause = std::error::Error::source(&error).map(ToString::to_string);
+        tracing::warn!(?stage, ?cause, "recovery operation failed: {error}");
+    }
+
     fn fell_back(&self, from: RecoveryStage, reason: RecoveryFallback) {
         self.metrics.recovery_fallback();
         tracing::info!(?from, ?reason, "recovery fell back");
     }
 
-    fn invalidate(
+    async fn invalidate(
         &self,
         _op: RecoveryOperation,
         distrust_bodies: bool,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            permit
-                .publish(|| {
-                    if distrust_bodies {
-                        self.local.distrust_all();
-                    }
-                })
-                .ok_or(AdapterError)
-        })
+    ) -> Result<(), AdapterError> {
+        permit
+            .publish(|| {
+                if distrust_bodies {
+                    self.local.distrust_all();
+                }
+            })
+            .ok_or_else(fenced)
     }
 
-    fn rebuild_origin(
+    async fn rebuild_origin(
         &self,
         _op: RecoveryOperation,
         permit: PublicationPermit,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            self.metrics.recovery_origin_scan();
-            let buckets: BTreeSet<String> = {
-                let state = self.state.read().map_err(|_| AdapterError)?;
-                if state.len() > MAX_RECOVERY_BUCKETS
-                    || state.len().saturating_add(self.buckets.len()) > MAX_RECOVERY_BUCKETS
-                {
-                    return Err(AdapterError);
-                }
-                let mut buckets: BTreeSet<String> = self.buckets.iter().cloned().collect();
-                buckets.extend(state.keys().cloned());
-                buckets
-            };
-            let mut generations = Vec::with_capacity(buckets.len());
-            for bucket in buckets {
-                let generation = permit
-                    .publish(|| begin_bucket_resync(&self.state, &bucket))
-                    .ok_or(AdapterError)?;
-                generations.push((bucket, generation));
+    ) -> Result<(), AdapterError> {
+        self.metrics.recovery_origin_scan();
+        let buckets: BTreeSet<String> = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| AdapterError::new(AdapterErrorKind::Unavailable))?;
+            if state.len() > MAX_RECOVERY_BUCKETS
+                || state.len().saturating_add(self.buckets.len()) > MAX_RECOVERY_BUCKETS
+            {
+                return Err(AdapterErrorKind::Capacity.into());
             }
-            for (bucket, generation) in generations {
-                sync_bucket_generation_guarded(
-                    &self.client,
-                    &self.state,
-                    &bucket,
-                    generation,
-                    self.scan,
-                    permit.clone(),
-                )
-                .await
-                .map_err(|_| AdapterError)?;
-            }
-            Ok(())
-        })
+            let mut buckets: BTreeSet<String> = self.buckets.iter().cloned().collect();
+            buckets.extend(state.keys().cloned());
+            buckets
+        };
+        let mut generations = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let generation = permit
+                .publish(|| begin_bucket_resync(&self.state, &bucket))
+                .ok_or_else(fenced)?;
+            generations.push((bucket, generation));
+        }
+        for (bucket, generation) in generations {
+            sync_bucket_generation_guarded(
+                &self.client,
+                &self.state,
+                &bucket,
+                generation,
+                self.scan,
+                permit.clone(),
+            )
+            .await
+            .map_err(|error| AdapterError::with_source(AdapterErrorKind::Unavailable, error))?;
+        }
+        Ok(())
     }
 
-    fn observe_peers(
-        &self,
-        _op: RecoveryOperation,
-        limits: RecoveryConfig,
-    ) -> BoxRecoveryFuture<'_, PeerObservation> {
-        Box::pin(async move {
-            let sync = self.sync.upgrade().ok_or(AdapterError)?;
-            observe_group(&self.group, &sync, &self.me, self.lease, limits)
-        })
+    async fn observe_peers(&self, _op: RecoveryOperation, limits: RecoveryConfig) -> PeerObservation {
+        let sync = self.sync.upgrade().ok_or_else(closed)?;
+        observe_group(&self.group, &sync, &self.me, self.lease, limits)
     }
 
-    fn wait_frontiers(
+    async fn wait_frontiers(
         &self,
         _op: RecoveryOperation,
         heads: Vec<(NodeId, Mark)>,
-    ) -> BoxRecoveryFuture<'_, Result<(), AdapterError>> {
-        Box::pin(async move {
-            let frontier = self.frontier().ok_or(AdapterError)?;
-            for (node, head) in heads {
-                if !frontier
-                    .reached(
-                        &node,
-                        WriteToken {
-                            epoch: head.epoch,
-                            seq: head.sequence,
-                        },
-                    )
-                    .await
-                {
-                    return Err(AdapterError);
-                }
+    ) -> Result<(), AdapterError> {
+        let frontier = self.frontier().ok_or_else(closed)?;
+        for (node, head) in heads {
+            if !frontier
+                .reached(
+                    &node,
+                    WriteToken {
+                        epoch: head.epoch,
+                        seq: head.sequence,
+                    },
+                )
+                .await
+            {
+                return Err(AdapterErrorKind::Unavailable.into());
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     fn affirm(&self, _op: RecoveryOperation) -> bool {
@@ -349,6 +349,16 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
             .upgrade()
             .is_some_and(|sync| sync.affirm_lease_now())
     }
+}
+
+/// The operation's publication permit is no longer current.
+fn fenced() -> AdapterError {
+    AdapterError::new(AdapterErrorKind::Fenced)
+}
+
+/// The write feed this adapter serves has shut down or never started its apply loop.
+fn closed() -> AdapterError {
+    AdapterError::new(AdapterErrorKind::Unavailable)
 }
 
 #[cfg(test)]

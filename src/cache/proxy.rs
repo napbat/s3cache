@@ -414,6 +414,45 @@ impl IndexedWrite {
     }
 }
 
+/// Why [`CachingProxy::with_recovery_config`] refused a recovery configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryConfigRejected {
+    /// Groupnet's own bounds refused it.
+    Invalid(groupnet::core::volatile_recovery::RecoveryConfigError),
+    /// The settle window is shorter than two gossip rounds of this node, so a
+    /// renewal could still be in flight when the window closes.
+    SettleBelowGossip {
+        /// The configured settle window.
+        settle_ms: u64,
+        /// Two of this node's gossip rounds.
+        floor_ms: u64,
+    },
+}
+
+impl std::fmt::Display for RecoveryConfigRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) => error.fmt(f),
+            Self::SettleBelowGossip {
+                settle_ms,
+                floor_ms,
+            } => write!(
+                f,
+                "recovery settle_ms {settle_ms} is below two gossip rounds ({floor_ms} ms)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryConfigRejected {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(error) => Some(error),
+            Self::SettleBelowGossip { .. } => None,
+        }
+    }
+}
+
 /// S3 service that caches LIST (from an in-memory index) and small GET/HEAD bodies (the
 /// hot/warm/cold [`TieredCache`]) in front of an upstream `s3s_aws::Proxy`, forwarding
 /// every write.
@@ -505,22 +544,26 @@ impl CachingProxy {
     }
 
     /// Set finite recovery budgets and roster caps for gossip mode.
-    /// The settle window must still cover two local anti-entropy periods.
+    /// The settle window must still cover two local gossip rounds.
     ///
     /// # Errors
-    /// Returns an invalid-configuration error for zero/overflowing bounds or
-    /// an undersized gossip settle window.
+    /// Returns the rule a zero or overflowing bound breaks, or an undersized gossip
+    /// settle window.
     pub fn with_recovery_config(
         mut self,
         config: groupnet::consistency::volatile_recovery::RecoveryConfig,
-    ) -> Result<Self, groupnet::consistency::volatile_recovery::RecoveryError> {
-        config.validate()?;
-        if self
+    ) -> Result<Self, RecoveryConfigRejected> {
+        config.validate().map_err(RecoveryConfigRejected::Invalid)?;
+        if let Some(floor_ms) = self
             .sync
             .as_ref()
-            .is_some_and(|sync| config.settle_ms < sync.recovery_settle_floor_ms())
+            .map(|sync| sync.recovery_settle_floor_ms())
+            .filter(|floor_ms| config.settle_ms < *floor_ms)
         {
-            return Err(groupnet::consistency::volatile_recovery::RecoveryError::InvalidConfig);
+            return Err(RecoveryConfigRejected::SettleBelowGossip {
+                settle_ms: config.settle_ms,
+                floor_ms,
+            });
         }
         self.recovery_config = Some(config);
         Ok(self)
@@ -534,8 +577,9 @@ impl CachingProxy {
     pub fn with_recovery_rearm(
         mut self,
         policy: groupnet::consistency::volatile_recovery::RecoveryRearm,
-    ) -> Result<Self, groupnet::consistency::volatile_recovery::RecoveryError> {
-        self.recovery_rearm = Some(policy.validate()?);
+    ) -> Result<Self, groupnet::core::volatile_recovery::RecoveryRearmError> {
+        policy.validate()?;
+        self.recovery_rearm = Some(policy);
         Ok(self)
     }
 
