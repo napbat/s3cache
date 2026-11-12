@@ -259,19 +259,21 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
         tracing::info!(?from, ?reason, "recovery fell back");
     }
 
-    async fn invalidate(
+    fn invalidate(
         &self,
         _op: RecoveryOperation,
         distrust_bodies: bool,
         permit: PublicationPermit,
-    ) -> Result<(), AdapterError> {
-        permit
-            .publish(|| {
-                if distrust_bodies {
-                    self.local.distrust_all();
-                }
-            })
-            .ok_or_else(fenced)
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        std::future::ready(
+            permit
+                .publish(|| {
+                    if distrust_bodies {
+                        self.local.distrust_all();
+                    }
+                })
+                .ok_or_else(fenced),
+        )
     }
 
     async fn rebuild_origin(
@@ -316,9 +318,15 @@ impl RecoveryAdapter for CacheRecoveryAdapter {
         Ok(())
     }
 
-    async fn observe_peers(&self, _op: RecoveryOperation, limits: RecoveryConfig) -> PeerObservation {
-        let sync = self.sync.upgrade().ok_or_else(closed)?;
-        observe_group(&self.group, &sync, &self.me, self.lease, limits)
+    fn observe_peers(
+        &self,
+        _op: RecoveryOperation,
+        limits: RecoveryConfig,
+    ) -> impl Future<Output = PeerObservation> + Send {
+        std::future::ready(match self.sync.upgrade() {
+            Some(sync) => observe_group(&self.group, &sync, &self.me, self.lease, limits),
+            None => Err(closed()),
+        })
     }
 
     async fn wait_frontiers(
@@ -364,7 +372,7 @@ fn closed() -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use groupnet::consistency::LeaseConfig;
+    use groupnet::consistency::lease::LeaseConfig;
     use groupnet::core::Config;
     use groupnet::network::RouterConfig;
     use groupnet::runtime::Node;
@@ -377,8 +385,7 @@ mod tests {
         let a = NodeId::new("recovery-a");
         let b = NodeId::new("recovery-b");
         let config = Config {
-            gossip_interval_ms: 10,
-            anti_entropy_interval_ms: 25,
+            gossip_interval_ms: 25,
             ..Config::default()
         };
         let routing = RouterConfig {
@@ -422,9 +429,9 @@ mod tests {
             None,
         );
         let limits = RecoveryConfig {
-            max_members: 4,
-            max_member_bytes: 64,
-            max_barrier_rounds: 2,
+            max_members: NonZeroUsize::new(4).unwrap(),
+            max_member_bytes: NonZeroUsize::new(64).unwrap(),
+            max_barrier_rounds: NonZeroU32::new(2).unwrap(),
             total_ms: 2_000,
             attempt_ms: 500,
             settle_ms: 100,

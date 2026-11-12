@@ -160,7 +160,9 @@ impl BootstrapStatePort for FleetStatePort {
         if max_bytes > CHUNK_BYTES {
             return Err(invalid());
         }
-        let start = sequence.checked_mul(CHUNK_BYTES.get()).ok_or_else(invalid)?;
+        let start = sequence
+            .checked_mul(CHUNK_BYTES.get())
+            .ok_or_else(invalid)?;
         let end = start
             .checked_add(CHUNK_BYTES.get())
             .ok_or_else(invalid)?
@@ -195,43 +197,56 @@ impl BootstrapStatePort for FleetStatePort {
         self.execute_follower(effect, resources, context).await
     }
 
-    async fn store_chunk(
+    fn store_chunk(
         &self,
         sequence: usize,
         chunk: &Admitted<Vec<u8>>,
         resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> Result<usize, AdapterError> {
-        let stage = resources.stage.as_mut().ok_or_else(fenced)?;
-        stage
-            .stage_mut()
-            .store_chunk(sequence, chunk.get())
-            .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))?;
-        Ok(stage.reserved_bytes().1)
+    ) -> impl Future<Output = Result<usize, AdapterError>> + Send {
+        std::future::ready(
+            resources
+                .stage
+                .as_mut()
+                .ok_or_else(fenced)
+                .and_then(|stage| {
+                    stage
+                        .stage_mut()
+                        .store_chunk(sequence, chunk.get())
+                        .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))?;
+                    Ok(stage.reserved_bytes().1)
+                }),
+        )
     }
 
-    async fn stage_batch(
+    fn stage_batch(
         &self,
         batch: &Admitted<JournalBatch>,
         resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> Result<(), AdapterError> {
-        resources
-            .stage
-            .as_mut()
-            .ok_or_else(fenced)?
-            .stage_mut()
-            .stage_batch(batch.get())
-            .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        std::future::ready(
+            resources
+                .stage
+                .as_mut()
+                .ok_or_else(fenced)
+                .and_then(|stage| {
+                    stage
+                        .stage_mut()
+                        .stage_batch(batch.get())
+                        .map_err(|_| AdapterError::new(AdapterErrorKind::Malformed))
+                }),
+        )
     }
 
-    async fn detach(
+    fn detach(
         &self,
         token: AttachToken,
         resources: &mut TransferResources<Self::Stage, AttachToken, Self::NativeBuffer>,
-    ) -> Result<(), AdapterError> {
-        if resources.attachment.as_ref() != Some(&token) {
-            return Err(fenced());
-        }
-        resources.attachment.take();
-        Ok(())
+    ) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        std::future::ready(if resources.attachment.as_ref() == Some(&token) {
+            resources.attachment.take();
+            Ok(())
+        } else {
+            Err(fenced())
+        })
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use groupnet::consistency::QueueCapacity;
 use groupnet::consistency::volatile_recovery::RecoveryHandle;
 use groupnet::consistency::volatile_recovery::bootstrap::admission::{
     AdmissionLimits, ByteAdmission,
@@ -25,7 +26,6 @@ use groupnet::consistency::volatile_recovery::bootstrap::report::{
 use groupnet::consistency::volatile_recovery::bootstrap::session::{
     BootstrapRuntimeConfig, BootstrapSession,
 };
-use groupnet::consistency::QueueCapacity;
 use groupnet::core::NodeId;
 use groupnet::core::volatile_bootstrap::transfer::TransferConfig;
 use groupnet::core::volatile_bootstrap::{BootstrapConfig, BootstrapScope, PresenceIdentity};

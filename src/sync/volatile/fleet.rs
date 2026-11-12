@@ -17,7 +17,9 @@ use groupnet::core::volatile_bootstrap::{
 
 use crate::index::fleet::FleetDonorImage;
 
-use super::{AdapterError, AdapterErrorKind, CacheRecoveryAdapter, RecoveryAdapter, closed, fenced};
+use super::{
+    AdapterError, AdapterErrorKind, CacheRecoveryAdapter, RecoveryAdapter, closed, fenced,
+};
 
 mod capture;
 mod donor;

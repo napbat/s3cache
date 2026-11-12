@@ -4,10 +4,10 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use groupnet::consistency::volatile_recovery::{RecoveryError, RecoveryHandle, RecoveryStatus};
 use groupnet::consistency::lease::{
     CAP_LEASE, CoherenceOutcome, LeaseConfig, LeaseView, Leases, RenewalId,
 };
+use groupnet::consistency::volatile_recovery::{RecoveryError, RecoveryHandle, RecoveryStatus};
 use groupnet::consistency::{
     AckWait, CAP_ACKS, PublishError, WriteFeed, WriteToken, advertised_head, applied_by_selected,
 };
@@ -528,10 +528,7 @@ impl WriteSync {
     }
 
     pub(crate) fn recovery_settle_floor_ms(&self) -> u64 {
-        self.group
-            .config()
-            .gossip_interval_ms
-            .saturating_mul(2)
+        self.group.config().gossip_interval_ms.saturating_mul(2)
     }
 
     pub(super) fn frontier_view(&self) -> Option<groupnet::consistency::FrontierView> {
