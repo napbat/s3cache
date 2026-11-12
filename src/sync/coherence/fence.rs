@@ -161,8 +161,7 @@ impl WriteSync {
             settles: None,
             floor: None,
         };
-        let publishing =
-            state.note_own_native(|| self.publish_own(event, Some(&write), false));
+        let publishing = state.note_own_native(|| self.publish_own(event, Some(&write), false));
         drop(write);
         self.advertised(publishing, metrics).await;
     }

@@ -128,10 +128,7 @@ impl WriteSync {
                         // the floor of its next event settles them.
                         reconcile_all(
                             &reconcile,
-                            state.end_pending_life(
-                                peer.as_str().as_bytes(),
-                                missed_through.epoch,
-                            ),
+                            state.end_pending_life(peer.as_str().as_bytes(), missed_through.epoch),
                         );
                         // The public signal fences serving before returning; the
                         // recovery worker distrusts bodies and guards every origin

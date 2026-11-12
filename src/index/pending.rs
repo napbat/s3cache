@@ -213,10 +213,7 @@ impl KeyIndex {
     /// End every pending write of `writer`'s lives before `epoch`: its feed moved
     /// past them (a new life, or a seal). Returns those keys, now uncertain.
     pub(crate) fn end_pending_life(&self, writer: &[u8], epoch: u64) -> Vec<UncertainKey> {
-        self.inner
-            .write()
-            .unwrap()
-            .end_pending_life(writer, epoch)
+        self.inner.write().unwrap().end_pending_life(writer, epoch)
     }
 
     /// Note this node's own feed event that changes no index row — its pending and
