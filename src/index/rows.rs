@@ -36,6 +36,11 @@ impl KeyRows {
         self.map.contains_key(key)
     }
 
+    /// The greatest key held.
+    pub(crate) fn last_key(&self) -> Option<&str> {
+        self.map.get_max().map(|(key, _)| key.as_str())
+    }
+
     pub(crate) fn iter(&self) -> Iter<'_, String, ObjEntry, DefaultSharedPtr> {
         self.map.iter()
     }
@@ -134,6 +139,11 @@ impl GoneRows {
 
     pub(crate) fn get(&self, key: &str) -> Option<&SystemTime> {
         self.map.get(key)
+    }
+
+    /// The greatest key held.
+    pub(crate) fn last_key(&self) -> Option<&str> {
+        self.map.get_max().map(|(key, _)| key.as_str())
     }
 
     pub(crate) fn iter(&self) -> Iter<'_, String, SystemTime, DefaultSharedPtr> {
