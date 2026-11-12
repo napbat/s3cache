@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::index::pending::PendingWrites;
 use crate::index::{BucketState, IndexStats, KeyIndexState};
 
 use super::{
@@ -12,8 +13,8 @@ use super::{
 };
 
 /// One universe bucket, named in strictly ascending order, completely synced
-/// and free of uncertainty: the bucket-level refusals shared by the size at C
-/// and the measurement off-lock.
+/// and free of uncertainty and pending peer writes: the bucket-level refusals
+/// shared by the size at C and the measurement off-lock.
 fn image_bucket<'a>(
     index: &'a KeyIndexState,
     name: &'a str,
@@ -26,7 +27,11 @@ fn image_bucket<'a>(
     }
     *previous = Some(name);
     let bucket = index.buckets.get(name).ok_or(ImageError::Incomplete)?;
-    if !bucket.synced || !bucket.uncertain_keys.is_empty() || bucket.rebuild_generation.is_some() {
+    if !bucket.synced
+        || !bucket.uncertain_keys.is_empty()
+        || index.pending.fenced_under(name, "")
+        || bucket.rebuild_generation.is_some()
+    {
         return Err(ImageError::Incomplete);
     }
     Ok(bucket)
@@ -124,6 +129,7 @@ pub(crate) fn snapshot_state(
         stats: total,
         capture: None,
         native_cuts: BTreeMap::new(),
+        pending: PendingWrites::default(),
     })
 }
 

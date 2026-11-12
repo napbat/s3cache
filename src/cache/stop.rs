@@ -140,7 +140,7 @@ impl CachingProxy {
                 let mut receipt = None;
                 for key in keys {
                     receipt = self
-                        .announce_unknown(bucket, key, "the mutation task terminated")
+                        .announce_unknown(bucket, key, "the mutation task terminated", None)
                         .await
                         .or(receipt);
                 }

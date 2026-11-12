@@ -15,11 +15,12 @@ pub(super) fn parse_token(value: &str) -> Option<(&str, u64, u64)> {
 
 /// Prefix identifying the current event envelope: a postcard `IndexEvent`. Bytes
 /// without it are not this protocol and are rejected rather than interpreted as
-/// another shape. Peers upgrade together, so the retired bincode envelope (`0xFF`)
-/// is not read: mixed-version fleets are unsupported, as for every peer protocol.
-pub(super) const WIRE_MAGIC: u8 = 0xFE;
+/// another shape. Peers upgrade together, so the retired envelopes — bincode (`0xFF`)
+/// and the postcard event before the pre-write fence (`0xFE`) — are not read:
+/// mixed-version fleets are unsupported, as for every peer protocol.
+pub(super) const WIRE_MAGIC: u8 = 0xFD;
 
-/// What one durable write did, as advertised to peers.
+/// What one write did, or is about to do, as advertised to peers.
 #[derive(Serialize, Deserialize)]
 pub(crate) enum IndexOp {
     /// The key now holds an object.
@@ -41,6 +42,13 @@ pub(crate) enum IndexOp {
     },
     /// The key was deleted.
     Del,
+    /// A `strong` write of the key is about to reach the origin. Until the writer
+    /// settles it, a reader answers the key from the origin: a writer that crashes
+    /// after the origin applied the write cannot tell anyone what it did.
+    Pending,
+    /// The origin refused the pending write, or it was never sent: the key is as
+    /// it was. It only settles the pending write it names.
+    Abandoned,
 }
 
 impl IndexOp {
@@ -75,15 +83,21 @@ impl IndexOp {
     }
 }
 
-/// One durable write: the operation, its `(bucket, key)`, and the writer's wall-clock
-/// timestamp — the cross-writer LWW tiebreak, in **microseconds** so it is not coarser
-/// than the clock a local write is stamped with (see [`wire_stamp`]).
+/// One write-feed event: the operation, its `(bucket, key)`, and the writer's
+/// wall-clock timestamp — the cross-writer LWW tiebreak, in **microseconds** so it is
+/// not coarser than the clock a local write is stamped with (see [`wire_stamp`]).
 #[derive(Serialize, Deserialize)]
 pub(crate) struct IndexEvent {
     pub(crate) op: IndexOp,
     pub(crate) bucket: String,
     pub(crate) key: String,
     pub(crate) ts_us: u64,
+    /// The feed sequence of the [`IndexOp::Pending`] this event settles.
+    pub(crate) settles: Option<u64>,
+    /// The writer's oldest pending write still open when this event was published;
+    /// `None` when none was. A reader settles every older one it holds, which also
+    /// covers a settling event it lost to a gap.
+    pub(crate) floor: Option<u64>,
 }
 
 pub(crate) fn to_micros(ts: SystemTime) -> u64 {

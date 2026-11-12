@@ -3,11 +3,14 @@
 //!
 //! Each mutation's origin call and coherence tail run on a task of their own
 //! ([`CachingProxy::mutation_tail`]), so a client that hangs up cannot strand an applied
-//! write outside the index. A success indexes and advertises what was written and holds
-//! the response until the cluster has applied it. A failure that does not prove the
-//! origin refused the write leaves the key's state unknown: it is fenced on every node
-//! and reconciled from the origin ([`CachingProxy::publish_unknown`]) before the error
-//! is answered, so no node answers that key from local state in the meantime.
+//! write outside the index. In `strong`, the write is first announced to every peer
+//! ([`WriteSync::fence`](crate::sync::coherence::WriteSync::fence)), so a writer that
+//! dies after the origin applied it leaves no peer answering the key from local state.
+//! A success indexes and advertises what was written and holds the response until the
+//! cluster has applied it. A failure that does not prove the origin refused the write
+//! leaves the key's state unknown: it is fenced on every node and reconciled from the
+//! origin ([`CachingProxy::publish_unknown`]) before the error is answered. A refusal
+//! abandons the announcement.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -22,9 +25,11 @@ use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
 use crate::cache::copy;
 use crate::cache::proxy::{
-    CachingProxy, IndexedWrite, observed_entry, write_storage_class, written_object,
+    CachingProxy, IndexedWrite, WRITE_ACK_TIMEOUT, observed_entry, write_storage_class,
+    written_object,
 };
 use crate::index::{ObjEntry, ObjMeta};
+use crate::sync::coherence::PendingWrite;
 use crate::tier::CachedObject;
 
 /// Why a failed mutation cannot be assumed not to have reached durable origin state. A
@@ -59,6 +64,58 @@ fn copy_conflict_needs_reconcile(error: &S3Error, create_only: bool) -> bool {
 }
 
 impl CachingProxy {
+    /// Announce a write of `keys` to every peer before it reaches the origin. A stalled
+    /// announcement is a 503, and nothing reached the origin.
+    async fn fence_writes(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> S3Result<Vec<Option<PendingWrite>>> {
+        let Some(sync) = self.sync.as_ref() else {
+            return Ok(keys.iter().map(|_| None).collect());
+        };
+        sync.fence(&self.state, bucket, keys, WRITE_ACK_TIMEOUT, &self.metrics)
+            .await
+            .map_err(|_| {
+                s3s::s3_error!(
+                    ServiceUnavailable,
+                    "a cache peer could not be told about the write in time; it was not \
+                     sent to the origin, retry it"
+                )
+            })
+    }
+
+    async fn fence_write(&self, bucket: &str, key: &str) -> S3Result<Option<PendingWrite>> {
+        let mut pending = self.fence_writes(bucket, &[key.to_owned()]).await?;
+        Ok(pending.pop().flatten())
+    }
+
+    /// Settle a write the origin answered with an error: fenced and reconciled when the
+    /// error does not prove the origin refused it (`uncertain`), abandoned when it does.
+    async fn settle_failed(
+        &self,
+        bucket: &str,
+        key: &str,
+        uncertain: Option<&str>,
+        pending: Option<PendingWrite>,
+    ) {
+        match uncertain {
+            Some(reason) => {
+                self.publish_unknown(bucket, key, reason, pending.as_ref())
+                    .await;
+            }
+            None => self.abandon(bucket, key, pending).await,
+        }
+    }
+
+    /// Settle a pending write that left the key as it was.
+    async fn abandon(&self, bucket: &str, key: &str, pending: Option<PendingWrite>) {
+        if let (Some(sync), Some(pending)) = (self.sync.as_ref(), pending) {
+            sync.index_abandoned(&self.state, bucket, key, pending, &self.metrics)
+                .await;
+        }
+    }
+
     /// Forward a `PutObject`, then update the index from the result — and, when the write
     /// knows exactly what a read of it will report, keep the body it just wrote rather
     /// than dropping it (see [`buffered_put_body`](CachingProxy::buffered_put_body)).
@@ -122,12 +179,14 @@ impl CachingProxy {
         let worker = self.clone();
         let (tail_bucket, tail_key) = (bucket.clone(), key.clone());
         self.mutation_tail(&tail_bucket, &[tail_key], async move {
+            let pending = worker.fence_write(&bucket, &key).await?;
             let mut resp = match worker.inner.put_object(req).await {
                 Ok(resp) => resp,
                 Err(error) => {
-                    if let Some(reason) = uncertain_mutation_error(&error, locally_vouched) {
-                        worker.publish_unknown(&bucket, &key, reason).await;
-                    }
+                    let uncertain = uncertain_mutation_error(&error, locally_vouched);
+                    worker
+                        .settle_failed(&bucket, &key, uncertain, pending)
+                        .await;
                     return Err(error);
                 }
             };
@@ -149,7 +208,7 @@ impl CachingProxy {
                 worker.metrics.write_fill();
             }
             let token = worker
-                .record_put(IndexedWrite::Put, &bucket, &key, entry)
+                .record_put(IndexedWrite::Put, &bucket, &key, entry, pending.as_ref())
                 .await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)
@@ -168,12 +227,14 @@ impl CachingProxy {
         let worker = self.clone();
         let (tail_bucket, tail_key) = (bucket.clone(), key.clone());
         self.mutation_tail(&tail_bucket, &[tail_key], async move {
+            let pending = worker.fence_write(&bucket, &key).await?;
             let mut resp = match worker.inner.delete_object(req).await {
                 Ok(resp) => resp,
                 Err(error) => {
-                    if let Some(reason) = uncertain_mutation_error(&error, false) {
-                        worker.publish_unknown(&bucket, &key, reason).await;
-                    }
+                    let uncertain = uncertain_mutation_error(&error, false);
+                    worker
+                        .settle_failed(&bucket, &key, uncertain, pending)
+                        .await;
                     return Err(error);
                 }
             };
@@ -187,10 +248,10 @@ impl CachingProxy {
             // from the origin until an origin HEAD says.
             let receipt = if versioned {
                 worker
-                    .announce_unknown(&bucket, &key, "a version-scoped delete")
+                    .announce_unknown(&bucket, &key, "a version-scoped delete", pending.as_ref())
                     .await
             } else {
-                worker.record_del(&bucket, &key).await
+                worker.record_del(&bucket, &key, pending.as_ref()).await
             };
             let token = worker.await_cluster(receipt, &bucket, &key).await?;
             Self::attach_token(&mut resp.headers, token);
@@ -216,21 +277,27 @@ impl CachingProxy {
         let keys: Vec<String> = requested.iter().map(|(key, _)| key.clone()).collect();
         let worker = self.clone();
         let tail_bucket = bucket.clone();
+        let fenced = keys.clone();
         self.mutation_tail(&tail_bucket, &keys, async move {
+            let pending = worker.fence_writes(&bucket, &fenced).await?;
             let mut resp = match worker.inner.delete_objects(req).await {
                 Ok(resp) => resp,
                 Err(error) => {
                     if let Some(reason) = uncertain_mutation_error(&error, false) {
                         let mut receipt = None;
-                        for (key, _) in &requested {
+                        for ((key, _), pending) in requested.iter().zip(pending) {
                             receipt = worker
-                                .announce_unknown(&bucket, key, reason)
+                                .announce_unknown(&bucket, key, reason, pending.as_ref())
                                 .await
                                 .or(receipt);
                         }
                         worker
                             .settle_cluster(receipt, &bucket, "<batch delete>")
                             .await;
+                    } else {
+                        for ((key, _), pending) in requested.iter().zip(pending) {
+                            worker.abandon(&bucket, key, pending).await;
+                        }
                     }
                     return Err(error);
                 }
@@ -256,13 +323,14 @@ impl CachingProxy {
                 .filter_map(|d| d.key.as_deref())
                 .collect();
             let mut receipt = None;
-            for (key, versioned) in &requested {
+            for ((key, versioned), pending) in requested.iter().zip(pending) {
                 let applied = if quiet {
                     !refused.contains(key.as_str())
                 } else {
                     deleted.contains(key.as_str())
                 };
                 if !applied {
+                    worker.abandon(&bucket, key, pending).await;
                     continue;
                 }
                 worker
@@ -275,10 +343,10 @@ impl CachingProxy {
                 // version is not the key (see `delete`): its key's state is unknown.
                 let published = if *versioned {
                     worker
-                        .announce_unknown(&bucket, key, "a version-scoped delete")
+                        .announce_unknown(&bucket, key, "a version-scoped delete", pending.as_ref())
                         .await
                 } else {
-                    worker.record_del(&bucket, key).await
+                    worker.record_del(&bucket, key, pending.as_ref()).await
                 };
                 receipt = published.or(receipt);
             }
@@ -301,12 +369,14 @@ impl CachingProxy {
         let worker = self.clone();
         let (tail_bucket, tail_key) = (bucket.clone(), key.clone());
         self.mutation_tail(&tail_bucket, &[tail_key], async move {
+            let pending = worker.fence_write(&bucket, &key).await?;
             let mut resp = match worker.inner.complete_multipart_upload(req).await {
                 Ok(resp) => resp,
                 Err(error) => {
-                    if let Some(reason) = uncertain_completion_error(&error) {
-                        worker.publish_unknown(&bucket, &key, reason).await;
-                    }
+                    let uncertain = uncertain_completion_error(&error);
+                    worker
+                        .settle_failed(&bucket, &key, uncertain, pending)
+                        .await;
                     return Err(error);
                 }
             };
@@ -327,7 +397,13 @@ impl CachingProxy {
             let mut entry = observed_entry(observed.as_ref());
             entry.etag = completed.or(entry.etag);
             let token = worker
-                .record_put(IndexedWrite::MultipartComplete, &bucket, &key, entry)
+                .record_put(
+                    IndexedWrite::MultipartComplete,
+                    &bucket,
+                    &key,
+                    entry,
+                    pending.as_ref(),
+                )
                 .await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)
@@ -353,10 +429,12 @@ impl CachingProxy {
         let worker = self.clone();
         let (tail_bucket, tail_key) = (bucket.clone(), key.clone());
         self.mutation_tail(&tail_bucket, &[tail_key], async move {
+            let pending = worker.fence_write(&bucket, &key).await?;
             let mut resp = match copy::forward(&worker.copy_inner, req).await {
                 Ok(resp) => resp,
                 Err(error) => {
                     if copy_conflict_needs_reconcile(&error, create_only) {
+                        worker.abandon(&bucket, &key, pending).await;
                         // The origin's 412 proves an immutable create-only
                         // destination already exists. That can race ahead of this
                         // proxy's LIST index (for example after an interrupted
@@ -375,8 +453,11 @@ impl CachingProxy {
                         } else {
                             worker.metrics.copy_conflict_reconcile_miss();
                         }
-                    } else if let Some(reason) = uncertain_mutation_error(&error, false) {
-                        worker.publish_unknown(&bucket, &key, reason).await;
+                    } else {
+                        let uncertain = uncertain_mutation_error(&error, false);
+                        worker
+                            .settle_failed(&bucket, &key, uncertain, pending)
+                            .await;
                     }
                     return Err(error);
                 }
@@ -419,7 +500,7 @@ impl CachingProxy {
             };
             entry.etag = copied_etag.or(entry.etag);
             let token = worker
-                .record_put(IndexedWrite::Copy, &bucket, &key, entry)
+                .record_put(IndexedWrite::Copy, &bucket, &key, entry, pending.as_ref())
                 .await?;
             Self::attach_token(&mut resp.headers, token);
             Ok(resp)

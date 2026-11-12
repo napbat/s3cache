@@ -1,4 +1,7 @@
 mod apply;
+mod fence;
+
+pub(crate) use fence::PendingWrite;
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
@@ -17,6 +20,7 @@ use groupnet::runtime::{Group, Node};
 use s3s::dto::ObjectStorageClass;
 use tracing::{info, warn};
 
+use crate::index::pending::UncertainKey;
 use crate::index::{
     KeyIndex, ObjEntry, apply_del_native, apply_own_del, apply_own_put, apply_put_native,
     fence_own_uncertain_key, fence_uncertain_key_native, standard_class,
@@ -45,20 +49,31 @@ pub(super) fn native_cut(peer: &NodeId, token: WriteToken) -> NativeCut {
 }
 
 /// Fold one peer event into the index. A put that describes nothing (see
-/// [`IndexOp::unknown`]) fences its key instead, and the fence's token is returned for
-/// the caller to reconcile with the origin.
+/// [`IndexOp::unknown`]) fences its key instead; a pending write fences it until the
+/// writer settles it. Returns every key left uncertain, for the caller to reconcile
+/// with the origin.
 fn apply_feed_index(
     state: &KeyIndex,
     peer: &NodeId,
     token: WriteToken,
     event: &IndexEvent,
-) -> Option<u64> {
+) -> Vec<UncertainKey> {
     let ts = from_micros(event.ts_us);
     let cut = native_cut(peer, token);
-    if event.op.describes_nothing() {
-        return fence_uncertain_key_native(state, &event.bucket, &event.key, &cut);
-    }
+    let mut uncertain = Vec::new();
     match &event.op {
+        IndexOp::Pending => {
+            return state.hold_pending_native(&event.bucket, &event.key, &cut, event.floor);
+        }
+        IndexOp::Abandoned => {
+            return state.settle_pending_native(&cut, event.settles, event.floor, true);
+        }
+        op if op.describes_nothing() => {
+            if let Some(fence) = fence_uncertain_key_native(state, &event.bucket, &event.key, &cut)
+            {
+                uncertain.push((event.bucket.clone(), event.key.clone(), fence));
+            }
+        }
         IndexOp::Put {
             size,
             etag,
@@ -77,13 +92,16 @@ fn apply_feed_index(
                 content_type: content_type.clone(),
                 meta: None,
             };
-            apply_put_native(state, &event.bucket, &event.key, entry, cut);
+            apply_put_native(state, &event.bucket, &event.key, entry, cut.clone());
         }
         IndexOp::Del => {
-            apply_del_native(state, &event.bucket, &event.key, ts, cut);
+            apply_del_native(state, &event.bucket, &event.key, ts, cut.clone());
         }
     }
-    None
+    // The outcome is indexed first, so a read that no longer sees the pending write
+    // sees what replaced it.
+    uncertain.extend(state.settle_pending_native(&cut, event.settles, event.floor, false));
+    uncertain
 }
 
 /// Starts an origin reconciliation of a key this node fenced under `token` (see
@@ -367,6 +385,9 @@ pub struct WriteSync {
     /// The counted granters membership last did not report alive, as last logged
     /// (see [`absent_granters`](Self::absent_granters)).
     absent_granters: std::sync::Mutex<Vec<NodeId>>,
+    /// The feed sequences of this node's pending writes not settled yet (see
+    /// [`fence`](Self::fence)).
+    open_writes: fence::OpenWrites,
 }
 
 impl WriteSync {
@@ -421,6 +442,7 @@ impl WriteSync {
             advertisement,
             unmet_seeds: Arc::default(),
             absent_granters: std::sync::Mutex::default(),
+            open_writes: fence::OpenWrites::default(),
             node,
         }
     }
@@ -600,14 +622,16 @@ impl WriteSync {
     /// Index this node's own put and advertise it to peers: everything the entry
     /// carries that a peer can use, stamped with the local index's timestamp. The feed
     /// assigns the write's position under the index lock that applies it, so every own
-    /// write reaches the index, the donor journal and the feed in one order. Returns
-    /// whether the index changed and the advertisement to await.
+    /// write reaches the index, the donor journal and the feed in one order. `settles`
+    /// is the write's pending announcement, if it made one. Returns whether the index
+    /// changed and the advertisement to await.
     pub(crate) fn index_put<'a>(
         &'a self,
         state: &KeyIndex,
         bucket: &str,
         key: &str,
         entry: ObjEntry,
+        settles: Option<&PendingWrite>,
         metrics: &'a Metrics,
     ) -> (bool, impl Future<Output = WriteReceipt> + use<'a>) {
         let event = IndexEvent {
@@ -620,9 +644,11 @@ impl WriteSync {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             ts_us: to_micros(entry.last_modified),
+            settles: None,
+            floor: None,
         };
         let (changed, publishing) = apply_own_put(state, bucket, key, entry, || {
-            (self.feed.publish(&event), self.own_position())
+            self.publish_own(event, settles, false)
         });
         (changed, self.advertised(publishing, metrics))
     }
@@ -635,6 +661,7 @@ impl WriteSync {
         bucket: &str,
         key: &str,
         ts: SystemTime,
+        settles: Option<&PendingWrite>,
         metrics: &'a Metrics,
     ) -> impl Future<Output = WriteReceipt> + use<'a> {
         let event = IndexEvent {
@@ -642,9 +669,11 @@ impl WriteSync {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             ts_us: to_micros(ts),
+            settles: None,
+            floor: None,
         };
         let (_, publishing) = apply_own_del(state, bucket, key, ts, || {
-            (self.feed.publish(&event), self.own_position())
+            self.publish_own(event, settles, false)
         });
         self.advertised(publishing, metrics)
     }
@@ -658,6 +687,7 @@ impl WriteSync {
         state: &KeyIndex,
         bucket: &str,
         key: &str,
+        settles: Option<&PendingWrite>,
         metrics: &'a Metrics,
     ) -> (u64, impl Future<Output = WriteReceipt> + use<'a>) {
         let event = IndexEvent {
@@ -665,9 +695,11 @@ impl WriteSync {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             ts_us: to_micros(SystemTime::now()),
+            settles: None,
+            floor: None,
         };
         let (token, publishing) = fence_own_uncertain_key(state, bucket, key, || {
-            (self.feed.publish(&event), self.own_position())
+            self.publish_own(event, settles, false)
         });
         (token, self.advertised(publishing, metrics))
     }
@@ -823,6 +855,27 @@ impl WriteSync {
         key: &str,
         metrics: &Metrics,
     ) -> bool {
+        self.acked(
+            token,
+            timeout,
+            bucket,
+            key,
+            metrics,
+            "answering 503, the write may be applied at the origin",
+        )
+        .await
+    }
+
+    /// [`ack_write`](Self::ack_write), logging `on_stall` when the wait stalls.
+    async fn acked(
+        &self,
+        token: WriteToken,
+        timeout: Duration,
+        bucket: &str,
+        key: &str,
+        metrics: &Metrics,
+        on_stall: &str,
+    ) -> bool {
         let outcome: WriteWait = self.wait_cluster_applied(token, timeout).await;
         let retires_feed = outcome.retires_feed(self.consistency);
         let guaranteed = matches!(outcome, WriteWait::Applied | WriteWait::Lapsed(_));
@@ -843,10 +896,7 @@ impl WriteSync {
             }
             WriteWait::Stalled { waiting_on, lapsed } => {
                 let who = node_names(&waiting_on);
-                warn!(
-                    "write ack timed out for {bucket}/{key} ({who}); \
-                     answering 503, the write may be applied at the origin"
-                );
+                warn!("write ack timed out for {bucket}/{key} ({who}); {on_stall}");
                 metrics.ack_timeout();
                 if !lapsed.is_empty() {
                     // The lease tier *did* resolve this write, on a lapse, and the

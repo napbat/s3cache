@@ -19,7 +19,9 @@ use crate::index::{
     uncertain_key_is_current,
 };
 use crate::metrics::Metrics;
-use crate::sync::coherence::{READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync};
+use crate::sync::coherence::{
+    PendingWrite, READ_TOKEN_HEADER, WRITE_TOKEN_HEADER, WriteReceipt, WriteSync,
+};
 use crate::sync::config::RecoveryConfigRejected;
 use crate::sync::wire::wire_stamp;
 use crate::tier::{self, CachedObject, TieredCache, WarmPair};
@@ -86,7 +88,7 @@ impl CachedRange {
 /// uniform leased fleet): the lease wait runs to its own `D + 1s` deadline, and the two
 /// run concurrently, so the response is held for the longer of the two — see
 /// [`WriteSync::wait_cluster_applied`](crate::sync::coherence::WriteSync).
-const WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(super) const WRITE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a strict read waits for the freshness barrier before failing closed to the
 /// origin. A healthy cluster resolves this immediately.
@@ -742,7 +744,7 @@ impl CachingProxy {
         let Some(bucket) = g.get(input.bucket.as_str()).filter(|bucket| bucket.synced) else {
             return false;
         };
-        if bucket.uncertain_keys.contains_key(input.key.as_str()) {
+        if g.key_fenced(&input.bucket, &input.key) {
             return false;
         }
         let entry = bucket.keys.get(input.key.as_str());
@@ -786,9 +788,15 @@ impl CachingProxy {
     /// until the cluster has fenced it too or lost the right to serve, exactly as a
     /// describable write is held ([`record_put`](Self::record_put)). A stalled wait
     /// changes nothing here: the caller's error already tells the client the outcome is
-    /// unknown.
-    pub(super) async fn publish_unknown(&self, bucket: &str, key: &str, reason: &str) {
-        let receipt = self.announce_unknown(bucket, key, reason).await;
+    /// unknown. `pending` is the write's own announcement, which this settles.
+    pub(super) async fn publish_unknown(
+        &self,
+        bucket: &str,
+        key: &str,
+        reason: &str,
+        pending: Option<&PendingWrite>,
+    ) {
+        let receipt = self.announce_unknown(bucket, key, reason, pending).await;
         self.settle_cluster(receipt, bucket, key).await;
     }
 
@@ -800,6 +808,7 @@ impl CachingProxy {
         bucket: &str,
         key: &str,
         reason: &str,
+        pending: Option<&PendingWrite>,
     ) -> Option<WriteReceipt> {
         let ckey = (bucket.to_owned(), key.to_owned());
         let Some(sync) = self.sync.as_ref() else {
@@ -807,7 +816,8 @@ impl CachingProxy {
             self.obj_cache.invalidate(&ckey).await;
             return None;
         };
-        let (token, publishing) = sync.index_unknown(&self.state, bucket, key, &self.metrics);
+        let (token, publishing) =
+            sync.index_unknown(&self.state, bucket, key, pending, &self.metrics);
         spawn_key_reconcile(&self.client, &self.state, bucket, key, token, reason);
         // Fenced first, so no fill can commit the old body behind this: a copy left in
         // place would be served again, trusted, once the reconciliation resolves.
@@ -815,14 +825,10 @@ impl CachingProxy {
         Some(publishing.await)
     }
 
-    /// A key fenced by an ambiguous mutation may only be read from the origin until its
-    /// exact reconciliation token is resolved or superseded.
-    fn key_uncertain(&self, bucket: &str, key: &str) -> bool {
-        self.state
-            .read()
-            .unwrap()
-            .get(bucket)
-            .is_some_and(|bucket| bucket.uncertain_keys.contains_key(key))
+    /// A key fenced by an ambiguous mutation, or by a peer's pending write, may only be
+    /// read from the origin until that fence is resolved or settled.
+    fn key_fenced(&self, bucket: &str, key: &str) -> bool {
+        self.state.read().unwrap().key_fenced(bucket, key)
     }
 
     /// Attach a write's session token to a response, when coherence is on.
@@ -848,20 +854,26 @@ impl CachingProxy {
     /// coherence is on, or a 503 when the wait stalled (see
     /// [`await_cluster`](Self::await_cluster)). The caller has already dropped this
     /// node's own body copy — the writer must not serve its own stale bytes while the
-    /// cluster round runs.
+    /// cluster round runs. `pending` is the write's own announcement, which this settles.
     pub(super) async fn record_put(
         &self,
         op: IndexedWrite,
         bucket: &str,
         key: &str,
         mut entry: ObjEntry,
+        pending: Option<&PendingWrite>,
     ) -> S3Result<Option<String>> {
         // A write whose response carried neither an `ETag` nor a size describes nothing
         // a reader could check a copy against: it is reconciled as an uncertain one.
         if entry.etag.is_none() && entry.size.is_none() {
             op.record(&self.metrics);
             let receipt = self
-                .announce_unknown(bucket, key, "the write's response described no object")
+                .announce_unknown(
+                    bucket,
+                    key,
+                    "the write's response described no object",
+                    pending,
+                )
                 .await;
             return self.await_cluster(receipt, bucket, key).await;
         }
@@ -875,7 +887,8 @@ impl CachingProxy {
             }
             return Ok(None);
         };
-        let (changed, publishing) = sync.index_put(&self.state, bucket, key, entry, &self.metrics);
+        let (changed, publishing) =
+            sync.index_put(&self.state, bucket, key, entry, pending, &self.metrics);
         if changed {
             op.record(&self.metrics);
         }
@@ -886,15 +899,21 @@ impl CachingProxy {
     /// Record a durable delete: tombstone + remove locally and advertise it to peers,
     /// returning the receipt rather than waiting. The caller chooses when to wait — one
     /// key waits immediately, a batch publishes every key first and then waits once (see
-    /// [`await_cluster`](Self::await_cluster)).
-    pub(super) async fn record_del(&self, bucket: &str, key: &str) -> Option<WriteReceipt> {
+    /// [`await_cluster`](Self::await_cluster)). `pending` is the write's own
+    /// announcement, which this settles.
+    pub(super) async fn record_del(
+        &self,
+        bucket: &str,
+        key: &str,
+        pending: Option<&PendingWrite>,
+    ) -> Option<WriteReceipt> {
         let ts = wire_stamp(SystemTime::now());
         let Some(sync) = self.sync.as_ref() else {
             apply_del(&self.state, bucket, key, ts);
             return None;
         };
         Some(
-            sync.index_del(&self.state, bucket, key, ts, &self.metrics)
+            sync.index_del(&self.state, bucket, key, ts, pending, &self.metrics)
                 .await,
         )
     }
@@ -1219,7 +1238,7 @@ impl CachingProxy {
             || {
                 self.obj_cache.suspect_gen() == generation
                     && self.sync.as_ref().is_none_or(|sync| sync.may_serve_local())
-                    && !self.key_uncertain(&ckey.0, &ckey.1)
+                    && !self.key_fenced(&ckey.0, &ckey.1)
             },
             |obj, observed| {
                 self.observe(&ckey.0, &ckey.1, observed);
@@ -1275,9 +1294,7 @@ impl CachingProxy {
         resume_after: Option<&str>,
     ) -> Option<ListObjectsV2Output> {
         let g = self.state.read().unwrap();
-        if g.get(inp.bucket.as_str())
-            .is_some_and(|bucket| !bucket.uncertain_keys.is_empty())
-        {
+        if g.fenced_under(&inp.bucket, inp.prefix.as_deref().unwrap_or_default()) {
             return None;
         }
         list_objects_v2_from_index(
@@ -1412,7 +1429,7 @@ impl CachingProxy {
         // overwrite is never read stale; a token-carrying read that cannot be
         // verified in time skips every local copy and streams from the origin.
         let local_ok = if cacheable || cached_range.is_some() {
-            !self.key_uncertain(&ckey.0, &ckey.1)
+            !self.key_fenced(&ckey.0, &ckey.1)
                 && self.read_barrier(&req.headers).await == ReadRoute::Local
         } else {
             true
@@ -1518,7 +1535,7 @@ impl CachingProxy {
         let can_commit = || {
             self.obj_cache.suspect_gen() == generation
                 && self.sync.as_ref().is_none_or(|sync| sync.may_serve_local())
-                && !self.key_uncertain(&ckey.0, &ckey.1)
+                && !self.key_fenced(&ckey.0, &ckey.1)
         };
         let on_commit = |filled: &Arc<CachedObject>, observed: &ObservedObject| {
             // The GET supplies both body and HEAD metadata. Fold the observation
@@ -1571,7 +1588,7 @@ impl CachingProxy {
             && req.input.if_unmodified_since.is_none();
         let ckey = (req.input.bucket.clone(), req.input.key.clone());
         if cache_eligible
-            && !self.key_uncertain(&ckey.0, &ckey.1)
+            && !self.key_fenced(&ckey.0, &ckey.1)
             && self.read_barrier(&req.headers).await == ReadRoute::Local
         {
             if let Some(obj) = self.validated_get(&ckey).await

@@ -117,8 +117,11 @@ pub(super) fn indexed_source_size(
         return None;
     };
     let state = proxy.state.read().unwrap();
+    if state.key_fenced(bucket.as_ref(), key.as_ref()) {
+        return None;
+    }
     let bucket = state.get(bucket.as_ref())?;
-    if !bucket.synced || bucket.uncertain_keys.contains_key(key.as_ref()) {
+    if !bucket.synced {
         return None;
     }
     let entry = bucket.keys.get(key.as_ref())?;

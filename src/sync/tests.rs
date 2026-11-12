@@ -38,7 +38,7 @@ fn test_lease() -> LeaseConfig {
 
 /// Index `entry` as this writer's own put into a scratch index and advertise it.
 async fn own_put(sync: &WriteSync, key: &str, entry: ObjEntry, metrics: &Metrics) -> WriteReceipt {
-    sync.index_put(&KeyIndex::default(), "bkt", key, entry, metrics)
+    sync.index_put(&KeyIndex::default(), "bkt", key, entry, None, metrics)
         .1
         .await
 }
@@ -438,6 +438,8 @@ fn event_codec_round_trips_and_rejects_garbage() {
         bucket: "bucket-1".to_owned(),
         key: "a/b weird\0key".to_owned(),
         ts_us: 1_700_000_000_000_000,
+        settles: Some(7),
+        floor: Some(5),
     };
     let encoded = encode_event(&event);
     assert_eq!(
@@ -534,6 +536,7 @@ async fn peer_events_fold_into_index_and_invalidate() {
             "bkt",
             "obj",
             SystemTime::now(),
+            None,
             &metrics,
         )
         .await;
@@ -585,6 +588,7 @@ async fn peer_delete_retires_the_warm_copy() {
             "bkt",
             "gone",
             SystemTime::now(),
+            None,
             &metrics,
         )
         .await;
@@ -640,7 +644,8 @@ async fn an_undescribed_peer_write_fences_the_key_before_it_is_acknowledged() {
     let ckey = ("bkt".to_owned(), "ptr".to_owned());
     cache.insert(ckey.clone(), cached(b"old")).await;
 
-    let (_, publishing) = sync_a.index_unknown(&KeyIndex::default(), "bkt", "ptr", &metrics);
+    let (_, publishing) =
+        sync_a.index_unknown(&KeyIndex::default(), "bkt", "ptr", None, &metrics);
     let unknown = publishing.await;
     assert!(
         sync_b

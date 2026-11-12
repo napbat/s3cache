@@ -491,7 +491,7 @@ async fn a_stalled_write_is_a_503_not_a_success() {
         meta: None,
     };
     let error = proxy
-        .record_put(crate::cache::proxy::IndexedWrite::Put, "bkt", "k", entry)
+        .record_put(crate::cache::proxy::IndexedWrite::Put, "bkt", "k", entry, None)
         .await
         .expect_err("a stalled write must not be acknowledged");
     assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);

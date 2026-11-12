@@ -476,6 +476,7 @@ impl KeyIndex {
             capture.invalidate(Invalidation::Rebuild);
         }
         candidate.native_cuts = std::mem::take(&mut live.native_cuts);
+        candidate.pending = std::mem::take(&mut live.pending);
         *live = candidate;
         Ok(())
     }

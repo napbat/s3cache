@@ -6,6 +6,7 @@ use groupnet::core::NodeId;
 use tracing::warn;
 
 use crate::index::KeyIndex;
+use crate::index::pending::UncertainKey;
 use crate::metrics::Metrics;
 use crate::sync::coherence::{KeyReconcile, WriteSync, apply_feed_index, lapse_poll, native_cut};
 use crate::sync::wire::decode_event;
@@ -65,6 +66,11 @@ impl WriteSync {
                 match event {
                     PeerWrite::Sealed { peer, token } => {
                         state.note_native_seal(native_cut(&peer, token));
+                        let ended = state.end_pending_life(
+                            peer.as_str().as_bytes(),
+                            token.epoch.saturating_add(1),
+                        );
+                        reconcile_all(&reconcile, ended);
                         sync.observe_seal(&peer, token);
                         frontier.advance(&peer, token);
                         acknowledge(ledger.as_ref(), &peer, token).await;
@@ -75,6 +81,10 @@ impl WriteSync {
                         epoch,
                     } => {
                         let start = sync.observe_renewal(&state, &peer, sealed, epoch, &metrics);
+                        reconcile_all(
+                            &reconcile,
+                            state.end_pending_life(peer.as_str().as_bytes(), epoch),
+                        );
                         frontier.advance(&peer, start);
                         acknowledge(ledger.as_ref(), &peer, start).await;
                     }
@@ -88,11 +98,9 @@ impl WriteSync {
                         let fenced = apply_feed_index(&state, &peer, token, &event);
                         drop(mutation);
                         // Fenced before the acknowledgement below: from then on this
-                        // node answers the key from the origin until the reconciliation
-                        // resolves it.
-                        if let Some(fence) = fenced {
-                            reconcile(&event.bucket, &event.key, fence);
-                        }
+                        // node answers these keys from the origin until each
+                        // reconciliation resolves its key.
+                        reconcile_all(&reconcile, fenced);
                         // The index must move first: a warm body promoted after this hot
                         // eviction decodes suspect and is checked against the new entry
                         // before it can be served. Awaiting moka removal before the ack
@@ -116,6 +124,15 @@ impl WriteSync {
                         warn!("write-feed gap from `{peer}`: distrusting bodies, resyncing index");
                         sync.forget_crossing(&peer);
                         state.discard_for_gap(&native_cut(&peer, missed_through));
+                        // A gap within one life keeps that life's pending writes:
+                        // the floor of its next event settles them.
+                        reconcile_all(
+                            &reconcile,
+                            state.end_pending_life(
+                                peer.as_str().as_bytes(),
+                                missed_through.epoch,
+                            ),
+                        );
                         // The public signal fences serving before returning; the
                         // recovery worker distrusts bodies and guards every origin
                         // scan page with that exact operation's permit. Frontier
@@ -132,6 +149,13 @@ impl WriteSync {
                 }
             }
         });
+    }
+}
+
+/// Start the origin reconciliation of each key left uncertain.
+fn reconcile_all(reconcile: &KeyReconcile, keys: Vec<UncertainKey>) {
+    for (bucket, key, token) in keys {
+        reconcile(&bucket, &key, token);
     }
 }
 

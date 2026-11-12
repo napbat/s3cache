@@ -14,6 +14,7 @@ use groupnet::core::volatile_bootstrap::journal::{
 
 use s3s::dto::{ETag, ObjectStorageClass};
 
+use super::pending::PendingWrites;
 use super::{BucketState, GoneRows, IndexStats, KeyIndexState, KeyRows, ObjEntry};
 
 const VERSION: u8 = 1;
@@ -955,6 +956,7 @@ pub(super) fn decode(bytes: &[u8], caps: ImageCaps) -> Result<KeyIndexState, Ima
         stats: total,
         capture: None,
         native_cuts: BTreeMap::new(),
+        pending: PendingWrites::default(),
     })
 }
 
@@ -1011,6 +1013,7 @@ mod tests {
             stats,
             capture: None,
             native_cuts: BTreeMap::new(),
+            pending: PendingWrites::default(),
         }
     }
 
