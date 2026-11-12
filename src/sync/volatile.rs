@@ -438,11 +438,13 @@ mod tests {
             poll_ms: 25,
         };
         assert!(observe_group(&group_b, &sync, &b, Duration::from_millis(300), limits).is_ok());
+        // Groupnet keys the default write feed's entry as `~writes/d`.
+        let feed_entry = "~writes/d";
         group_a
-            .set_entry("~writes", vec![0xFF], None)
+            .set_entry(feed_entry, vec![0xFF], None)
             .expect("malformed entry enqueued");
         tokio::time::timeout(Duration::from_secs(3), async {
-            while group_b.node_entry(&a, "~writes").is_none() {
+            while group_b.node_entry(&a, feed_entry).is_none() {
                 tokio::task::yield_now().await;
             }
         })
